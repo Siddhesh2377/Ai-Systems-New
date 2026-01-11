@@ -9,6 +9,7 @@ plugins {
 
 android {
     namespace = "com.dark.ai_sd"
+    ndkPath = "/home/home/Android/Sdk/ndk/android-ndk-r27d"
     compileSdk {
         version = release(36)
     }
@@ -30,8 +31,7 @@ android {
         release {
             isMinifyEnabled = false
             proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro"
+                getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
             )
         }
     }
@@ -41,27 +41,14 @@ android {
             version = "3.22.1"
         }
     }
-    packaging {
-        resources {
-            excludes += "/META-INF/{AL2.0,LGPL2.1}"
-        }
-        jniLibs {
-            useLegacyPackaging = true
-            // Exclude CMake build outputs to prevent duplicates
-            excludes += "**/intermediates/cxx/**/*.so"
-        }
-        // Add this to handle duplicate .so files
-        jniLibs.pickFirsts.add("lib/arm64-v8a/libstable_diffusion_core.so")
-        jniLibs.pickFirsts.add("lib/armeabi-v7a/libstable_diffusion_core.so")
-        jniLibs.pickFirsts.add("lib/x86/libstable_diffusion_core.so")
-        jniLibs.pickFirsts.add("lib/x86_64/libstable_diffusion_core.so")
-    }
-
-    // Add sourceSets configuration to control jniLibs directory
     sourceSets {
         getByName("main") {
-            // Only include jniLibs from the standard location
             jniLibs.setSrcDirs(listOf("src/main/jniLibs"))
+        }
+    }
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
         }
     }
     compileOptions {
@@ -76,6 +63,9 @@ android {
 }
 
 dependencies {
+    implementation ("org.apache.commons:commons-compress:1.28.0")
+    implementation ("org.tukaani:xz:1.11")
+    implementation(libs.okhttp)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.appcompat)
     implementation(libs.material)

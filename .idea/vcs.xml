@@ -3,18 +3,6 @@
   <component name="VcsDirectoryMappings">
     <mapping directory="" vcs="Git" />
     <mapping directory="$PROJECT_DIR$" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/ai_sd/src/main/cpp/3rdparty/MNN" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/ai_sd/src/main/cpp/3rdparty/cpp-httplib" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/ai_sd/src/main/cpp/3rdparty/json" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/ai_sd/src/main/cpp/3rdparty/stb" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/ai_sd/src/main/cpp/3rdparty/tokenizers-cpp" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/ai_sd/src/main/cpp/3rdparty/tokenizers-cpp/msgpack" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/ai_sd/src/main/cpp/3rdparty/tokenizers-cpp/sentencepiece" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/ai_sd/src/main/cpp/3rdparty/xsimd" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/ai_sd/src/main/cpp/3rdparty/xtensor" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/ai_sd/src/main/cpp/3rdparty/xtensor-blas" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/ai_sd/src/main/cpp/3rdparty/xtl" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/ai_sd/src/main/cpp/3rdparty/zstd" vcs="Git" />
-    <mapping directory="$USER_HOME$/dev/AI/llama.cpp" vcs="Git" />
+    <mapping directory="$USER_HOME$/dev/android/MNN" vcs="Git" />
   </component>
 </project>

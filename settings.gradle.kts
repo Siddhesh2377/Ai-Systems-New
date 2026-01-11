@@ -23,3 +23,4 @@ rootProject.name = "Ai-Systems"
 include(":app")
 include(":ai_gguf")
 include(":ai_sd")
+//include(":ai_mnn")
