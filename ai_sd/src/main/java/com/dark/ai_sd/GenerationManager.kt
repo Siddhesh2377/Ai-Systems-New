@@ -39,8 +39,8 @@ class GenerationManager(private val context: Context) {
     }
 
     // State management
-    private val _generationState = MutableStateFlow<GenerationState>(GenerationState.Idle)
-    val generationState: StateFlow<GenerationState> = _generationState.asStateFlow()
+    private val _Diffusion_generationState = MutableStateFlow<DiffusionGenerationState>(DiffusionGenerationState.Idle)
+    val diffusionGenerationState: StateFlow<DiffusionGenerationState> = _Diffusion_generationState.asStateFlow()
 
     private val _isGenerating = MutableStateFlow(false)
     val isGenerating: StateFlow<Boolean> = _isGenerating.asStateFlow()
@@ -64,7 +64,7 @@ class GenerationManager(private val context: Context) {
      * Start image generation with the given parameters
      * Returns immediately, use generationState to monitor progress
      */
-    fun generateImage(params: GenerationParams) {
+    fun generateImage(params: DiffusionGenerationParams) {
         if (_isGenerating.value) {
             Log.w(TAG, "Generation already in progress, cancelling previous job")
             cancelGeneration()
@@ -73,14 +73,14 @@ class GenerationManager(private val context: Context) {
         generationJob = generationScope.launch {
             try {
                 _isGenerating.value = true
-                updateState(GenerationState.Idle)
+                updateState(DiffusionGenerationState.Idle)
                 runGeneration(params)
             } catch (e: CancellationException) {
                 Log.i(TAG, "Generation cancelled")
-                updateState(GenerationState.Error("Generation cancelled"))
+                updateState(DiffusionGenerationState.Error("Generation cancelled"))
             } catch (e: Exception) {
                 Log.e(TAG, "Generation failed", e)
-                updateState(GenerationState.Error(e.message ?: "Unknown error"))
+                updateState(DiffusionGenerationState.Error(e.message ?: "Unknown error"))
             } finally {
                 _isGenerating.value = false
             }
@@ -91,28 +91,28 @@ class GenerationManager(private val context: Context) {
      * Generate image synchronously and return the result
      * Suspending function for use in coroutines
      */
-    suspend fun generateImageSync(params: GenerationParams): GenerationResult = withContext(Dispatchers.IO) {
+    suspend fun generateImageSync(params: DiffusionGenerationParams): DiffusionGenerationResult = withContext(Dispatchers.IO) {
         try {
             _isGenerating.value = true
-            updateState(GenerationState.Idle)
+            updateState(DiffusionGenerationState.Idle)
             runGeneration(params)
             
             // Wait for completion
-            when (val state = _generationState.value) {
-                is GenerationState.Complete -> {
-                    GenerationResult.Success(
+            when (val state = _Diffusion_generationState.value) {
+                is DiffusionGenerationState.Complete -> {
+                    DiffusionGenerationResult.Success(
                         bitmap = state.bitmap,
                         seed = state.seed,
                         width = state.width,
                         height = state.height
                     )
                 }
-                is GenerationState.Error -> GenerationResult.Failure(state.message)
-                else -> GenerationResult.Failure("Unexpected state: $state")
+                is DiffusionGenerationState.Error -> DiffusionGenerationResult.Failure(state.message)
+                else -> DiffusionGenerationResult.Failure("Unexpected state: $state")
             }
         } catch (e: Exception) {
             Log.e(TAG, "Synchronous generation failed", e)
-            GenerationResult.Failure(e.message ?: "Unknown error")
+            DiffusionGenerationResult.Failure(e.message ?: "Unknown error")
         } finally {
             _isGenerating.value = false
         }
@@ -124,7 +124,7 @@ class GenerationManager(private val context: Context) {
     fun cancelGeneration() {
         generationJob?.cancel()
         generationJob = null
-        updateState(GenerationState.Idle)
+        updateState(DiffusionGenerationState.Idle)
         _isGenerating.value = false
     }
 
@@ -133,7 +133,7 @@ class GenerationManager(private val context: Context) {
      */
     fun resetState() {
         if (!_isGenerating.value) {
-            updateState(GenerationState.Idle)
+            updateState(DiffusionGenerationState.Idle)
         }
     }
 
@@ -147,9 +147,9 @@ class GenerationManager(private val context: Context) {
 
     // Private helper methods
 
-    private suspend fun runGeneration(params: GenerationParams) = withContext(Dispatchers.IO) {
+    private suspend fun runGeneration(params: DiffusionGenerationParams) = withContext(Dispatchers.IO) {
         try {
-            updateState(GenerationState.Progress(0f))
+            updateState(DiffusionGenerationState.Progress(0f))
 
             val jsonObject = buildRequestJson(params)
             val request = buildHttpRequest(jsonObject, params)
@@ -159,9 +159,7 @@ class GenerationManager(private val context: Context) {
                     throw IOException("Request failed with code: ${response.code}")
                 }
 
-                response.body?.let { responseBody ->
-                    processStreamingResponse(responseBody, params.width, params.height)
-                } ?: throw IOException("Empty response body")
+                processStreamingResponse(response.body, params.width, params.height)
             }
         } catch (e: Exception) {
             Log.e(TAG, "Generation error", e)
@@ -169,7 +167,7 @@ class GenerationManager(private val context: Context) {
         }
     }
 
-    private fun buildRequestJson(params: GenerationParams): JSONObject {
+    private fun buildRequestJson(params: DiffusionGenerationParams): JSONObject {
         return JSONObject().apply {
             put("prompt", params.prompt)
             put("negative_prompt", params.negativePrompt)
@@ -190,7 +188,7 @@ class GenerationManager(private val context: Context) {
         }
     }
 
-    private fun buildHttpRequest(jsonObject: JSONObject, params: GenerationParams): Request {
+    private fun buildHttpRequest(jsonObject: JSONObject, params: DiffusionGenerationParams): Request {
         // Determine port from model config or use default
         val port = 8081 // Could be made configurable
         
@@ -246,7 +244,7 @@ class GenerationManager(private val context: Context) {
         }
 
         updateState(
-            GenerationState.Progress(
+            DiffusionGenerationState.Progress(
                 progress = progress,
                 currentStep = step,
                 totalSteps = totalSteps,
@@ -281,7 +279,7 @@ class GenerationManager(private val context: Context) {
         Log.d(TAG, "Image processing: decode=${decodeTime}ms, bitmap=${bitmapTime}ms, total=${totalTime}ms")
 
         updateState(
-            GenerationState.Complete(
+            DiffusionGenerationState.Complete(
                 bitmap = bitmap,
                 seed = seed,
                 width = width,
@@ -318,7 +316,7 @@ class GenerationManager(private val context: Context) {
         return bitmap
     }
 
-    private fun updateState(state: GenerationState) {
-        _generationState.value = state
+    private fun updateState(state: DiffusionGenerationState) {
+        _Diffusion_generationState.value = state
     }
 }

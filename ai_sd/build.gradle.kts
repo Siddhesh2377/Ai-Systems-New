@@ -9,7 +9,6 @@ plugins {
 
 android {
     namespace = "com.dark.ai_sd"
-    ndkPath = "/home/home/Android/Sdk/ndk/android-ndk-r27d"
     compileSdk {
         version = release(36)
     }
@@ -20,11 +19,6 @@ android {
             //noinspection ChromeOsAbiSupport
             abiFilters += listOf("arm64-v8a")
         }
-        externalNativeBuild {
-            cmake {
-                cppFlags("")
-            }
-        }
     }
 
     buildTypes {
@@ -33,12 +27,6 @@ android {
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
             )
-        }
-    }
-    externalNativeBuild {
-        cmake {
-            path("src/main/cpp/CMakeLists.txt")
-            version = "3.22.1"
         }
     }
     sourceSets {

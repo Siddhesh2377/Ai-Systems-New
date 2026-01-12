@@ -154,30 +154,30 @@ fun Context.cleanTempDirectory() {
 /**
  * Check if state represents an active generation
  */
-fun GenerationState.isActive(): Boolean {
-    return this is GenerationState.Progress
+fun DiffusionGenerationState.isActive(): Boolean {
+    return this is DiffusionGenerationState.Progress
 }
 
 /**
  * Check if state represents completion
  */
-fun GenerationState.isComplete(): Boolean {
-    return this is GenerationState.Complete
+fun DiffusionGenerationState.isComplete(): Boolean {
+    return this is DiffusionGenerationState.Complete
 }
 
 /**
  * Check if state represents an error
  */
-fun GenerationState.isError(): Boolean {
-    return this is GenerationState.Error
+fun DiffusionGenerationState.isError(): Boolean {
+    return this is DiffusionGenerationState.Error
 }
 
 /**
  * Get progress value or 0 if not in progress state
  */
-fun GenerationState.getProgress(): Float {
+fun DiffusionGenerationState.getProgress(): Float {
     return when (this) {
-        is GenerationState.Progress -> progress
+        is DiffusionGenerationState.Progress -> progress
         else -> 0f
     }
 }
@@ -187,15 +187,15 @@ fun GenerationState.getProgress(): Float {
 /**
  * Check if backend is ready for generation
  */
-fun BackendState.isReady(): Boolean {
-    return this is BackendState.Running
+fun DiffusionBackendState.isReady(): Boolean {
+    return this is DiffusionBackendState.Running
 }
 
 /**
  * Check if backend has an error
  */
-fun BackendState.hasError(): Boolean {
-    return this is BackendState.Error
+fun DiffusionBackendState.hasError(): Boolean {
+    return this is DiffusionBackendState.Error
 }
 
 // Model config builder
@@ -211,6 +211,7 @@ class ModelConfigBuilder {
     private var useCpuClip: Boolean = false
     private var isPony: Boolean = false
     private var httpPort: Int = 8081
+    private var safetyMode: Boolean = false
 
     fun name(name: String) = apply { this.name = name }
     fun modelDir(dir: String) = apply { this.modelDir = dir }
@@ -219,12 +220,13 @@ class ModelConfigBuilder {
     fun useCpuClip(cpuClip: Boolean) = apply { this.useCpuClip = cpuClip }
     fun isPony(pony: Boolean) = apply { this.isPony = pony }
     fun httpPort(port: Int) = apply { this.httpPort = port }
+    fun setSafetyMode(safetyMode: Boolean) = apply { this.safetyMode = safetyMode }
 
-    fun build(): ModelConfig {
+    fun build(): DiffusionModelConfig {
         require(name.isNotEmpty()) { "Model name is required" }
         require(modelDir.isNotEmpty()) { "Model directory is required" }
 
-        return ModelConfig(
+        return DiffusionModelConfig(
             name = name,
             modelDir = modelDir,
             textEmbeddingSize = textEmbeddingSize,
@@ -239,7 +241,7 @@ class ModelConfigBuilder {
 /**
  * DSL function for creating ModelConfig
  */
-fun modelConfig(block: ModelConfigBuilder.() -> Unit): ModelConfig {
+fun modelConfig(block: ModelConfigBuilder.() -> Unit): DiffusionModelConfig {
     return ModelConfigBuilder().apply(block).build()
 }
 
@@ -284,10 +286,10 @@ class GenerationParamsBuilder {
         this.showDiffusionStride = stride
     }
 
-    fun build(): GenerationParams {
+    fun build(): DiffusionGenerationParams {
         require(prompt.isNotEmpty()) { "Prompt is required" }
 
-        return GenerationParams(
+        return DiffusionGenerationParams(
             prompt = prompt,
             negativePrompt = negativePrompt,
             steps = steps,
@@ -309,7 +311,7 @@ class GenerationParamsBuilder {
 /**
  * DSL function for creating GenerationParams
  */
-fun generationParams(block: GenerationParamsBuilder.() -> Unit): GenerationParams {
+fun generationParams(block: GenerationParamsBuilder.() -> Unit): DiffusionGenerationParams {
     return GenerationParamsBuilder().apply(block).build()
 }
 

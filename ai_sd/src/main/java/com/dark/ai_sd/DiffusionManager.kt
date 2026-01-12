@@ -7,6 +7,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.io.File
+import java.io.FileNotFoundException
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
@@ -20,6 +21,7 @@ class DiffusionManager(private val context: Context) {
         private const val TAG = "DiffusionManager"
         private const val RUNTIME_DIR = "runtime_libs"
         private const val EXECUTABLE_NAME = "libstable_diffusion_core.so"
+        private const val SAFETY_CHECKER_FILE = "safety_checker/safety_checker.mnn"
 
         @SuppressLint("StaticFieldLeak")
         @Volatile
@@ -32,14 +34,16 @@ class DiffusionManager(private val context: Context) {
         }
     }
 
+    private val safetyCheckerFile = File(context.filesDir, SAFETY_CHECKER_FILE)
+
     // State management
-    private val _backendState = MutableStateFlow<BackendState>(BackendState.Idle)
-    val backendState: StateFlow<BackendState> = _backendState.asStateFlow()
+    private val _Diffusion_backendState = MutableStateFlow<DiffusionBackendState>(DiffusionBackendState.Idle)
+    val diffusionBackendState: StateFlow<DiffusionBackendState> = _Diffusion_backendState.asStateFlow()
 
     // Runtime configuration
     private lateinit var runtimeDir: File
     private var process: Process? = null
-    private var currentModel: ModelConfig? = null
+    private var currentModel: DiffusionModelConfig? = null
     private var monitorThread: Thread? = null
 
     // Runtime setup
@@ -49,7 +53,7 @@ class DiffusionManager(private val context: Context) {
      * Initialize the runtime environment
      * Must be called before loading models
      */
-    fun setupRuntime(config: RuntimeConfig = RuntimeConfig(RUNTIME_DIR)) {
+    fun setupRuntime(config: DiffusionRuntimeConfig = DiffusionRuntimeConfig(RUNTIME_DIR)) {
         if (isRuntimePrepared) {
             Log.i(TAG, "Runtime already prepared")
             return
@@ -58,7 +62,7 @@ class DiffusionManager(private val context: Context) {
         try {
             prepareRuntimeDirectory(config)
 
-            if (config.safetyCheckerEnabled && config.safetyCheckerPath != null) {
+            if (config.safetyCheckerEnabled) {
                 prepareSafetyChecker(config.safetyCheckerPath)
             }
 
@@ -66,7 +70,7 @@ class DiffusionManager(private val context: Context) {
             Log.i(TAG, "Runtime setup completed successfully")
         } catch (e: Exception) {
             Log.e(TAG, "Runtime setup failed", e)
-            updateState(BackendState.Error("Runtime setup failed: ${e.message}"))
+            updateState(DiffusionBackendState.Error("Runtime setup failed: ${e.message}"))
             throw RuntimeException("Failed to setup runtime environment", e)
         }
     }
@@ -74,20 +78,20 @@ class DiffusionManager(private val context: Context) {
     /**
      * Load a model and start the backend server
      */
-    fun loadModel(modelConfig: ModelConfig, width: Int = 512, height: Int = 512): Boolean {
+    fun loadModel(diffusionModelConfig: DiffusionModelConfig, width: Int = 512, height: Int = 512): Boolean {
         if (!isRuntimePrepared) {
             Log.e(TAG, "Runtime not prepared. Call setupRuntime() first")
-            updateState(BackendState.Error("Runtime not prepared"))
+            updateState(DiffusionBackendState.Error("Runtime not prepared"))
             return false
         }
 
         // Stop existing backend if running
-        if (_backendState.value is BackendState.Running) {
+        if (_Diffusion_backendState.value is DiffusionBackendState.Running) {
             Log.i(TAG, "Stopping existing backend before loading new model")
             stopBackend()
         }
 
-        return startBackend(modelConfig, width, height)
+        return startBackend(diffusionModelConfig, width, height)
     }
 
     /**
@@ -123,10 +127,10 @@ class DiffusionManager(private val context: Context) {
                 val exitCode = proc.exitValue()
                 Log.i(TAG, "Backend process stopped with exit code: $exitCode")
 
-                updateState(BackendState.Idle)
+                updateState(DiffusionBackendState.Idle)
             } catch (e: Exception) {
                 Log.e(TAG, "Error stopping backend", e)
-                updateState(BackendState.Error("Error stopping backend: ${e.message}"))
+                updateState(DiffusionBackendState.Error("Error stopping backend: ${e.message}"))
             } finally {
                 process = null
             }
@@ -142,12 +146,12 @@ class DiffusionManager(private val context: Context) {
     /**
      * Get the current model configuration
      */
-    fun getCurrentModel(): ModelConfig? = currentModel
+    fun getCurrentModel(): DiffusionModelConfig? = currentModel
 
     /**
      * Check if backend is running
      */
-    fun isBackendRunning(): Boolean = _backendState.value is BackendState.Running
+    fun isBackendRunning(): Boolean = _Diffusion_backendState.value is DiffusionBackendState.Running
 
     /**
      * Cleanup resources
@@ -159,7 +163,7 @@ class DiffusionManager(private val context: Context) {
 
     // Private helper methods
 
-    private fun prepareRuntimeDirectory(config: RuntimeConfig) {
+    private fun prepareRuntimeDirectory(config: DiffusionRuntimeConfig) {
         runtimeDir = File(context.filesDir, config.runtimeDir).apply {
             if (!exists()) {
                 mkdirs()
@@ -221,10 +225,10 @@ class DiffusionManager(private val context: Context) {
         }
     }
 
-    private fun prepareSafetyChecker(assetPath: String) {
+    private fun prepareSafetyChecker(assetPath: String = "assets/safety_checker.mnn") {
         try {
             val safetyCheckerSource = context.assets.open(assetPath)
-            val safetyCheckerTarget = File(context.filesDir, "safety_checker.mnn")
+            val safetyCheckerTarget = safetyCheckerFile
 
             safetyCheckerSource.use { input ->
                 safetyCheckerTarget.outputStream().use { output ->
@@ -240,9 +244,9 @@ class DiffusionManager(private val context: Context) {
         }
     }
 
-    private fun startBackend(model: ModelConfig, width: Int, height: Int): Boolean {
+    private fun startBackend(model: DiffusionModelConfig, width: Int, height: Int): Boolean {
         Log.i(TAG, "Starting backend - Model: ${model.name}, Resolution: ${width}×${height}")
-        updateState(BackendState.Starting)
+        updateState(DiffusionBackendState.Starting)
 
         try {
             val nativeDir = context.applicationInfo.nativeLibraryDir
@@ -251,12 +255,24 @@ class DiffusionManager(private val context: Context) {
             val executableFile = File(nativeDir, EXECUTABLE_NAME)
             if (!executableFile.exists()) {
                 Log.e(TAG, "Executable not found: ${executableFile.absolutePath}")
-                updateState(BackendState.Error("Executable not found"))
+                updateState(DiffusionBackendState.Error("Executable not found"))
                 return false
             }
 
             // Build command
-            val command = buildCommand(model, modelsDir, executableFile, width, height)
+            var command = buildCommand(model, modelsDir, executableFile, width, height)
+
+            if (model.safetyMode){
+                if (!safetyCheckerFile.exists()){
+                    throw FileNotFoundException("Safety checker model not found: ${safetyCheckerFile.absolutePath}")
+                }
+                val tempCommand = command
+                val safetyCommand= listOf(
+                    "--safety_checker",
+                    safetyCheckerFile.absolutePath
+                )
+                command = tempCommand + safetyCommand
+            }
 
             // Build environment
             val env = buildEnvironment()
@@ -277,19 +293,19 @@ class DiffusionManager(private val context: Context) {
             // Start monitoring thread
             startMonitorThread()
 
-            updateState(BackendState.Running)
+            updateState(DiffusionBackendState.Running)
             Log.i(TAG, "Backend started successfully")
             return true
 
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start backend", e)
-            updateState(BackendState.Error("Backend start failed: ${e.message}"))
+            updateState(DiffusionBackendState.Error("Backend start failed: ${e.message}"))
             return false
         }
     }
 
     private fun buildCommand(
-        model: ModelConfig, modelsDir: File, executableFile: File, width: Int, height: Int
+        model: DiffusionModelConfig, modelsDir: File, executableFile: File, width: Int, height: Int
     ): List<String> {
         val preferences = context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
         val useImg2img = preferences.getBoolean("use_img2img", true)
@@ -346,7 +362,7 @@ class DiffusionManager(private val context: Context) {
     }
 
     private fun buildCpuCommand(
-        model: ModelConfig, modelsDir: File, executableFile: File, useImg2img: Boolean
+        model: DiffusionModelConfig, modelsDir: File, executableFile: File, useImg2img: Boolean
     ): List<String> {
         var command = listOf(
             executableFile.absolutePath,
@@ -364,6 +380,8 @@ class DiffusionManager(private val context: Context) {
             model.textEmbeddingSize.toString(),
             "--cpu"
         )
+
+
 
         if (useImg2img) {
             command = command + listOf(
@@ -443,15 +461,15 @@ class DiffusionManager(private val context: Context) {
                     val exitCode = proc.waitFor()
                     Log.i(TAG, "Backend process exited with code: $exitCode")
 
-                    if (_backendState.value is BackendState.Running) {
-                        updateState(BackendState.Error("Backend process exited unexpectedly (code: $exitCode)"))
+                    if (_Diffusion_backendState.value is DiffusionBackendState.Running) {
+                        updateState(DiffusionBackendState.Error("Backend process exited unexpectedly (code: $exitCode)"))
                     }
                 }
             } catch (e: InterruptedException) {
                 Log.d(TAG, "Monitor thread interrupted")
             } catch (e: Exception) {
                 Log.e(TAG, "Monitor thread error", e)
-                updateState(BackendState.Error("Monitor error: ${e.message}"))
+                updateState(DiffusionBackendState.Error("Monitor error: ${e.message}"))
             }
         }.apply {
             isDaemon = true
@@ -469,7 +487,7 @@ class DiffusionManager(private val context: Context) {
         Log.d(TAG, "================================")
     }
 
-    private fun updateState(state: BackendState) {
-        _backendState.value = state
+    private fun updateState(state: DiffusionBackendState) {
+        _Diffusion_backendState.value = state
     }
 }

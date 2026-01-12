@@ -57,15 +57,15 @@ class StableDiffusionManager private constructor(context: Context) {
     private val generationManager = GenerationManager.getInstance(context)
 
     // Expose state flows
-    val backendState: StateFlow<BackendState> = diffusionManager.backendState
-    val generationState: StateFlow<GenerationState> = generationManager.generationState
+    val diffusionBackendState: StateFlow<DiffusionBackendState> = diffusionManager.diffusionBackendState
+    val diffusionGenerationState: StateFlow<DiffusionGenerationState> = generationManager.diffusionGenerationState
     val isGenerating: StateFlow<Boolean> = generationManager.isGenerating
 
     /**
      * Initialize the runtime environment
      * Must be called before any other operations
      */
-    fun initialize(config: RuntimeConfig = RuntimeConfig("runtime_libs")) {
+    fun initialize(config: DiffusionRuntimeConfig = DiffusionRuntimeConfig("runtime_libs")) {
         diffusionManager.setupRuntime(config)
     }
 
@@ -73,8 +73,8 @@ class StableDiffusionManager private constructor(context: Context) {
      * Load a model and start the backend server
      * @return true if successful, false otherwise
      */
-    fun loadModel(modelConfig: ModelConfig, width: Int = 512, height: Int = 512): Boolean {
-        return diffusionManager.loadModel(modelConfig, width, height)
+    fun loadModel(diffusionModelConfig: DiffusionModelConfig, width: Int = 512, height: Int = 512): Boolean {
+        return diffusionManager.loadModel(diffusionModelConfig, width, height)
     }
 
     /**
@@ -96,7 +96,7 @@ class StableDiffusionManager private constructor(context: Context) {
      * Generate an image asynchronously
      * Monitor progress through generationState flow
      */
-    fun generateImage(params: GenerationParams) {
+    fun generateImage(params: DiffusionGenerationParams) {
         generationManager.generateImage(params)
     }
 
@@ -104,7 +104,7 @@ class StableDiffusionManager private constructor(context: Context) {
      * Generate an image synchronously (suspending function)
      * @return GenerationResult containing the bitmap or error
      */
-    suspend fun generateImageSync(params: GenerationParams): GenerationResult {
+    suspend fun generateImageSync(params: DiffusionGenerationParams): DiffusionGenerationResult {
         return generationManager.generateImageSync(params)
     }
 
@@ -125,7 +125,7 @@ class StableDiffusionManager private constructor(context: Context) {
     /**
      * Get the currently loaded model
      */
-    fun getCurrentModel(): ModelConfig? {
+    fun getCurrentModel(): DiffusionModelConfig? {
         return diffusionManager.getCurrentModel()
     }
 

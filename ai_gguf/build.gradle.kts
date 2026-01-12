@@ -10,7 +10,6 @@ plugins {
 
 android {
     namespace = "com.mp.ai_gguf"
-    ndkPath = "/home/home/Android/Sdk/ndk/android-ndk-r27d"
     compileSdk {
         version = release(36)
     }
