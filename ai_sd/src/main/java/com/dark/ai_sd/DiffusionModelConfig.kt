@@ -90,6 +90,6 @@ data class DiffusionRuntimeConfig(
     val runtimeDir: String,
     val executableName: String = "libstable_diffusion_core.so",
     val qnnLibsAssetPath: String = "qnnlibs",
-    val safetyCheckerEnabled: Boolean = false,
+    val safetyCheckerEnabled: Boolean = true,
     val safetyCheckerPath: String = "assets/safety_checker.mnn"
 )

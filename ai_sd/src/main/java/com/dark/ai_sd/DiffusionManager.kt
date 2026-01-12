@@ -63,7 +63,7 @@ class DiffusionManager(private val context: Context) {
             prepareRuntimeDirectory(config)
 
             if (config.safetyCheckerEnabled) {
-                prepareSafetyChecker(config.safetyCheckerPath)
+                prepareSafetyChecker()
             }
 
             isRuntimePrepared = true
@@ -171,44 +171,44 @@ class DiffusionManager(private val context: Context) {
         }
 
         try {
+            val markerFile = File(runtimeDir, ".extracted")
+
+            if (markerFile.exists() && runtimeDir.listFiles()?.isNotEmpty() == true) {
+                Log.i(TAG, "QNN libraries already exist, skipping extraction")
+
+                runtimeDir.listFiles()?.forEach { file ->
+                    file.setReadable(true, true)
+                    file.setExecutable(true, true)
+                }
+
+                runtimeDir.setReadable(true, true)
+                runtimeDir.setExecutable(true, true)
+
+                Log.i(TAG, "QNN libraries prepared in: ${runtimeDir.absolutePath}")
+                Log.i(TAG, "Runtime files: ${runtimeDir.list()?.joinToString()}")
+                return
+            }
+
             val tarXzAssetPath = "${config.qnnLibsAssetPath}/qnnlibs.tar.xz"
             val tarXzFile = File(context.cacheDir, "qnnlibs.tar.xz")
 
-            // Check if extraction is needed
-            val markerFile = File(runtimeDir, ".extracted")
-            val needsExtraction = !markerFile.exists() || run {
-                // Check if tar.xz file has changed
-                val assetInputStream = context.assets.open(tarXzAssetPath)
-                val assetSize = assetInputStream.use { it.available().toLong() }
-                !tarXzFile.exists() || tarXzFile.length() != assetSize
-            }
+            Log.i(TAG, "Extracting QNN libraries from tar.xz")
 
-            if (needsExtraction) {
-                Log.i(TAG, "Extracting QNN libraries from tar.xz")
-
-                // Copy tar.xz from assets to cache
-                context.assets.open(tarXzAssetPath).use { input ->
-                    tarXzFile.outputStream().use { output ->
-                        input.copyTo(output)
-                    }
+            context.assets.open(tarXzAssetPath).use { input ->
+                tarXzFile.outputStream().use { output ->
+                    input.copyTo(output)
                 }
-                Log.d(TAG, "Copied tar.xz to cache: ${tarXzFile.absolutePath}")
-
-                // Extract tar.xz using system commands
-                extractTarXzWithCommonsCompress(tarXzFile, runtimeDir)
-
-                // Create marker file to indicate successful extraction
-                markerFile.createNewFile()
-
-                // Clean up tar.xz file
-                tarXzFile.delete()
-
-                Log.i(TAG, "QNN libraries extracted successfully")
-            } else {
-                Log.i(TAG, "QNN libraries already extracted, skipping")
             }
+            Log.d(TAG, "Copied tar.xz to cache: ${tarXzFile.absolutePath}")
 
-            // Set permissions for all files in runtime directory
+            extractTarXzWithCommonsCompress(tarXzFile, runtimeDir)
+
+            markerFile.createNewFile()
+
+            tarXzFile.delete()
+
+            Log.i(TAG, "QNN libraries extracted successfully")
+
             runtimeDir.listFiles()?.forEach { file ->
                 file.setReadable(true, true)
                 file.setExecutable(true, true)
@@ -225,8 +225,14 @@ class DiffusionManager(private val context: Context) {
         }
     }
 
-    private fun prepareSafetyChecker(assetPath: String = "assets/safety_checker.mnn") {
+    private fun prepareSafetyChecker(assetPath: String = "safety_checker.mnn") {
         try {
+            // Ensure parent directory exists
+            if (!safetyCheckerFile.parentFile?.exists()!!) {
+                safetyCheckerFile.parentFile?.mkdirs()
+                Log.d(TAG, "Created safety checker directory: ${safetyCheckerFile.parentFile?.absolutePath}")
+            }
+
             val safetyCheckerSource = context.assets.open(assetPath)
             val safetyCheckerTarget = safetyCheckerFile
 

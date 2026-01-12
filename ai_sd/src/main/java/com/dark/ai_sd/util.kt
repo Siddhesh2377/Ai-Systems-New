@@ -18,16 +18,33 @@ import java.util.Base64
 
 fun extractTarXzWithCommonsCompress(tarXzFile: File, targetDir: File) {
     try {
-        // Note: You'll need to add Apache Commons Compress dependency
-
-
         val inputStream = tarXzFile.inputStream()
         val xzIn = XZInputStream(inputStream)
         val tarIn = TarArchiveInputStream(xzIn)
 
         var entry: TarArchiveEntry?
+        var rootDirName: String? = null
+
         while (tarIn.nextEntry.also { entry = it } != null) {
-            val outputFile = File(targetDir, entry!!.name)
+            val entryName = entry!!.name
+
+            // Detect and strip the root directory
+            val pathComponents = entryName.split("/")
+            if (rootDirName == null && pathComponents.size > 1) {
+                rootDirName = pathComponents[0]
+            }
+
+            // Strip root directory if present
+            val relativePath = if (rootDirName != null && entryName.startsWith("$rootDirName/")) {
+                entryName.substring(rootDirName.length + 1)
+            } else {
+                entryName
+            }
+
+            // Skip if it's just the root directory itself or empty path
+            if (relativePath.isEmpty()) continue
+
+            val outputFile = File(targetDir, relativePath)
 
             if (entry.isDirectory) {
                 outputFile.mkdirs()
