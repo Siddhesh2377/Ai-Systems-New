@@ -269,6 +269,7 @@ class DiffusionManager(private val context: Context) {
             var command = buildCommand(model, modelsDir, executableFile, width, height)
 
             if (model.safetyMode){
+                Log.d(TAG, "Using safety checker model: ${safetyCheckerFile.absolutePath}")
                 if (!safetyCheckerFile.exists()){
                     throw FileNotFoundException("Safety checker model not found: ${safetyCheckerFile.absolutePath}")
                 }

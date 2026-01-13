@@ -250,7 +250,8 @@ class ModelConfigBuilder {
             runOnCpu = runOnCpu,
             useCpuClip = useCpuClip,
             isPony = isPony,
-            httpPort = httpPort
+            httpPort = httpPort,
+            safetyMode = safetyMode
         )
     }
 }
