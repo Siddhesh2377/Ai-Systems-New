@@ -453,9 +453,7 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeGenerateStream(JNIEnv *env, jobject, js
             break;
         }
 
-        LOG_INFO("About to sample, ctx=%p, sampler=%p", g_state.ctx, g_state.sampler);
         llama_token tok = llama_sampler_sample(g_state.sampler, g_state.ctx, -1);
-        LOG_INFO("Sampled token: %d", tok);
 
         // Check for invalid token
         if (tok < 0) {
