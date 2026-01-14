@@ -5,14 +5,21 @@
  * - Uses llama_memory_* API instead of deprecated llama_kv_cache_*
  * - Optimized detokenization for immediate streaming
  * - Improved sampler chain construction
+ * - Grammar caching for tool calls (avoids rebuilds)
+ * - Memory metrics tracking
  */
 
 #include "model_state.h"
 #include "../utils/logger.h"
+#include "../chat/chat_template.h"
 
 #include <cstring>
 #include <algorithm>
 #include <jni.h>
+
+#if defined(__ANDROID__)
+#include <sys/sysinfo.h>
+#endif
 
 // Global model state instance
 ModelState g_state;
@@ -396,4 +403,121 @@ bool ModelState::load_state_data(const void* data, size_t size) const {
             size
     );
     return n == size;
+}
+
+// ============================================================================
+// GRAMMAR MANAGEMENT (Optimized for low-end devices)
+// ============================================================================
+
+void ModelState::update_grammar_if_needed() {
+    if (!tools_enabled || tools_json.empty()) {
+        // No tools - clean up any existing grammar
+        if (grammar_sampler) {
+            llama_sampler_free(grammar_sampler);
+            grammar_sampler = nullptr;
+        }
+        grammar_needs_rebuild = false;
+        cached_tools_json.clear();
+        return;
+    }
+
+    // Check if we can reuse cached grammar
+    if (!grammar_needs_rebuild && tools_json == cached_tools_json && grammar_sampler) {
+        LOG_INFO("Reusing cached grammar sampler");
+        return;
+    }
+
+    LOG_INFO("Building new grammar sampler for tools");
+
+    // Free existing grammar sampler
+    if (grammar_sampler) {
+        llama_sampler_free(grammar_sampler);
+        grammar_sampler = nullptr;
+    }
+
+    // Build new grammar
+    const std::string grammar = chat::build_tool_grammar(tools_json);
+    if (grammar.empty()) {
+        LOG_ERROR("Failed to build tool grammar");
+        tools_enabled = false;
+        return;
+    }
+
+    const llama_vocab* vocab = llama_model_get_vocab(model);
+    if (!vocab) {
+        LOG_ERROR("Failed to get vocab for grammar");
+        return;
+    }
+
+    grammar_sampler = llama_sampler_init_grammar(vocab, grammar.c_str(), "root");
+
+    if (!grammar_sampler) {
+        LOG_ERROR("Grammar sampler initialization failed");
+        tools_enabled = false;
+    } else {
+        // Cache for next time
+        cached_tools_json = tools_json;
+        grammar_needs_rebuild = false;
+        LOG_INFO("Grammar sampler cached successfully");
+    }
+}
+
+// ============================================================================
+// MEMORY MANAGEMENT
+// ============================================================================
+
+void ModelState::update_memory_metrics() {
+    if (!model || !ctx) {
+        memory_metrics = MemoryMetrics{};
+        return;
+    }
+
+    // Estimate model size (this is approximate)
+    // llama.cpp doesn't expose exact memory usage, so we estimate
+    const llama_vocab* vocab = llama_model_get_vocab(model);
+    int32_t n_vocab = vocab ? llama_vocab_n_tokens(vocab) : 0;
+    int32_t n_embd = llama_model_n_embd(model);
+    int32_t n_layer = llama_model_n_layer(model);
+
+    // Rough estimate: vocab embedding + layers
+    // This is a simplified calculation
+    memory_metrics.model_size_bytes = static_cast<size_t>(n_vocab) * n_embd * sizeof(float);
+
+    // Context memory estimate: KV cache
+    // KV cache size = 2 * n_layer * ctx_size * n_embd * sizeof(float16)
+    memory_metrics.context_size_bytes = estimate_context_memory(ctx_size, n_embd, n_layer);
+
+#if defined(__ANDROID__)
+    // Get system memory info
+    struct sysinfo si;
+    if (sysinfo(&si) == 0) {
+        size_t total_mem = si.totalram * si.mem_unit;
+        size_t used_mem = memory_metrics.model_size_bytes + memory_metrics.context_size_bytes;
+        memory_metrics.memory_usage_percent = (total_mem > 0)
+            ? (static_cast<float>(used_mem) / static_cast<float>(total_mem)) * 100.0f
+            : 0.0f;
+    }
+#endif
+
+    // Track peak
+    size_t current_total = memory_metrics.model_size_bytes + memory_metrics.context_size_bytes;
+    if (current_total > memory_metrics.peak_memory_bytes) {
+        memory_metrics.peak_memory_bytes = current_total;
+    }
+
+    LOG_INFO("Memory metrics updated: model=%zu MB, ctx=%zu MB, peak=%zu MB",
+             memory_metrics.model_size_bytes / (1024 * 1024),
+             memory_metrics.context_size_bytes / (1024 * 1024),
+             memory_metrics.peak_memory_bytes / (1024 * 1024));
+}
+
+size_t ModelState::estimate_context_memory(int32_t ctx_size, int32_t n_embd, int32_t n_layer) {
+    // KV cache: 2 (K and V) * layers * context * embedding * sizeof(float16)
+    // Plus some overhead for attention weights
+    const size_t kv_cache = 2 * static_cast<size_t>(n_layer) *
+                            static_cast<size_t>(ctx_size) *
+                            static_cast<size_t>(n_embd) * sizeof(uint16_t);
+
+    // Add ~10% overhead for internal buffers
+    return static_cast<size_t>(kv_cache * 1.1);
 }

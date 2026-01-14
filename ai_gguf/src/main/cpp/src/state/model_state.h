@@ -7,13 +7,31 @@
  * - Uses llama_memory_* API instead of deprecated llama_kv_cache_*
  * - Optimized detokenization for streaming
  * - Efficient UTF-8 handling
+ * - Grammar caching for tool calls
+ * - Configurable batch sizes for low-end devices
  */
 
 #include "llama.h"
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <functional>
 #include <jni.h>
+
+/**
+ * Memory usage metrics for monitoring
+ */
+struct MemoryMetrics {
+    size_t model_size_bytes = 0;      // Approximate model memory
+    size_t context_size_bytes = 0;    // KV cache and context memory
+    size_t peak_memory_bytes = 0;     // Peak observed memory
+    float memory_usage_percent = 0.0f; // Percentage of available memory
+};
+
+/**
+ * Progress callback for model loading
+ */
+using LoadProgressCallback = std::function<void(float progress)>;
 
 class ModelState {
 public:
@@ -26,6 +44,7 @@ public:
     // Configuration
     int32_t ctx_size = 0;
     int32_t batch_size = 512;
+    int32_t ubatch_size = 256;  // Micro-batch size for low-end devices
 
     // Chat/Tool state
     std::string system_prompt;
@@ -33,8 +52,15 @@ public:
     std::string tools_json;
     bool tools_enabled = false;
 
+    // Grammar caching for tool calls
+    std::string cached_tools_json;     // Last tools JSON used to build grammar
+    bool grammar_needs_rebuild = true;  // Flag to trigger grammar rebuild
+
     // UTF-8 carry buffer for incomplete sequences (legacy)
     std::string utf8_carry_buffer;
+
+    // Memory tracking
+    MemoryMetrics memory_metrics;
 
     // ========================================================================
     // CORE METHODS
@@ -70,6 +96,30 @@ public:
             float mirostatEta,
             int seed
     );
+
+    // ========================================================================
+    // GRAMMAR MANAGEMENT (Optimized for low-end devices)
+    // ========================================================================
+
+    /**
+     * Initialize or update grammar sampler for tool calls
+     * Only rebuilds if tools_json has changed (caching)
+     */
+    void update_grammar_if_needed();
+
+    /**
+     * Check if grammar needs to be rebuilt
+     */
+    bool needs_grammar_rebuild() const {
+        return grammar_needs_rebuild || (tools_json != cached_tools_json);
+    }
+
+    /**
+     * Force grammar rebuild on next generation
+     */
+    void invalidate_grammar() {
+        grammar_needs_rebuild = true;
+    }
 
     // ========================================================================
     // TOKENIZATION
@@ -115,6 +165,25 @@ public:
      * Warm up context
      */
     void warmup_context() const;
+
+    // ========================================================================
+    // MEMORY MANAGEMENT
+    // ========================================================================
+
+    /**
+     * Update memory metrics
+     */
+    void update_memory_metrics();
+
+    /**
+     * Get current memory metrics
+     */
+    const MemoryMetrics& get_memory_metrics() const { return memory_metrics; }
+
+    /**
+     * Estimate memory needed for given context size
+     */
+    static size_t estimate_context_memory(int32_t ctx_size, int32_t n_embd, int32_t n_layer);
 
     // ========================================================================
     // STATE PERSISTENCE

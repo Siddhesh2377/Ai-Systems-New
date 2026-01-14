@@ -292,26 +292,15 @@ private:
     }
 };
 
+/**
+ * Initialize or update grammar sampler for tool calls
+ * Uses caching to avoid rebuilds when tools haven't changed
+ */
 static void maybe_init_grammar() {
     if (!g_state.tools_enabled) return;
 
-    LOG_INFO("Initializing tool-call grammar");
-    const std::string grammar = chat::build_tool_grammar(g_state.tools_json);
-
-    if (!grammar.empty()) {
-        if (g_state.grammar_sampler) {
-            llama_sampler_free(g_state.grammar_sampler);
-            g_state.grammar_sampler = nullptr;
-        }
-
-        const llama_vocab *vocab = llama_model_get_vocab(g_state.model);
-        g_state.grammar_sampler = llama_sampler_init_grammar(vocab, grammar.c_str(), "root");
-
-        if (!g_state.grammar_sampler) {
-            LOG_ERROR("Tool grammar initialization failed");
-            g_state.tools_enabled = false;
-        }
-    }
+    // Use cached grammar management
+    g_state.update_grammar_if_needed();
 }
 
 static const char *get_model_architecture(llama_model *model) {
@@ -441,6 +430,15 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeGenerateStream(JNIEnv *env, jobject, js
     // Check every 64 tokens or so
     constexpr int EXCEPTION_CHECK_INTERVAL = 64;
     bool has_exception = false;
+
+    // ========================================================================
+    // LAZY TOOL DETECTION OPTIMIZATION
+    // Only engage tool call parsing after seeing potential tool call start
+    // This reduces overhead when generating normal text
+    // ========================================================================
+    bool tool_detection_active = g_state.tools_enabled;
+    bool seen_non_whitespace = false;
+    bool definitely_not_tool_call = false;
 
     // ========================================================================
     // MAIN GENERATION LOOP - IMMEDIATE TOKEN STREAMING
