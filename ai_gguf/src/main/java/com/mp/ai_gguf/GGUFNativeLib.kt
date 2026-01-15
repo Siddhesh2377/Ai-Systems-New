@@ -13,6 +13,20 @@ import com.mp.ai_gguf.models.StreamCallback
  */
 class GGUFNativeLib {
 
+    external fun nativeLoadModelFromFd(
+        fd: Int,
+        threads: Int,
+        ctxSize: Int,
+        temp: Float,
+        topK: Int,
+        topP: Float,
+        minP: Float,
+        mirostat: Int,
+        mirostatTau: Float,
+        mirostatEta: Float,
+        seed: Int
+    ): Boolean
+
     external fun nativeRelease(): Boolean
     external fun nativeSetChatTemplate(template: String)
     external fun nativeSetToolsJson(toolsJson: String)

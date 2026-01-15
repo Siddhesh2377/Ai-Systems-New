@@ -29,6 +29,7 @@
 #include <chrono>
 #include <sstream>
 #include <algorithm>
+#include <sys/stat.h>
 
 static std::mutex g_init_mtx;
 static std::atomic<bool> g_stop_requested{false};
@@ -574,6 +575,82 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeGenerateStream(JNIEnv *env, jobject, js
 
     return JNI_TRUE;
 }
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mp_ai_1gguf_GGUFNativeLib_nativeLoadModelFromFd(JNIEnv *env, jobject, jint fd,
+                                                         jint jthreads, jint ctxSize, jfloat temp,
+                                                         jint topK, jfloat topP, jfloat minP,
+                                                         jint mirostat, jfloat mirostatTau,
+                                                         jfloat mirostatEta, jint seed) {
+    std::lock_guard<std::mutex> lk(g_init_mtx);
+
+    g_state.release();
+    llama_backend_init();
+
+    int phys = count_physical_cores();
+    int nthreads = (jthreads > 0) ? static_cast<int>(jthreads) : phys;
+
+    LOG_INFO("Initializing model from fd=%d (threads=%d, ctx=%d)", fd, nthreads, ctxSize);
+
+    // Get file size via fstat
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        LOG_ERROR("fstat failed: %s", strerror(errno));
+        return JNI_FALSE;
+    }
+    size_t file_size = static_cast<size_t>(st.st_size);
+    LOG_INFO("File size: %zu bytes", file_size);
+
+    // Model parameters - no mmap for FD-based loading
+    llama_model_params mparams = llama_model_default_params();
+    mparams.n_gpu_layers = 0;
+    mparams.use_mmap = false;  // FD loading doesn't support mmap
+    mparams.use_mlock = false;
+    mparams.check_tensors = false;  // Skip tensor validation for faster load
+
+    // Use the native FD loading API (added to llama.cpp for Android SAF support)
+    // This avoids the /proc/self/fd/ workaround that fails on Android
+    g_state.model = llama_model_load_from_fd(fd, file_size, mparams);
+
+    if (!g_state.model) {
+        LOG_ERROR("llama_model_load_from_fd failed");
+        g_state.release();
+        return JNI_FALSE;
+    }
+
+    LOG_INFO("Model loaded successfully from fd");
+
+    // Context setup
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx = ctxSize;
+    cparams.n_batch = 512;
+    cparams.n_ubatch = 256;
+    cparams.n_threads = nthreads;
+    cparams.n_threads_batch = nthreads;
+    cparams.offload_kqv = false;
+    cparams.n_seq_max = 1;
+    cparams.no_perf = false;
+
+    g_state.ctx = llama_init_from_model(g_state.model, cparams);
+    if (!g_state.ctx) {
+        LOG_ERROR("Failed to create context");
+        g_state.release();
+        return JNI_FALSE;
+    }
+
+    g_state.ctx_size = ctxSize;
+    g_state.batch_size = cparams.n_batch;
+
+    g_state.rebuild_sampler(static_cast<int>(topK), topP, temp, minP, mirostat, mirostatTau,
+                            mirostatEta, seed);
+    g_state.warmup_context();
+    maybe_init_grammar();
+
+    LOG_INFO("Model initialized successfully from fd");
+    return JNI_TRUE;
+}
+
+
 
 
 extern "C" JNIEXPORT jboolean JNICALL
