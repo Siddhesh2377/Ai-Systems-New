@@ -4,7 +4,7 @@ project(ai_gguf LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-set(LLAMACPP_DIR /home/home/dev/AI/llama.cpp)
+set(LLAMACPP_DIR /home/home/CLionProjects/llama.cpp-android)
 if(NOT EXISTS "${LLAMACPP_DIR}/CMakeLists.txt")
     message(FATAL_ERROR "Could not find llama.cpp in ${LLAMACPP_DIR}")
 endif()
