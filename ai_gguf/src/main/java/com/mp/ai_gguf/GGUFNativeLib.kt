@@ -121,6 +121,72 @@ class GGUFNativeLib {
      */
     external fun nativeGetEmbeddingModelInfo(): String
 
+    /**
+     * Load an embedding model from file descriptor (for SAF compatibility)
+     *
+     * @param fd File descriptor from ContentResolver
+     * @param threads Number of threads (0 = auto-detect physical cores)
+     * @param ctxSize Context size for embeddings
+     * @return true if model loaded successfully
+     */
+    external fun nativeLoadEmbeddingModelFromFd(
+        fd: Int,
+        threads: Int,
+        ctxSize: Int
+    ): Boolean
+
+    // ========================================================================
+    // TOOL CALLING SDK FUNCTIONS
+    // ========================================================================
+
+    /**
+     * Get the architecture of the loaded model
+     *
+     * @return Model architecture (e.g., "qwen2", "llama", etc.) or empty string if no model
+     */
+    external fun nativeGetModelArchitecture(): String
+
+    /**
+     * Check if the currently loaded model supports tool calling
+     *
+     * Only Qwen models support tool calling in this implementation.
+     *
+     * @return true if model supports tool calling (i.e., is a Qwen model)
+     */
+    external fun nativeIsToolCallingSupported(): Boolean
+
+    /**
+     * Enable tool calling mode for the current model
+     *
+     * This will:
+     * 1. Verify the model is a Qwen model (returns false otherwise)
+     * 2. Set the tool calling system prompt
+     * 3. Set the Qwen chat template with tool calling support
+     * 4. Initialize the grammar sampler for tool call JSON
+     *
+     * @param toolsJson OpenAI-compatible tools JSON array
+     * @return true if tool calling was enabled successfully
+     */
+    external fun nativeEnableToolCalling(toolsJson: String): Boolean
+
+    /**
+     * Disable tool calling and revert to default model behavior
+     *
+     * This clears:
+     * - Tools JSON
+     * - System prompt
+     * - Chat template override
+     * - Tool calling state
+     */
+    external fun nativeDisableToolCalling()
+
+    /**
+     * Check if tool calling is currently enabled
+     *
+     * @return true if tool calling is enabled
+     */
+    external fun nativeIsToolCallingEnabled(): Boolean
+
     companion object {
         init {
             System.loadLibrary("ai_gguf")

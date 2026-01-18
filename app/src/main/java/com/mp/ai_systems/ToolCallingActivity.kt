@@ -1,6 +1,5 @@
 package com.mp.ai_systems
 
-import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.widget.Toast
@@ -8,19 +7,17 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Send
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -31,6 +28,8 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.mp.ai_gguf.GGUFNativeLib
 import com.mp.ai_gguf.models.DecodingMetrics
 import com.mp.ai_gguf.models.StreamCallback
+import com.mp.ai_gguf.toolcalling.ToolCallManager
+import com.mp.ai_gguf.toolcalling.tool
 import com.mp.ai_systems.ui.theme.AiSystemsTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -38,17 +37,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import org.json.JSONArray
-import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.*
-
-// Data classes
-data class Tools(
-    val toolName: String,
-    val description: String,
-    val args: Map<String, Any?>
-)
 
 sealed class Message {
     data class User(val text: String) : Message()
@@ -57,9 +47,10 @@ sealed class Message {
     data class Error(val text: String) : Message()
 }
 
-// ViewModel
+// ViewModel with new SDK
 class ToolCallingViewModel : ViewModel() {
     private val gguf = GGUFNativeLib()
+    private val toolCallManager = ToolCallManager(gguf)
 
     private val _messages = MutableStateFlow<List<Message>>(emptyList())
     val messages: StateFlow<List<Message>> = _messages.asStateFlow()
@@ -73,75 +64,40 @@ class ToolCallingViewModel : ViewModel() {
     private val _currentResponse = MutableStateFlow("")
     val currentResponse: StateFlow<String> = _currentResponse.asStateFlow()
 
-    private val toolCallingChatTemplate = """
-        {%- if professional is defined or emotional is defined -%}
-        <|im_start|>system
-        The assistant should modulate style accordingly while staying accurate.
-        <|im_end|>
-        {%- endif -%}
-        {%- if gbnf is defined and gbnf|length > 0 -%}
-        <|im_start|>system
-        The assistant's NEXT message MUST conform to the following GBNF grammar.
-        If a token would violate the grammar, do not emit it.
-        <GBNF>
-        {{ gbnf }}
-        </GBNF>
-        <|im_end|>
-        {%- endif -%}
-        {%- for m in messages -%}
-        <|im_start|>{{ m['role'] }}
-        {{ m['content'] }}
-        <|im_end|>
-        {%- endfor -%}
-        {%- if add_generation_prompt -%}
-        <|im_start|>assistant
-        {%- endif -%}
-    """.trimIndent()
+    init {
+        // Register tools using the new SDK
+        registerTools()
+    }
 
-    private val toolCallingSystemPrompt = """
-        You are a function-calling assistant. When tools are available, respond ONLY with a JSON object in this EXACT format:
-
-        {
-          "tool_calls": [{
-            "name": "toolName",
-            "arguments": {
-              "param1": "value1",
-              "param2": "value2"
+    private fun registerTools() {
+        toolCallManager.registerTools(
+            tool("get_current_time", "Get the current date and/or time") {
+                stringParam(
+                    "format",
+                    "Format type: 'full' for both date and time, 'time' for time only, 'date' for date only",
+                    required = false,
+                    enum = listOf("full", "time", "date")
+                )
+            },
+            tool("show_toast", "Display a toast message to the user") {
+                stringParam("message", "The message to display", required = true)
+                stringParam(
+                    "duration",
+                    "Duration to show the toast",
+                    required = false,
+                    enum = listOf("short", "long")
+                )
+            },
+            tool("get_device_info", "Get information about the Android device") {
+                stringParam(
+                    "info_type",
+                    "Type of information: 'basic' for device name, 'system' for OS info, 'all' for everything",
+                    required = false,
+                    enum = listOf("basic", "system", "all")
+                )
             }
-          }]
-        }
-
-        CRITICAL RULES:
-        1. Use "arguments" as an object containing all parameters
-        2. NEVER put parameters directly in the tool_calls object
-        3. NEVER include any text before or after the JSON
-        4. The "arguments" field must be a JSON object, not a string
-        5. Match parameter names exactly as defined in the tool schema
-
-        If no tool is needed, respond with plain text.
-    """.trimIndent()
-
-    // Available tools
-    private val availableTools = listOf(
-        Tools(
-            toolName = "get_current_time",
-            description = "Get the current date and/or time. Use 'full' for both, 'time' for time only, 'date' for date only.",
-            args = mapOf("format" to "full")
-        ),
-        Tools(
-            toolName = "show_toast",
-            description = "Display a toast message to the user",
-            args = mapOf(
-                "message" to "",
-                "duration" to "short"
-            )
-        ),
-        Tools(
-            toolName = "get_device_info",
-            description = "Get information about the Android device",
-            args = mapOf("info_type" to "basic")
         )
-    )
+    }
 
     fun loadModel(context: android.content.Context, uri: Uri) {
         viewModelScope.launch(Dispatchers.IO) {
@@ -164,17 +120,34 @@ class ToolCallingViewModel : ViewModel() {
                 )
 
                 if (success) {
-                    // Set system prompt and chat template
-                    gguf.nativeSetSystemPrompt(toolCallingSystemPrompt)
-                    gguf.nativeSetChatTemplate(toolCallingChatTemplate)
+                    // Check if model supports tool calling
+                    if (!toolCallManager.isModelCompatible()) {
+                        val arch = toolCallManager.modelArchitecture
+                        withContext(Dispatchers.Main) {
+                            _messages.value += Message.Error(
+                                "Model loaded but tool calling is not supported. " +
+                                "Model architecture: $arch. Only Qwen models support tool calling."
+                            )
+                        }
+                        _modelLoaded.value = true
+                        return@launch
+                    }
 
-                    // Build and set tools JSON
-                    val toolsJson = buildToolsJson()
-                    gguf.nativeSetToolsJson(toolsJson)
-
-                    _modelLoaded.value = true
-                    withContext(Dispatchers.Main) {
-                        _messages.value += Message.Assistant("Model loaded! I can now call tools. Try asking: 'What time is it?'")
+                    // Enable tool calling using the SDK
+                    if (toolCallManager.enable()) {
+                        _modelLoaded.value = true
+                        withContext(Dispatchers.Main) {
+                            _messages.value += Message.Assistant(
+                                "✅ Qwen model loaded with tool calling enabled!\n\n" +
+                                "Available tools:\n" +
+                                "• get_current_time - Get the current date/time\n" +
+                                "• show_toast - Display a message\n" +
+                                "• get_device_info - Get device information\n\n" +
+                                "Try asking: 'What time is it?'"
+                            )
+                        }
+                    } else {
+                        throw Exception("Failed to enable tool calling: ${toolCallManager.lastError}")
                     }
                 } else {
                     throw Exception("Failed to load model")
@@ -208,9 +181,15 @@ class ToolCallingViewModel : ViewModel() {
                     override fun onToolCall(name: String, argsJson: String) {
                         toolCallDetected = true
                         viewModelScope.launch {
-                            // Execute tool
-                            val result = executeToolCall(name, argsJson, context)
-                            _messages.value += Message.ToolCall(name, argsJson, result)
+                            // Parse tool call using SDK
+                            val toolCall = toolCallManager.parseToolCall(argsJson)
+                            if (toolCall != null) {
+                                // Execute tool
+                                val result = executeToolCall(toolCall, context)
+                                _messages.value += Message.ToolCall(toolCall.name, argsJson, result)
+                            } else {
+                                _messages.value += Message.Error("Failed to parse tool call: ${toolCallManager.lastError}")
+                            }
                             _currentResponse.value = ""
                         }
                     }
@@ -249,29 +228,26 @@ class ToolCallingViewModel : ViewModel() {
     }
 
     private suspend fun executeToolCall(
-        name: String,
-        argsJson: String,
+        toolCall: com.mp.ai_gguf.toolcalling.ToolCall,
         context: android.content.Context
     ): String {
         return withContext(Dispatchers.IO) {
             try {
-                val args = JSONObject(argsJson)
-
-                when (name) {
+                when (toolCall.name) {
                     "get_current_time" -> {
-                        val format = args.optString("format", "full")
+                        val format = toolCall.getString("format", "full")
                         getCurrentTime(format)
                     }
                     "show_toast" -> {
-                        val message = args.optString("message", "Hello!")
-                        val duration = args.optString("duration", "short")
+                        val message = toolCall.getString("message", "Hello!")
+                        val duration = toolCall.getString("duration", "short")
                         showToast(context, message, duration)
                     }
                     "get_device_info" -> {
-                        val infoType = args.optString("info_type", "basic")
+                        val infoType = toolCall.getString("info_type", "basic")
                         getDeviceInfo(infoType)
                     }
-                    else -> "Unknown tool: $name"
+                    else -> "Unknown tool: ${toolCall.name}"
                 }
             } catch (e: Exception) {
                 "Error executing tool: ${e.message}"
@@ -318,48 +294,6 @@ class ToolCallingViewModel : ViewModel() {
         }
 
         return info.toString()
-    }
-
-    private fun buildToolsJson(): String {
-        val toolsArray = JSONArray()
-
-        availableTools.forEach { tool ->
-            val toolDef = toolDefinitionBuilder(tool)
-            toolsArray.put(toolDef.getJSONObject(0))
-        }
-
-        return toolsArray.toString()
-    }
-
-    private fun toolDefinitionBuilder(tool: Tools): JSONArray {
-        val properties = JSONObject()
-        val required = mutableListOf<String>()
-
-        tool.args.forEach { (key, value) ->
-            val type = when (value) {
-                is Int, is Double, is Float -> "number"
-                is Boolean -> "boolean"
-                else -> "string"
-            }
-            properties.put(key, JSONObject().put("type", type))
-            if (value != null) required.add(key)
-        }
-
-        val parameters = JSONObject()
-            .put("type", "object")
-            .put("properties", properties)
-            .put("required", JSONArray(required))
-
-        val function = JSONObject()
-            .put("name", tool.toolName)
-            .put("description", tool.description)
-            .put("parameters", parameters)
-
-        return JSONArray().put(
-            JSONObject()
-                .put("type", "function")
-                .put("function", function)
-        )
     }
 
     override fun onCleared() {
@@ -479,7 +413,7 @@ fun ToolCallingScreen(viewModel: ToolCallingViewModel = viewModel()) {
                         },
                         enabled = !isLoading && inputText.isNotBlank()
                     ) {
-                        Icon(Icons.Default.Send, "Send")
+                        Icon(Icons.AutoMirrored.Filled.Send, "Send")
                     }
                 }
             }

@@ -1269,3 +1269,136 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeGetEmbeddingModelInfo(JNIEnv *env, jobj
     json << "}";
     return env->NewStringUTF(json.str().c_str());
 }
+
+// ============================================================================
+// TOOL CALLING SDK FUNCTIONS
+// ============================================================================
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_mp_ai_1gguf_GGUFNativeLib_nativeGetModelArchitecture(JNIEnv *env, jobject) {
+    if (!g_state.model) {
+        return env->NewStringUTF("");
+    }
+
+    const char *arch = get_model_architecture(g_state.model);
+    return env->NewStringUTF(arch ? arch : "");
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mp_ai_1gguf_GGUFNativeLib_nativeIsToolCallingSupported(JNIEnv *env, jobject) {
+    if (!g_state.model) {
+        return JNI_FALSE;
+    }
+
+    const char *arch = get_model_architecture(g_state.model);
+    if (!arch) {
+        return JNI_FALSE;
+    }
+
+    // Only Qwen models support tool calling
+    std::string arch_str(arch);
+    std::transform(arch_str.begin(), arch_str.end(), arch_str.begin(), ::tolower);
+
+    return (arch_str.find("qwen") != std::string::npos) ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mp_ai_1gguf_GGUFNativeLib_nativeEnableToolCalling(JNIEnv *env, jobject, jstring jtools) {
+    if (!g_state.model) {
+        LOG_ERROR("Cannot enable tool calling: model not loaded");
+        return JNI_FALSE;
+    }
+
+    // Check if model supports tool calling
+    const char *arch = get_model_architecture(g_state.model);
+    if (!arch) {
+        LOG_ERROR("Cannot enable tool calling: failed to get model architecture");
+        return JNI_FALSE;
+    }
+
+    std::string arch_str(arch);
+    std::transform(arch_str.begin(), arch_str.end(), arch_str.begin(), ::tolower);
+
+    if (arch_str.find("qwen") == std::string::npos) {
+        LOG_ERROR("Tool calling only supported for Qwen models, got: %s", arch);
+        return JNI_FALSE;
+    }
+
+    // Set tools JSON
+    const std::string tools_json = utf8::from_jstring(env, jtools);
+    g_state.tools_json = tools_json;
+    g_state.tools_enabled = !tools_json.empty();
+
+    // Set tool calling system prompt
+    const std::string tool_system_prompt =
+        "You are a function-calling assistant. When tools are available, respond ONLY with a JSON object in this EXACT format:\n"
+        "\n"
+        "{\n"
+        "  \"tool_calls\": [{\n"
+        "    \"name\": \"toolName\",\n"
+        "    \"arguments\": {\n"
+        "      \"param1\": \"value1\",\n"
+        "      \"param2\": \"value2\"\n"
+        "    }\n"
+        "  }]\n"
+        "}\n"
+        "\n"
+        "CRITICAL RULES:\n"
+        "1. Use \"arguments\" as an object containing all parameters\n"
+        "2. NEVER put parameters directly in the tool_calls object\n"
+        "3. NEVER include any text before or after the JSON\n"
+        "4. The \"arguments\" field must be a JSON object, not a string\n"
+        "5. Match parameter names exactly as defined in the tool schema\n"
+        "\n"
+        "If no tool is needed, respond with plain text.";
+
+    g_state.system_prompt = tool_system_prompt;
+
+    // Set Qwen chat template with tool calling support
+    const std::string qwen_template =
+        "{%- if professional is defined or emotional is defined -%}\n"
+        "<|im_start|>system\n"
+        "The assistant should modulate style accordingly while staying accurate.\n"
+        "<|im_end|>\n"
+        "{%- endif -%}\n"
+        "{%- if gbnf is defined and gbnf|length > 0 -%}\n"
+        "<|im_start|>system\n"
+        "The assistant's NEXT message MUST conform to the following GBNF grammar.\n"
+        "If a token would violate the grammar, do not emit it.\n"
+        "<GBNF>\n"
+        "{{ gbnf }}\n"
+        "</GBNF>\n"
+        "<|im_end|>\n"
+        "{%- endif -%}\n"
+        "{%- for m in messages -%}\n"
+        "<|im_start|>{{ m['role'] }}\n"
+        "{{ m['content'] }}\n"
+        "<|im_end|>\n"
+        "{%- endfor -%}\n"
+        "{%- if add_generation_prompt -%}\n"
+        "<|im_start|>assistant\n"
+        "{%- endif -%}";
+
+    g_state.chat_template_override = qwen_template;
+
+    // Initialize grammar
+    maybe_init_grammar();
+
+    LOG_INFO("Tool calling enabled for Qwen model (%zu bytes of tools JSON)", tools_json.size());
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_mp_ai_1gguf_GGUFNativeLib_nativeDisableToolCalling(JNIEnv *env, jobject) {
+    g_state.tools_json.clear();
+    g_state.tools_enabled = false;
+    g_state.system_prompt.clear();
+    g_state.chat_template_override.clear();
+
+    LOG_INFO("Tool calling disabled, reverted to default model settings");
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mp_ai_1gguf_GGUFNativeLib_nativeIsToolCallingEnabled(JNIEnv *env, jobject) {
+    return g_state.tools_enabled ? JNI_TRUE : JNI_FALSE;
+}
