@@ -1024,6 +1024,81 @@ namespace {
 } // anonymous namespace
 
 extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mp_ai_1gguf_GGUFNativeLib_nativeLoadEmbeddingModelFromFd(JNIEnv *env, jobject,
+                                                                   jint fd,
+                                                                   jint jthreads,
+                                                                   jint ctxSize) {
+    std::lock_guard<std::mutex> lk(g_init_mtx);
+
+    g_embedding_state.release();
+    llama_backend_init();
+
+    int phys = count_physical_cores();
+    int nthreads = (jthreads > 0) ? static_cast<int>(jthreads) : phys;
+
+    LOG_INFO("Loading embedding model from fd=%d (threads=%d, ctx=%d)", fd, nthreads, ctxSize);
+
+    // Get file size via fstat
+    struct stat st{};
+    if (fstat(fd, &st) != 0) {
+        LOG_ERROR("fstat failed: %s", strerror(errno));
+        return JNI_FALSE;
+    }
+    auto file_size = static_cast<size_t>(st.st_size);
+    LOG_INFO("File size: %zu bytes", file_size);
+
+    // Model parameters - no mmap for FD-based loading
+    llama_model_params mparams = llama_model_default_params();
+    mparams.n_gpu_layers = 0;
+    mparams.use_mmap = false;  // FD loading doesn't support mmap
+    mparams.use_mlock = false;
+    mparams.check_tensors = false;  // Skip tensor validation for faster load
+
+    // Load model from FD
+    g_embedding_state.model = llama_model_load_from_fd(fd, file_size, mparams);
+    if (!g_embedding_state.model) {
+        LOG_ERROR("llama_model_load_from_fd failed for embedding model");
+        g_embedding_state.release();
+        return JNI_FALSE;
+    }
+
+    LOG_INFO("Embedding model loaded successfully from fd");
+
+    // Context parameters - optimized for embeddings
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx = ctxSize;
+    cparams.n_batch = g_embedding_state.batch_size;
+    cparams.n_ubatch = g_embedding_state.batch_size;
+    cparams.n_threads = nthreads;
+    cparams.n_threads_batch = nthreads;
+    cparams.offload_kqv = false;
+    cparams.n_seq_max = 1;
+    cparams.no_perf = false;
+    cparams.embeddings = true;  // CRITICAL: Enable embeddings mode
+
+    // Create context
+    g_embedding_state.ctx = llama_init_from_model(g_embedding_state.model, cparams);
+    if (!g_embedding_state.ctx) {
+        LOG_ERROR("Failed to create embedding context");
+        g_embedding_state.release();
+        return JNI_FALSE;
+    }
+
+    g_embedding_state.ctx_size = ctxSize;
+    g_embedding_state.n_threads = nthreads;
+
+    // Get embedding dimension
+    g_embedding_state.n_embd = g_embedding_state.get_embedding_dimension();
+    LOG_INFO("Embedding dimension: %d", g_embedding_state.n_embd);
+
+    // Detect pooling type from model
+    g_embedding_state.pooling_type = g_embedding_state.detect_pooling_type();
+
+    LOG_INFO("Embedding model initialized successfully from fd");
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
 Java_com_mp_ai_1gguf_GGUFNativeLib_nativeLoadEmbeddingModel(JNIEnv *env, jobject,
                                                              jstring jpath,
                                                              jint jthreads,
