@@ -3,9 +3,11 @@ package com.dark.ai_sd
 import android.annotation.SuppressLint
 import android.content.Context
 import android.util.Log
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileNotFoundException
 import java.io.IOException
@@ -53,25 +55,31 @@ class DiffusionManager(private val context: Context) {
      * Initialize the runtime environment
      * Must be called before loading models
      */
-    fun setupRuntime(config: DiffusionRuntimeConfig = DiffusionRuntimeConfig(RUNTIME_DIR)) {
+    // Add to DiffusionManager
+    suspend fun setupRuntimeAsync(config: DiffusionRuntimeConfig = DiffusionRuntimeConfig(RUNTIME_DIR)) {
         if (isRuntimePrepared) {
             Log.i(TAG, "Runtime already prepared")
             return
         }
 
-        try {
-            prepareRuntimeDirectory(config)
+        updateState(DiffusionBackendState.Starting)
 
-            if (config.safetyCheckerEnabled) {
-                prepareSafetyChecker()
+        withContext(Dispatchers.IO) {
+            try {
+                prepareRuntimeDirectory(config)
+
+                if (config.safetyCheckerEnabled) {
+                    prepareSafetyChecker()
+                }
+
+                isRuntimePrepared = true
+                updateState(DiffusionBackendState.Idle)
+                Log.i(TAG, "Runtime setup completed successfully")
+            } catch (e: Exception) {
+                Log.e(TAG, "Runtime setup failed", e)
+                updateState(DiffusionBackendState.Error("Runtime setup failed: ${e.message}"))
+                throw RuntimeException("Failed to setup runtime environment", e)
             }
-
-            isRuntimePrepared = true
-            Log.i(TAG, "Runtime setup completed successfully")
-        } catch (e: Exception) {
-            Log.e(TAG, "Runtime setup failed", e)
-            updateState(DiffusionBackendState.Error("Runtime setup failed: ${e.message}"))
-            throw RuntimeException("Failed to setup runtime environment", e)
         }
     }
 

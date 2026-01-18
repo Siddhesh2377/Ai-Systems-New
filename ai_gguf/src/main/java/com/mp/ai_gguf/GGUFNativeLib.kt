@@ -1,6 +1,7 @@
 package com.mp.ai_gguf
 
 import com.mp.ai_gguf.models.StreamCallback
+import com.mp.ai_gguf.models.EmbeddingCallback
 
 /**
  * Native library interface for GGUF model inference
@@ -70,6 +71,55 @@ class GGUFNativeLib {
         mirostatEta: Float,
         seed: Int
     ): Boolean
+
+    // ========================================================================
+    // EMBEDDING MODEL FUNCTIONS
+    // ========================================================================
+
+    /**
+     * Load an embedding model from file path
+     *
+     * This loads the model in a separate thread/state from the main generation model,
+     * so you can have both a generation model and embedding model loaded simultaneously.
+     *
+     * @param path Path to the embedding model file (must be in app directory)
+     * @param threads Number of threads (0 = auto-detect physical cores)
+     * @param contextSize Context size for the embedding model (512 typical for embeddings)
+     * @return true if model loaded successfully
+     */
+    external fun nativeLoadEmbeddingModel(
+        path: String,
+        threads: Int,
+        contextSize: Int
+    ): Boolean
+
+    /**
+     * Encode text into embeddings
+     *
+     * @param text The text to encode
+     * @param normalize Whether to L2-normalize the output embeddings (recommended for similarity)
+     * @param callback Callback for progress and results
+     * @return true if encoding started successfully
+     */
+    external fun nativeEncodeText(
+        text: String,
+        normalize: Boolean,
+        callback: EmbeddingCallback
+    ): Boolean
+
+    /**
+     * Release the embedding model and free resources
+     *
+     * @return true if released successfully
+     */
+    external fun nativeReleaseEmbeddingModel(): Boolean
+
+    /**
+     * Get embedding model info (architecture, dimensions, etc.)
+     *
+     * @return JSON string with model info, or empty object if no model loaded
+     */
+    external fun nativeGetEmbeddingModelInfo(): String
 
     companion object {
         init {

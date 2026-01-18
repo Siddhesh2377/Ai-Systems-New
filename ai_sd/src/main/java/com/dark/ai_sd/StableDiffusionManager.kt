@@ -65,8 +65,8 @@ class StableDiffusionManager private constructor(context: Context) {
      * Initialize the runtime environment
      * Must be called before any other operations
      */
-    fun initialize(config: DiffusionRuntimeConfig = DiffusionRuntimeConfig("runtime_libs")) {
-        diffusionManager.setupRuntime(config)
+    suspend fun initialize(config: DiffusionRuntimeConfig = DiffusionRuntimeConfig("runtime_libs")) {
+        diffusionManager.setupRuntimeAsync(config)
     }
 
     /**

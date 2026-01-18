@@ -19,6 +19,7 @@ add_subdirectory(${LLAMACPP_DIR} llama-build)
 
 set(SRC_FILES
         src/ai_gguf.cpp
+        src/state/embedding_state.cpp
         src/state/model_state.cpp
         src/utils/jni_utils.cpp
         src/utils/utf8_utils.cpp

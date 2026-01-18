@@ -12,6 +12,7 @@
  */
 
 #include "state/model_state.h"
+#include "state/embedding_state.h"
 #include "utils/jni_utils.h"
 #include "utils/utf8_utils.h"
 #include "chat/chat_template.h"
@@ -879,6 +880,316 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeGetModelInfo(JNIEnv *env, jobject thiz)
     // System info - only if it exists
     const char *sys_info = llama_print_system_info();
     add_string_field("system", sys_info);
+
+    json << "}";
+    return env->NewStringUTF(json.str().c_str());
+}
+
+// ============================================================================
+// EMBEDDING MODEL FUNCTIONS
+// ============================================================================
+
+namespace {
+    // Pre-cached JNI references for embedding callbacks
+    struct EmbeddingCallbackCache {
+        jclass cls = nullptr;
+        jmethodID onProgress = nullptr;
+        jmethodID onComplete = nullptr;
+        jmethodID onError = nullptr;
+
+        // EmbeddingResult class cache
+        jclass resultClass = nullptr;
+        jmethodID resultConstructor = nullptr;
+
+        bool initialized = false;
+
+        void init(JNIEnv *env, jobject callback) {
+            if (initialized) return;
+
+            jclass tempCls = env->GetObjectClass(callback);
+            if (!tempCls) {
+                LOG_ERROR("EmbeddingCallbackCache: Failed to get callback class");
+                return;
+            }
+
+            cls = static_cast<jclass>(env->NewGlobalRef(tempCls));
+            env->DeleteLocalRef(tempCls);
+
+            onProgress = env->GetMethodID(cls, "onProgress", "(FII)V");
+            onComplete = env->GetMethodID(cls, "onComplete",
+                                          "(Lcom/mp/ai_gguf/models/EmbeddingResult;)V");
+            onError = env->GetMethodID(cls, "onError", "(Ljava/lang/String;)V");
+
+            // Cache EmbeddingResult class
+            jclass tempResultCls = env->FindClass("com/mp/ai_gguf/models/EmbeddingResult");
+            if (tempResultCls) {
+                resultClass = static_cast<jclass>(env->NewGlobalRef(tempResultCls));
+                resultConstructor = env->GetMethodID(resultClass, "<init>",
+                                                     "([FILjava/lang/String;IJ)V");
+                env->DeleteLocalRef(tempResultCls);
+            }
+
+            initialized = true;
+        }
+
+        void release(JNIEnv *env) {
+            if (cls) {
+                env->DeleteGlobalRef(cls);
+                cls = nullptr;
+            }
+            if (resultClass) {
+                env->DeleteGlobalRef(resultClass);
+                resultClass = nullptr;
+            }
+            initialized = false;
+        }
+    };
+
+    static thread_local EmbeddingCallbackCache g_embedding_callback_cache;
+
+    inline void send_embedding_progress(JNIEnv *env, jobject callback,
+                                        float progress, int32_t current, int32_t total) {
+        if (!callback) return;
+
+        g_embedding_callback_cache.init(env, callback);
+        if (!g_embedding_callback_cache.onProgress) return;
+
+        env->CallVoidMethod(callback, g_embedding_callback_cache.onProgress,
+                            progress, current, total);
+    }
+
+    inline void send_embedding_complete(JNIEnv *env, jobject callback,
+                                        const EmbeddingOutput &output) {
+        if (!callback) return;
+
+        g_embedding_callback_cache.init(env, callback);
+        if (!g_embedding_callback_cache.onComplete ||
+            !g_embedding_callback_cache.resultClass) return;
+
+        // Convert embeddings to jfloatArray
+        jfloatArray jembeddings = env->NewFloatArray(output.dimension);
+        if (!jembeddings) {
+            LOG_ERROR("Failed to create float array for embeddings");
+            return;
+        }
+        env->SetFloatArrayRegion(jembeddings, 0, output.dimension, output.embeddings.data());
+
+        // Get pooling type string
+        const char *pooling_str = "mean";
+        switch (output.pooling) {
+            case PoolingType::NONE:
+                pooling_str = "none";
+                break;
+            case PoolingType::MEAN:
+                pooling_str = "mean";
+                break;
+            case PoolingType::CLS:
+                pooling_str = "cls";
+                break;
+            case PoolingType::LAST:
+                pooling_str = "last";
+                break;
+            case PoolingType::MAX:
+                pooling_str = "max";
+                break;
+        }
+        jstring jpooling = env->NewStringUTF(pooling_str);
+
+        // Create EmbeddingResult object
+        jobject result = env->NewObject(g_embedding_callback_cache.resultClass,
+                                        g_embedding_callback_cache.resultConstructor,
+                                        jembeddings, output.dimension, jpooling,
+                                        output.num_tokens, output.time_ms);
+
+        if (result) {
+            env->CallVoidMethod(callback, g_embedding_callback_cache.onComplete, result);
+            env->DeleteLocalRef(result);
+        }
+
+        env->DeleteLocalRef(jembeddings);
+        env->DeleteLocalRef(jpooling);
+    }
+
+    inline void send_embedding_error(JNIEnv *env, jobject callback, const char *msg) {
+        if (!callback) return;
+
+        g_embedding_callback_cache.init(env, callback);
+        if (!g_embedding_callback_cache.onError) return;
+
+        jstring jmsg = env->NewStringUTF(msg ? msg : "<unknown error>");
+        env->CallVoidMethod(callback, g_embedding_callback_cache.onError, jmsg);
+        env->DeleteLocalRef(jmsg);
+    }
+
+} // anonymous namespace
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mp_ai_1gguf_GGUFNativeLib_nativeLoadEmbeddingModel(JNIEnv *env, jobject,
+                                                             jstring jpath,
+                                                             jint jthreads,
+                                                             jint ctxSize) {
+    std::lock_guard<std::mutex> lk(g_init_mtx);
+
+    const std::string path = utf8::from_jstring(env, jpath);
+    g_embedding_state.release();
+    llama_backend_init();
+
+    // Detect optimal thread count
+    int phys = count_physical_cores();
+    int nthreads = (jthreads > 0) ? static_cast<int>(jthreads) : phys;
+
+    LOG_INFO("Loading embedding model '%s' (threads=%d, ctx=%d)", path.c_str(), nthreads,
+             ctxSize);
+
+    // Model parameters - optimized for embeddings
+    llama_model_params mparams = llama_model_default_params();
+    mparams.n_gpu_layers = 0;  // CPU-only for Android
+    mparams.use_mmap = true;   // Memory-map for efficiency
+    mparams.use_mlock = false;
+    mparams.check_tensors = true;
+
+    // Load model
+    g_embedding_state.model = llama_model_load_from_file(path.c_str(), mparams);
+    if (!g_embedding_state.model) {
+        LOG_ERROR("Failed to load embedding model '%s'", path.c_str());
+        g_embedding_state.release();
+        return JNI_FALSE;
+    }
+
+    // Context parameters - optimized for embeddings
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx = ctxSize;
+    cparams.n_batch = g_embedding_state.batch_size;
+    cparams.n_ubatch = g_embedding_state.batch_size;
+    cparams.n_threads = nthreads;
+    cparams.n_threads_batch = nthreads;
+    cparams.offload_kqv = false;
+    cparams.n_seq_max = 1;
+    cparams.no_perf = false;
+    cparams.embeddings = true;  // CRITICAL: Enable embeddings mode
+
+    // Create context
+    g_embedding_state.ctx = llama_init_from_model(g_embedding_state.model, cparams);
+    if (!g_embedding_state.ctx) {
+        LOG_ERROR("Failed to create embedding context");
+        g_embedding_state.release();
+        return JNI_FALSE;
+    }
+
+    g_embedding_state.ctx_size = ctxSize;
+    g_embedding_state.n_threads = nthreads;
+
+    // Get embedding dimension
+    g_embedding_state.n_embd = g_embedding_state.get_embedding_dimension();
+    LOG_INFO("Embedding dimension: %d", g_embedding_state.n_embd);
+
+    // Detect pooling type from model
+    g_embedding_state.pooling_type = g_embedding_state.detect_pooling_type();
+
+    LOG_INFO("Embedding model loaded successfully");
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mp_ai_1gguf_GGUFNativeLib_nativeEncodeText(JNIEnv *env, jobject, jstring jtext,
+                                                     jboolean normalize, jobject jcallback) {
+    if (!g_embedding_state.is_ready()) {
+        send_embedding_error(env, jcallback, "Embedding model not initialized");
+        return JNI_FALSE;
+    }
+
+    const std::string text = utf8::from_jstring(env, jtext);
+    if (text.empty()) {
+        send_embedding_error(env, jcallback, "Empty text provided");
+        return JNI_FALSE;
+    }
+
+    LOG_INFO("Encoding text (%zu bytes)", text.size());
+
+    // Create progress callback that forwards to Java
+    auto progress_callback = [env, jcallback](float progress, int32_t current, int32_t total) {
+        send_embedding_progress(env, jcallback, progress, current, total);
+    };
+
+    // Encode text
+    EmbeddingOutput output = g_embedding_state.encode(text, normalize, progress_callback);
+
+    // Check if encoding succeeded
+    if (output.embeddings.empty()) {
+        send_embedding_error(env, jcallback, "Encoding failed");
+        return JNI_FALSE;
+    }
+
+    // Send result to callback
+    send_embedding_complete(env, jcallback, output);
+
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mp_ai_1gguf_GGUFNativeLib_nativeReleaseEmbeddingModel(JNIEnv *, jobject) {
+    std::lock_guard<std::mutex> lk(g_init_mtx);
+    g_embedding_state.release();
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_mp_ai_1gguf_GGUFNativeLib_nativeGetEmbeddingModelInfo(JNIEnv *env, jobject) {
+    if (!g_embedding_state.model) return env->NewStringUTF("{}");
+
+    std::ostringstream json;
+    json << "{";
+    bool first = true;
+
+    auto add_string_field = [&](const char *key, const char *value) {
+        if (value && *value) {
+            if (!first) json << ",";
+            json << "\"" << key << "\":\"" << chat::json_escape(value) << "\"";
+            first = false;
+        }
+    };
+
+    auto add_int_field = [&](const char *key, int value) {
+        if (value > 0) {
+            if (!first) json << ",";
+            json << "\"" << key << "\":" << value;
+            first = false;
+        }
+    };
+
+    // Model identity
+    const char *arch = get_model_architecture(g_embedding_state.model);
+    const char *name = get_model_name(g_embedding_state.model);
+    const char *desc = get_model_description(g_embedding_state.model);
+
+    add_string_field("architecture", arch);
+    add_string_field("name", name);
+    add_string_field("description", desc);
+
+    // Embedding-specific info
+    add_int_field("n_embd", g_embedding_state.n_embd);
+    add_int_field("n_ctx", g_embedding_state.ctx_size);
+
+    // Pooling type
+    const char *pooling_str = "unknown";
+    switch (g_embedding_state.pooling_type) {
+        case PoolingType::NONE:
+            pooling_str = "none";
+            break;
+        case PoolingType::MEAN:
+            pooling_str = "mean";
+            break;
+        case PoolingType::CLS:
+            pooling_str = "cls";
+            break;
+        case PoolingType::LAST:
+            pooling_str = "last";
+            break;
+        case PoolingType::MAX:
+            pooling_str = "max";
+            break;
+    }
+    add_string_field("pooling", pooling_str);
 
     json << "}";
     return env->NewStringUTF(json.str().c_str());
