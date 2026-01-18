@@ -1025,9 +1025,9 @@ namespace {
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_mp_ai_1gguf_GGUFNativeLib_nativeLoadEmbeddingModelFromFd(JNIEnv *env, jobject,
-                                                                   jint fd,
-                                                                   jint jthreads,
-                                                                   jint ctxSize) {
+                                                                  jint fd,
+                                                                  jint jthreads,
+                                                                  jint ctxSize) {
     std::lock_guard<std::mutex> lk(g_init_mtx);
 
     g_embedding_state.release();
@@ -1100,9 +1100,9 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeLoadEmbeddingModelFromFd(JNIEnv *env, j
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_mp_ai_1gguf_GGUFNativeLib_nativeLoadEmbeddingModel(JNIEnv *env, jobject,
-                                                             jstring jpath,
-                                                             jint jthreads,
-                                                             jint ctxSize) {
+                                                            jstring jpath,
+                                                            jint jthreads,
+                                                            jint ctxSize) {
     std::lock_guard<std::mutex> lk(g_init_mtx);
 
     const std::string path = utf8::from_jstring(env, jpath);
@@ -1167,7 +1167,7 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeLoadEmbeddingModel(JNIEnv *env, jobject
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_mp_ai_1gguf_GGUFNativeLib_nativeEncodeText(JNIEnv *env, jobject, jstring jtext,
-                                                     jboolean normalize, jobject jcallback) {
+                                                    jboolean normalize, jobject jcallback) {
     if (!g_embedding_state.is_ready()) {
         send_embedding_error(env, jcallback, "Embedding model not initialized");
         return JNI_FALSE;
@@ -1331,53 +1331,53 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeEnableToolCalling(JNIEnv *env, jobject,
 
     // Set tool calling system prompt
     const std::string tool_system_prompt =
-        "You are a function-calling assistant. When tools are available, respond ONLY with a JSON object in this EXACT format:\n"
-        "\n"
-        "{\n"
-        "  \"tool_calls\": [{\n"
-        "    \"name\": \"toolName\",\n"
-        "    \"arguments\": {\n"
-        "      \"param1\": \"value1\",\n"
-        "      \"param2\": \"value2\"\n"
-        "    }\n"
-        "  }]\n"
-        "}\n"
-        "\n"
-        "CRITICAL RULES:\n"
-        "1. Use \"arguments\" as an object containing all parameters\n"
-        "2. NEVER put parameters directly in the tool_calls object\n"
-        "3. NEVER include any text before or after the JSON\n"
-        "4. The \"arguments\" field must be a JSON object, not a string\n"
-        "5. Match parameter names exactly as defined in the tool schema\n"
-        "\n"
-        "If no tool is needed, respond with plain text.";
+            "You are a function-calling assistant. When tools are available, respond ONLY with a JSON object in this EXACT format:\n"
+            "\n"
+            "{\n"
+            "  \"tool_calls\": [{\n"
+            "    \"name\": \"toolName\",\n"
+            "    \"arguments\": {\n"
+            "      \"param1\": \"value1\",\n"
+            "      \"param2\": \"value2\"\n"
+            "    }\n"
+            "  }]\n"
+            "}\n"
+            "\n"
+            "CRITICAL RULES:\n"
+            "1. Use \"arguments\" as an object containing all parameters\n"
+            "2. NEVER put parameters directly in the tool_calls object\n"
+            "3. NEVER include any text before or after the JSON\n"
+            "4. The \"arguments\" field must be a JSON object, not a string\n"
+            "5. Match parameter names exactly as defined in the tool schema\n"
+            "\n"
+            "If no tool is needed, respond with plain text.";
 
     g_state.system_prompt = tool_system_prompt;
 
     // Set Qwen chat template with tool calling support
     const std::string qwen_template =
-        "{%- if professional is defined or emotional is defined -%}\n"
-        "<|im_start|>system\n"
-        "The assistant should modulate style accordingly while staying accurate.\n"
-        "<|im_end|>\n"
-        "{%- endif -%}\n"
-        "{%- if gbnf is defined and gbnf|length > 0 -%}\n"
-        "<|im_start|>system\n"
-        "The assistant's NEXT message MUST conform to the following GBNF grammar.\n"
-        "If a token would violate the grammar, do not emit it.\n"
-        "<GBNF>\n"
-        "{{ gbnf }}\n"
-        "</GBNF>\n"
-        "<|im_end|>\n"
-        "{%- endif -%}\n"
-        "{%- for m in messages -%}\n"
-        "<|im_start|>{{ m['role'] }}\n"
-        "{{ m['content'] }}\n"
-        "<|im_end|>\n"
-        "{%- endfor -%}\n"
-        "{%- if add_generation_prompt -%}\n"
-        "<|im_start|>assistant\n"
-        "{%- endif -%}";
+            "{%- if professional is defined or emotional is defined -%}\n"
+            "<|im_start|>system\n"
+            "The assistant should modulate style accordingly while staying accurate.\n"
+            "<|im_end|>\n"
+            "{%- endif -%}\n"
+            "{%- if gbnf is defined and gbnf|length > 0 -%}\n"
+            "<|im_start|>system\n"
+            "The assistant's NEXT message MUST conform to the following GBNF grammar.\n"
+            "If a token would violate the grammar, do not emit it.\n"
+            "<GBNF>\n"
+            "{{ gbnf }}\n"
+            "</GBNF>\n"
+            "<|im_end|>\n"
+            "{%- endif -%}\n"
+            "{%- for m in messages -%}\n"
+            "<|im_start|>{{ m['role'] }}\n"
+            "{{ m['content'] }}\n"
+            "<|im_end|>\n"
+            "{%- endfor -%}\n"
+            "{%- if add_generation_prompt -%}\n"
+            "<|im_start|>assistant\n"
+            "{%- endif -%}";
 
     g_state.chat_template_override = qwen_template;
 
