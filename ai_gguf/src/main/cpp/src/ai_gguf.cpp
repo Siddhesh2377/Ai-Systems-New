@@ -1329,28 +1329,50 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeEnableToolCalling(JNIEnv *env, jobject,
     g_state.tools_json = tools_json;
     g_state.tools_enabled = !tools_json.empty();
 
-    // Set tool calling system prompt
+    // Set tool calling system prompt with multi-step reasoning support
     const std::string tool_system_prompt =
-        "You are a function-calling assistant. When tools are available, respond ONLY with a JSON object in this EXACT format:\n"
+        "You are a multi-step reasoning assistant with tool calling capabilities.\n"
         "\n"
+        "RESPONSE MODES:\n"
+        "1. REASONING MODE: Explain your thinking in one concise sentence before calling a tool\n"
+        "2. TOOL CALL MODE: Execute a tool using the exact JSON format below\n"
+        "3. NORMAL MODE: Respond with plain text when no tools are needed\n"
+        "\n"
+        "MULTI-STEP WORKFLOW:\n"
+        "- For complex requests, create a mental plan of steps\n"
+        "- Before each tool call, briefly explain WHY (one sentence)\n"
+        "- After receiving tool results, either:\n"
+        "  a) Call another tool if more steps needed\n"
+        "  b) Provide a final answer synthesizing all results\n"
+        "\n"
+        "TOOL CALL FORMAT (use EXACTLY this structure):\n"
         "{\n"
         "  \"tool_calls\": [{\n"
         "    \"name\": \"toolName\",\n"
         "    \"arguments\": {\n"
-        "      \"param1\": \"value1\",\n"
-        "      \"param2\": \"value2\"\n"
+        "      \"param1\": \"value1\"\n"
         "    }\n"
         "  }]\n"
         "}\n"
         "\n"
-        "CRITICAL RULES:\n"
-        "1. Use \"arguments\" as an object containing all parameters\n"
-        "2. NEVER put parameters directly in the tool_calls object\n"
-        "3. NEVER include any text before or after the JSON\n"
-        "4. The \"arguments\" field must be a JSON object, not a string\n"
-        "5. Match parameter names exactly as defined in the tool schema\n"
+        "EXAMPLES:\n"
+        "User: Show me the time and device info\n"
+        "Assistant: I'll check the time first, then get device information.\n"
+        "[Tool result received]\n"
+        "Assistant: {\"tool_calls\":[{\"name\":\"get_current_time\",\"arguments\":{\"format\":\"full\"}}]}\n"
+        "[Time result received]\n"
+        "Assistant: Now I'll get the device information.\n"
+        "[Tool result received]\n"
+        "Assistant: {\"tool_calls\":[{\"name\":\"get_device_info\",\"arguments\":{\"info_type\":\"all\"}}]}\n"
+        "[Device info received]\n"
+        "Assistant: Here's what I found: [synthesize both results]\n"
         "\n"
-        "If no tool is needed, respond with plain text.";
+        "CRITICAL RULES:\n"
+        "1. Use \"arguments\" as a JSON object, not a string\n"
+        "2. Match parameter names EXACTLY as defined in tool schema\n"
+        "3. One tool call per response (system will feed back results)\n"
+        "4. Explain reasoning briefly (1 sentence) before complex tool calls\n"
+        "5. After all tools executed, provide a final summary";
 
     g_state.system_prompt = tool_system_prompt;
 

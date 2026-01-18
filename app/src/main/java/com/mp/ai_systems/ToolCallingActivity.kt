@@ -39,16 +39,23 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.*
+import android.util.Log
 
 sealed class Message {
     data class User(val text: String) : Message()
     data class Assistant(val text: String) : Message()
+    data class Reasoning(val text: String) : Message() // Model's thinking before tool call
     data class ToolCall(val name: String, val args: String, val result: String?) : Message()
     data class Error(val text: String) : Message()
+    data class System(val text: String) : Message() // System notifications
 }
 
 // ViewModel with new SDK
 class ToolCallingViewModel : ViewModel() {
+    companion object {
+        private const val TAG = "ToolCallingVM"
+    }
+
     private val gguf = GGUFNativeLib()
     private val toolCallManager = ToolCallManager(gguf)
 
@@ -63,6 +70,9 @@ class ToolCallingViewModel : ViewModel() {
 
     private val _currentResponse = MutableStateFlow("")
     val currentResponse: StateFlow<String> = _currentResponse.asStateFlow()
+
+    private val _progressMessage = MutableStateFlow("")
+    val progressMessage: StateFlow<String> = _progressMessage.asStateFlow()
 
     init {
         // Register tools using the new SDK
@@ -100,10 +110,15 @@ class ToolCallingViewModel : ViewModel() {
     }
 
     fun loadModel(context: android.content.Context, uri: Uri) {
+        Log.i(TAG, "loadModel: Starting model load from URI: $uri")
         viewModelScope.launch(Dispatchers.IO) {
             try {
+                Log.d(TAG, "Opening file descriptor...")
                 val fd = context.contentResolver.openFileDescriptor(uri, "r")?.detachFd()
                     ?: throw Exception("Failed to open file descriptor")
+
+                Log.i(TAG, "File descriptor obtained: $fd")
+                Log.d(TAG, "Loading model from FD...")
 
                 val success = gguf.nativeLoadModelFromFd(
                     fd = fd,
@@ -119,10 +134,14 @@ class ToolCallingViewModel : ViewModel() {
                     seed = -1
                 )
 
+                Log.i(TAG, "nativeLoadModelFromFd returned: $success")
+
                 if (success) {
+                    Log.d(TAG, "Checking model compatibility...")
                     // Check if model supports tool calling
                     if (!toolCallManager.isModelCompatible()) {
                         val arch = toolCallManager.modelArchitecture
+                        Log.w(TAG, "Model not compatible for tool calling. Architecture: $arch")
                         withContext(Dispatchers.Main) {
                             _messages.value += Message.Error(
                                 "Model loaded but tool calling is not supported. " +
@@ -133,26 +152,35 @@ class ToolCallingViewModel : ViewModel() {
                         return@launch
                     }
 
-                    // Enable tool calling using the SDK
-                    if (toolCallManager.enable()) {
+                    Log.i(TAG, "Model is compatible (Qwen). Enabling tool calling...")
+                    // Enable tool calling with multi-step reasoning
+                    if (toolCallManager.enable(enableMultiStep = true)) {
+                        Log.i(TAG, "Tool calling enabled successfully")
                         _modelLoaded.value = true
                         withContext(Dispatchers.Main) {
-                            _messages.value += Message.Assistant(
-                                "✅ Qwen model loaded with tool calling enabled!\n\n" +
+                            _messages.value += Message.System(
+                                "✅ Qwen model loaded with multi-step tool calling!\n\n" +
+                                "Features:\n" +
+                                "• Multi-step reasoning - Model explains its thinking\n" +
+                                "• Automatic chaining - Tools execute in sequence\n" +
+                                "• Context preservation - Results fed back automatically\n\n" +
                                 "Available tools:\n" +
                                 "• get_current_time - Get the current date/time\n" +
                                 "• show_toast - Display a message\n" +
                                 "• get_device_info - Get device information\n\n" +
-                                "Try asking: 'What time is it?'"
+                                "Try: 'Show me the time and then device info'"
                             )
                         }
                     } else {
+                        Log.e(TAG, "Failed to enable tool calling: ${toolCallManager.lastError}")
                         throw Exception("Failed to enable tool calling: ${toolCallManager.lastError}")
                     }
                 } else {
+                    Log.e(TAG, "Failed to load model from FD")
                     throw Exception("Failed to load model")
                 }
             } catch (e: Exception) {
+                Log.e(TAG, "Exception in loadModel", e)
                 withContext(Dispatchers.Main) {
                     _messages.value += Message.Error("Error loading model: ${e.message}")
                 }
@@ -161,69 +189,174 @@ class ToolCallingViewModel : ViewModel() {
     }
 
     fun sendMessage(text: String, context: android.content.Context) {
-        if (text.isBlank() || !_modelLoaded.value) return
+        if (text.isBlank() || !_modelLoaded.value) {
+            Log.w(TAG, "sendMessage: blank text or model not loaded")
+            return
+        }
 
+        Log.i(TAG, "=== Starting new message: $text ===")
         viewModelScope.launch {
+            // Add user message and reset conversation for new request
             _messages.value += Message.User(text)
-            _isLoading.value = true
-            _currentResponse.value = ""
+            toolCallManager.resetConversation()
+            toolCallManager.conversationHistory.addUserMessage(text)
 
-            try {
-                var fullResponse = ""
-                var toolCallDetected = false
+            Log.d(TAG, "Conversation reset, starting generation loop")
 
-                val callback = object : StreamCallback {
-                    override fun onToken(token: String) {
-                        fullResponse += token
-                        _currentResponse.value = fullResponse
-                    }
+            // Start generation loop (supports multi-step)
+            executeGenerationLoop(text, context)
+        }
+    }
 
-                    override fun onToolCall(name: String, argsJson: String) {
-                        toolCallDetected = true
-                        viewModelScope.launch {
-                            // Parse tool call using SDK
-                            val toolCall = toolCallManager.parseToolCall(argsJson)
-                            if (toolCall != null) {
-                                // Execute tool
-                                val result = executeToolCall(toolCall, context)
-                                _messages.value += Message.ToolCall(toolCall.name, argsJson, result)
-                            } else {
-                                _messages.value += Message.Error("Failed to parse tool call: ${toolCallManager.lastError}")
-                            }
-                            _currentResponse.value = ""
-                        }
-                    }
+    private suspend fun executeGenerationLoop(
+        initialPrompt: String,
+        context: android.content.Context,
+        isContinuation: Boolean = false
+    ) {
+        Log.d(TAG, "executeGenerationLoop: isContinuation=$isContinuation")
+        _isLoading.value = true
+        _currentResponse.value = ""
+        _progressMessage.value = if (isContinuation) "Continuing..." else "Generating..."
 
-                    override fun onError(error: String) {
-                        viewModelScope.launch {
-                            _messages.value += Message.Error(error)
-                            _currentResponse.value = ""
-                        }
-                    }
+        try {
+            var fullResponse = ""
+            var isToolCall = false
+            var isReasoning = false
+            var tokenCount = 0
 
-                    override fun onDone() {
-                        viewModelScope.launch {
-                            if (!toolCallDetected && fullResponse.isNotBlank()) {
-                                _messages.value += Message.Assistant(fullResponse)
-                            }
-                            _currentResponse.value = ""
-                            _isLoading.value = false
-                        }
-                    }
-
-                    override fun onMetrics(metrics: DecodingMetrics) {
-                        // Optional: handle metrics
-                    }
-                }
-
-                withContext(Dispatchers.IO) {
-                    gguf.nativeGenerateStream(text, 256, callback)
-                }
-            } catch (e: Exception) {
-                _messages.value += Message.Error("Error: ${e.message}")
-                _isLoading.value = false
-                _currentResponse.value = ""
+            // Build prompt (initial or continuation)
+            val prompt = if (isContinuation) {
+                val contPrompt = toolCallManager.buildContinuationPrompt()
+                Log.d(TAG, "Continuation prompt: $contPrompt")
+                contPrompt
+            } else {
+                Log.d(TAG, "Initial prompt: $initialPrompt")
+                initialPrompt
             }
+
+            val callback = object : StreamCallback {
+                override fun onToken(token: String) {
+                    tokenCount++
+                    fullResponse += token
+                    _currentResponse.value = fullResponse
+                    _progressMessage.value = "Tokens: $tokenCount"
+
+                    if (tokenCount % 10 == 0) {
+                        Log.v(TAG, "Token $tokenCount: Current response length=${fullResponse.length}")
+                    }
+
+                    // Detect if this looks like a tool call (starts with {)
+                    if (fullResponse.trim().startsWith("{")) {
+                        isToolCall = true
+                        Log.d(TAG, "Detected tool call pattern")
+                    } else if (fullResponse.isNotBlank() && !isToolCall) {
+                        isReasoning = true
+                    }
+                }
+
+                override fun onToolCall(name: String, argsJson: String) {
+                    Log.i(TAG, "onToolCall: name=$name, args=$argsJson")
+                    isToolCall = true
+                    viewModelScope.launch {
+                        _currentResponse.value = ""
+                        _progressMessage.value = "Executing tool: $name"
+
+                        // Show reasoning if any
+                        val reasoningText = fullResponse.replace(argsJson, "").trim()
+                        Log.d(TAG, "Reasoning text: $reasoningText")
+
+                        if (reasoningText.isNotBlank() && !reasoningText.startsWith("{")) {
+                            Log.i(TAG, "Adding reasoning message")
+                            _messages.value += Message.Reasoning(reasoningText)
+                            toolCallManager.conversationHistory.addAssistantReasoning(reasoningText)
+                        }
+
+                        // Parse and execute tool call
+                        val toolCall = toolCallManager.parseToolCall(argsJson)
+                        if (toolCall != null) {
+                            Log.i(TAG, "Executing tool: ${toolCall.name}")
+                            val result = executeToolCall(toolCall, context)
+                            Log.i(TAG, "Tool result: $result")
+
+                            // Record in history
+                            toolCallManager.recordToolResult(toolCall.name, result, true)
+
+                            // Show in UI
+                            _messages.value += Message.ToolCall(toolCall.name, argsJson, result)
+
+                            // Auto-continue if needed
+                            val shouldCont = toolCallManager.shouldContinue()
+                            val toolCount = toolCallManager.conversationHistory.getToolCallCount()
+                            Log.d(TAG, "shouldContinue=$shouldCont, toolCount=$toolCount, maxSteps=${toolCallManager.maxAutoSteps}")
+
+                            if (shouldCont) {
+                                Log.i(TAG, "Auto-continuing to next step")
+                                _messages.value += Message.System("🔄 Continuing to next step...")
+                                executeGenerationLoop(initialPrompt, context, isContinuation = true)
+                            } else {
+                                Log.i(TAG, "No more continuation needed")
+                                _isLoading.value = false
+                                _progressMessage.value = ""
+                            }
+                        } else {
+                            Log.e(TAG, "Failed to parse tool call: ${toolCallManager.lastError}")
+                            _messages.value += Message.Error("Failed to parse tool call: ${toolCallManager.lastError}")
+                            _isLoading.value = false
+                            _progressMessage.value = ""
+                        }
+                    }
+                }
+
+                override fun onError(error: String) {
+                    Log.e(TAG, "onError: $error")
+                    viewModelScope.launch {
+                        _messages.value += Message.Error(error)
+                        _currentResponse.value = ""
+                        _isLoading.value = false
+                        _progressMessage.value = ""
+                    }
+                }
+
+                override fun onDone() {
+                    Log.d(TAG, "onDone: isToolCall=$isToolCall, fullResponse.length=${fullResponse.length}, isContinuation=$isContinuation")
+                    viewModelScope.launch {
+                        if (!isToolCall && fullResponse.isNotBlank()) {
+                            if (isReasoning && isContinuation) {
+                                // This is likely the final answer after tools
+                                Log.i(TAG, "Adding final assistant response (continuation)")
+                                _messages.value += Message.Assistant(fullResponse)
+                                toolCallManager.conversationHistory.addAssistantResponse(fullResponse)
+                            } else if (!isContinuation) {
+                                // Regular response without tools
+                                Log.i(TAG, "Adding regular assistant response")
+                                _messages.value += Message.Assistant(fullResponse)
+                            } else {
+                                Log.w(TAG, "onDone: Response not added - isToolCall=$isToolCall, fullResponse='$fullResponse'")
+                            }
+                        }
+                        _currentResponse.value = ""
+                        _isLoading.value = false
+                        _progressMessage.value = ""
+                        Log.i(TAG, "=== Generation complete ===")
+                    }
+                }
+
+                override fun onMetrics(metrics: DecodingMetrics) {
+                    Log.d(TAG, "Metrics: tokens=${metrics.totalTokens}, tps=${metrics.tokensPerSecond}")
+                }
+            }
+
+            Log.i(TAG, "Starting nativeGenerateStream...")
+            withContext(Dispatchers.IO) {
+                val success = gguf.nativeGenerateStream(prompt, 256, callback)
+                Log.d(TAG, "nativeGenerateStream returned: $success")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception in executeGenerationLoop", e)
+            _messages.value += Message.Error("Error: ${e.message}")
+            _isLoading.value = false
+            _currentResponse.value = ""
+            _progressMessage.value = ""
         }
     }
 
@@ -322,8 +455,9 @@ fun ToolCallingScreen(viewModel: ToolCallingViewModel = viewModel()) {
     val isLoading by viewModel.isLoading.collectAsState()
     val modelLoaded by viewModel.modelLoaded.collectAsState()
     val currentResponse by viewModel.currentResponse.collectAsState()
+    val progressMessage by viewModel.progressMessage.collectAsState()
 
-    var inputText by remember { mutableStateOf("What time is it?") }
+    var inputText by remember { mutableStateOf("Show me the time") }
     val listState = rememberLazyListState()
 
     // File picker launcher
@@ -369,6 +503,25 @@ fun ToolCallingScreen(viewModel: ToolCallingViewModel = viewModel()) {
                     }
                 }
             } else {
+                // Progress indicator
+                if (isLoading && progressMessage.isNotBlank()) {
+                    LinearProgressIndicator(
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 8.dp, vertical = 4.dp),
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        Text(
+                            text = progressMessage,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                        )
+                    }
+                }
+
                 // Chat messages
                 LazyColumn(
                     modifier = Modifier
@@ -431,15 +584,19 @@ fun ChatMessageItem(message: Message) {
     val backgroundColor = when (message) {
         is Message.User -> MaterialTheme.colorScheme.primaryContainer
         is Message.Assistant -> MaterialTheme.colorScheme.secondaryContainer
+        is Message.Reasoning -> MaterialTheme.colorScheme.surfaceVariant
         is Message.ToolCall -> MaterialTheme.colorScheme.tertiaryContainer
         is Message.Error -> MaterialTheme.colorScheme.errorContainer
+        is Message.System -> MaterialTheme.colorScheme.surfaceVariant
     }
 
     val textColor = when (message) {
         is Message.User -> MaterialTheme.colorScheme.onPrimaryContainer
         is Message.Assistant -> MaterialTheme.colorScheme.onSecondaryContainer
+        is Message.Reasoning -> MaterialTheme.colorScheme.onSurfaceVariant
         is Message.ToolCall -> MaterialTheme.colorScheme.onTertiaryContainer
         is Message.Error -> MaterialTheme.colorScheme.onErrorContainer
+        is Message.System -> MaterialTheme.colorScheme.onSurfaceVariant
     }
 
     Box(
@@ -469,6 +626,14 @@ fun ChatMessageItem(message: Message) {
                             color = textColor
                         )
                     }
+                    is Message.Reasoning -> {
+                        Text(
+                            text = "💭 ${message.text}",
+                            color = textColor,
+                            fontStyle = androidx.compose.ui.text.font.FontStyle.Italic,
+                            fontSize = 13.sp
+                        )
+                    }
                     is Message.ToolCall -> {
                         Text(
                             text = "🔧 Tool: ${message.name}",
@@ -484,6 +649,14 @@ fun ChatMessageItem(message: Message) {
                                 fontSize = 14.sp
                             )
                         }
+                    }
+                    is Message.System -> {
+                        Text(
+                            text = message.text,
+                            color = textColor,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Medium
+                        )
                     }
                     is Message.Error -> {
                         Text(
