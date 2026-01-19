@@ -131,11 +131,11 @@ data class ToolDefinition(
  * Builder for tool definitions
  */
 class ToolDefinitionBuilder(
-    private val name: String,
-    private val description: String
+     val name: String,
+     val description: String
 ) {
-    private val parameters = mutableMapOf<String, ToolParameter>()
-    private val required = mutableListOf<String>()
+     val parameters = mutableMapOf<String, ToolParameter>()
+     val required = mutableListOf<String>()
 
     fun stringParam(
         name: String,

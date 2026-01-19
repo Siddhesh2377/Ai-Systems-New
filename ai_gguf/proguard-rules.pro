@@ -1,1 +1,1 @@
--keep class com.mp.ai_core.* { *; }
+-keep class com.mp.ai_gguf.** { *; }
