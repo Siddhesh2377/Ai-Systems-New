@@ -51,8 +51,8 @@ android {
 }
 
 dependencies {
-    implementation ("org.apache.commons:commons-compress:1.28.0")
-    implementation ("org.tukaani:xz:1.11")
+    implementation (libs.commons.compress)
+    implementation (libs.xz)
     implementation(libs.okhttp)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.appcompat)
