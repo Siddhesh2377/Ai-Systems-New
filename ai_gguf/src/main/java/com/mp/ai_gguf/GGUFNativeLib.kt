@@ -44,6 +44,25 @@ class GGUFNativeLib {
     ): Boolean
 
     /**
+     * Multi-turn generation: processes a full conversation history and generates the next response.
+     *
+     * Used by the ToolCallManager orchestrator for multi-turn tool calling.
+     * Each call clears the KV cache and re-encodes the full conversation.
+     * This is intentional: prefill runs at 100-300 t/s on CPU so re-encoding
+     * 500-1000 tokens costs ~2-5s, which is acceptable for interactive tool flows.
+     *
+     * @param messagesJson JSON array of {role, content} message objects
+     * @param maxTokens Maximum tokens to generate this turn
+     * @param callback StreamCallback for tokens, tool calls, metrics, done/error
+     * @return true if generation completed (check callback for results)
+     */
+    external fun nativeGenerateStreamMultiTurn(
+        messagesJson: String,
+        maxTokens: Int,
+        callback: StreamCallback
+    ): Boolean
+
+    /**
      * Load a GGUF model with full configuration
      *
      * @param path Path to the GGUF model file
@@ -147,22 +166,21 @@ class GGUFNativeLib {
     external fun nativeGetModelArchitecture(): String
 
     /**
-     * Check if the currently loaded model supports tool calling
+     * Check if the currently loaded model supports tool calling.
      *
-     * Only Qwen models support tool calling in this implementation.
+     * Returns true for any model with a chat template. Grammar enforcement
+     * ensures valid JSON output regardless of model architecture.
      *
-     * @return true if model supports tool calling (i.e., is a Qwen model)
+     * @return true if model has a chat template and can support tool calling
      */
     external fun nativeIsToolCallingSupported(): Boolean
 
     /**
-     * Enable tool calling mode for the current model
+     * Enable tool calling mode for the current model.
      *
-     * This will:
-     * 1. Verify the model is a Qwen model (returns false otherwise)
-     * 2. Set the tool calling system prompt
-     * 3. Set the Qwen chat template with tool calling support
-     * 4. Initialize the grammar sampler for tool call JSON
+     * Sets the tools JSON and initializes the grammar sampler.
+     * System prompt and chat template should be set separately via
+     * [nativeSetSystemPrompt] and [nativeSetChatTemplate].
      *
      * @param toolsJson OpenAI-compatible tools JSON array
      * @return true if tool calling was enabled successfully
@@ -186,6 +204,24 @@ class GGUFNativeLib {
      * @return true if tool calling is enabled
      */
     external fun nativeIsToolCallingEnabled(): Boolean
+
+    /**
+     * Set the grammar enforcement mode for tool calling.
+     *
+     * @param mode 0 = STRICT (grammar active from first token, forces JSON output),
+     *             1 = LAZY (grammar activates on "{" trigger, model chooses tool vs text)
+     */
+    external fun nativeSetGrammarMode(mode: Int)
+
+    /**
+     * Enable/disable parameter-aware typed grammar.
+     *
+     * When enabled, the grammar enforces exact parameter names, types, and
+     * enum values per tool. When disabled, uses a generic JSON object grammar.
+     *
+     * @param enabled true to use typed grammar, false for generic
+     */
+    external fun nativeSetTypedGrammar(enabled: Boolean)
 
     companion object {
         init {

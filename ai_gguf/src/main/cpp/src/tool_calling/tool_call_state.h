@@ -44,6 +44,13 @@ public:
     // Get current buffer size (for debugging/metrics)
     size_t buffer_size() const { return buf.size(); }
 
+    // Check if the accumulated JSON contains a "tool_calls" wrapper key
+    bool has_tool_calls_wrapper() const;
+
+    // Extract just the "arguments" JSON object from the accumulated buffer.
+    // Returns false if no arguments found or parsing fails.
+    bool extract_arguments(std::string& args_json) const;
+
     // Reset helpers - preserves capacity for next tool call
     void reset() {
         collecting = false;

@@ -1,20 +1,87 @@
 package com.mp.ai_gguf.toolcalling
 
 import com.mp.ai_gguf.GGUFNativeLib
+import com.mp.ai_gguf.models.StreamCallback
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * Professional SDK for managing tool calling with Qwen models
+ * Grammar enforcement mode for tool calling
+ */
+enum class GrammarMode(val value: Int) {
+    /** Grammar active from first token - forces JSON tool call output */
+    STRICT(0),
+    /** Grammar activates only on "{" trigger - model chooses tool vs text */
+    LAZY(1)
+}
+
+/**
+ * Configuration for multi-turn tool calling
+ *
+ * @param maxRounds Maximum number of tool call rounds before stopping
+ * @param grammarMode Grammar enforcement mode (STRICT forces tool calls, LAZY lets model choose)
+ * @param useTypedGrammar Use parameter-aware GBNF (enforces exact param names/types/enums)
+ * @param maxTokensPerTurn Maximum tokens to generate per turn
+ */
+data class ToolCallingConfig(
+    val maxRounds: Int = 5,
+    val grammarMode: GrammarMode = GrammarMode.STRICT,
+    val useTypedGrammar: Boolean = true,
+    val maxTokensPerTurn: Int = 256
+)
+
+/**
+ * Result from executing a tool
+ *
+ * @param toolName Name of the tool that was executed
+ * @param result The result content (will be sent back to the model as a tool message)
+ * @param isError Whether the execution resulted in an error
+ */
+data class ToolResult(
+    val toolName: String,
+    val result: String,
+    val isError: Boolean = false
+)
+
+/**
+ * Interface for executing tool calls. Implement this to handle tool invocations.
+ *
+ * Example:
+ * ```kotlin
+ * val executor = ToolExecutor { call ->
+ *     when (call.name) {
+ *         "get_weather" -> ToolResult("get_weather", """{"temp": 15, "conditions": "sunny"}""")
+ *         else -> ToolResult(call.name, "Unknown tool", isError = true)
+ *     }
+ * }
+ * ```
+ */
+fun interface ToolExecutor {
+    suspend fun execute(call: ToolCall): ToolResult
+}
+
+/**
+ * Chat message for building multi-turn conversation history
+ */
+data class ChatMessage(
+    val role: String,    // "system", "user", "assistant", "tool"
+    val content: String
+)
+
+/**
+ * SDK for managing tool calling with GGUF models
  *
  * This SDK provides a clean interface for:
- * - Registering tools
+ * - Registering tools with typed parameters
  * - Enabling/disabling tool calling mode
- * - Validating model compatibility
- * - Managing tool calling state
+ * - Multi-turn tool calling with automatic orchestration
+ * - Grammar-constrained generation (STRICT or LAZY mode)
+ * - Parameter-aware GBNF grammars
  *
- * IMPORTANT: Tool calling is ONLY supported for Qwen models.
- * Attempting to enable tool calling on other architectures will fail.
+ * Supports any model with a chat template. Grammar enforcement ensures
+ * valid JSON output regardless of model architecture.
  *
  * Example usage:
  * ```kotlin
@@ -28,15 +95,16 @@ import org.json.JSONObject
  *     }
  * )
  *
- * // Enable tool calling
- * if (toolCallManager.enable()) {
- *     println("Tool calling enabled!")
- * } else {
- *     println("Failed: ${toolCallManager.lastError}")
- * }
+ * // Enable tool calling (with optional config)
+ * toolCallManager.enable(ToolCallingConfig(grammarMode = GrammarMode.LAZY))
  *
- * // Later, disable tool calling to use normal chat
- * toolCallManager.disable()
+ * // Multi-turn tool calling
+ * toolCallManager.generateWithTools(
+ *     userMessage = "What's the weather in London?",
+ *     executor = { call -> ToolResult(call.name, """{"temp": 15}""") },
+ *     onToken = { print(it) },
+ *     onDone = { println("\nFinal: $it") }
+ * )
  * ```
  */
 class ToolCallManager(private val nativeLib: GGUFNativeLib) {
@@ -57,9 +125,10 @@ class ToolCallManager(private val nativeLib: GGUFNativeLib) {
         get() = nativeLib.nativeGetModelArchitecture()
 
     /**
-     * Check if the loaded model supports tool calling
+     * Check if the loaded model supports tool calling.
      *
-     * @return true if model is a Qwen model
+     * Returns true for any model with a chat template.
+     * Grammar enforcement ensures valid JSON output regardless of architecture.
      */
     fun isModelCompatible(): Boolean {
         return nativeLib.nativeIsToolCallingSupported()
@@ -148,13 +217,15 @@ class ToolCallManager(private val nativeLib: GGUFNativeLib) {
      * Enable tool calling mode
      *
      * This will:
-     * 1. Check if model is compatible (Qwen only)
-     * 2. Build tools JSON from registered tools
-     * 3. Configure the model for tool calling
+     * 1. Check if model is compatible (has chat template)
+     * 2. Apply grammar configuration (mode + typed grammar)
+     * 3. Set a minimal system prompt for tool calling
+     * 4. Build tools JSON and initialize grammar sampler
      *
+     * @param config Optional configuration for grammar mode, typed grammar, etc.
      * @return true if tool calling was enabled successfully
      */
-    fun enable(): Boolean {
+    fun enable(config: ToolCallingConfig = ToolCallingConfig()): Boolean {
         try {
             // Check model compatibility
             if (!isModelCompatible()) {
@@ -162,7 +233,7 @@ class ToolCallManager(private val nativeLib: GGUFNativeLib) {
                 lastError = if (arch.isEmpty()) {
                     "No model loaded"
                 } else {
-                    "Tool calling only supported for Qwen models, current model: $arch"
+                    "Model does not have a chat template, current architecture: $arch"
                 }
                 return false
             }
@@ -173,10 +244,15 @@ class ToolCallManager(private val nativeLib: GGUFNativeLib) {
                 return false
             }
 
-            // Build tools JSON
-            val toolsJson = buildToolsJson()
+            // Apply grammar configuration
+            nativeLib.nativeSetGrammarMode(config.grammarMode.value)
+            nativeLib.nativeSetTypedGrammar(config.useTypedGrammar)
 
-            // Enable via native
+            // Set minimal system prompt for tool calling
+            nativeLib.nativeSetSystemPrompt(buildMinimalSystemPrompt())
+
+            // Build tools JSON and enable
+            val toolsJson = buildToolsJson()
             val success = nativeLib.nativeEnableToolCalling(toolsJson)
             if (!success) {
                 lastError = "Native tool calling initialization failed"
@@ -249,7 +325,163 @@ class ToolCallManager(private val nativeLib: GGUFNativeLib) {
         }
     }
 
+    // ========================================================================
+    // MULTI-TURN TOOL CALLING ORCHESTRATOR
+    // ========================================================================
+
+    /**
+     * Run a multi-turn tool calling conversation.
+     *
+     * This method orchestrates the full tool calling loop:
+     * 1. Send user message with system prompt + tool definitions
+     * 2. If model outputs a tool call: execute it, feed result back, repeat
+     * 3. If model outputs text: return it as the final response
+     * 4. Repeat up to [ToolCallingConfig.maxRounds] times
+     *
+     * Each turn clears the KV cache and re-encodes the full conversation.
+     * On CPU, prefill runs at 100-300 t/s so this costs ~2-5s per turn
+     * for 500-1000 token conversations.
+     *
+     * @param userMessage The user's input message
+     * @param executor Implementation that handles tool call execution
+     * @param config Configuration for grammar mode, max rounds, etc.
+     * @param onToken Called for each streamed token (on IO thread)
+     * @param onToolCallDetected Called when a tool call is detected (before execution)
+     * @param onError Called on error (generation failure, parse failure, max rounds)
+     * @param onDone Called with the final text response
+     */
+    suspend fun generateWithTools(
+        userMessage: String,
+        executor: ToolExecutor,
+        config: ToolCallingConfig = ToolCallingConfig(),
+        onToken: (String) -> Unit = {},
+        onToolCallDetected: (ToolCall) -> Unit = {},
+        onError: (String) -> Unit = {},
+        onDone: (String) -> Unit = {}
+    ) {
+        if (!isEnabled()) {
+            onError("Tool calling not enabled. Call enable() first.")
+            return
+        }
+
+        withContext(Dispatchers.IO) {
+            val messages = mutableListOf<ChatMessage>()
+
+            // System message with tool instructions and available tools
+            val systemContent = buildString {
+                append(buildMinimalSystemPrompt())
+                append("\n")
+                append("You may call tools by emitting ONLY the JSON object:\n")
+                append("{\"tool_calls\":[{\"name\":\"NAME\",\"arguments\":{...}}]}\n")
+                append("Available tools (OpenAI schema):\n")
+                append(buildToolsJson())
+            }
+            messages.add(ChatMessage("system", systemContent))
+
+            // User message
+            messages.add(ChatMessage("user", userMessage))
+
+            for (round in 0 until config.maxRounds) {
+                val messagesJson = buildMessagesJson(messages)
+
+                val roundText = StringBuilder()
+                var detectedToolCall: Pair<String, String>? = null
+                var errorMsg: String? = null
+
+                val callback = object : StreamCallback {
+                    override fun onToken(token: String) {
+                        roundText.append(token)
+                        onToken(token)
+                    }
+
+                    override fun onToolCall(name: String, argsJson: String) {
+                        detectedToolCall = name to argsJson
+                    }
+
+                    override fun onDone() {}
+
+                    override fun onError(message: String) {
+                        errorMsg = message
+                    }
+                }
+
+                nativeLib.nativeGenerateStreamMultiTurn(
+                    messagesJson, config.maxTokensPerTurn, callback
+                )
+
+                // Check for generation error
+                val error = errorMsg
+                if (error != null) {
+                    onError(error)
+                    return@withContext
+                }
+
+                // Check for tool call
+                val toolCallPair = detectedToolCall
+                if (toolCallPair != null) {
+                    val (toolName, payload) = toolCallPair
+
+                    val toolCall = parseToolCall(payload)
+                    if (toolCall == null) {
+                        onError("Failed to parse tool call from model output")
+                        return@withContext
+                    }
+
+                    onToolCallDetected(toolCall)
+
+                    // Add assistant message with the raw tool call JSON
+                    messages.add(ChatMessage("assistant", payload))
+
+                    // Execute the tool
+                    val toolResult = try {
+                        executor.execute(toolCall)
+                    } catch (e: Exception) {
+                        ToolResult(toolName, "Error: ${e.message}", isError = true)
+                    }
+
+                    // Add tool result message
+                    messages.add(ChatMessage("tool", toolResult.result))
+
+                    // Continue to next round
+                    continue
+                }
+
+                // No tool call detected - this is a text response
+                val response = roundText.toString()
+                onDone(response)
+                return@withContext
+            }
+
+            // Max rounds exceeded
+            onError("Maximum tool call rounds exceeded (${config.maxRounds})")
+        }
+    }
+
+    /**
+     * Build JSON array of messages for the native multi-turn function
+     */
+    private fun buildMessagesJson(messages: List<ChatMessage>): String {
+        val array = JSONArray()
+        for (msg in messages) {
+            val obj = JSONObject()
+            obj.put("role", msg.role)
+            obj.put("content", msg.content)
+            array.put(obj)
+        }
+        return array.toString()
+    }
+
     companion object {
+        /**
+         * Build a minimal system prompt for tool calling (~30 tokens).
+         * Keeps context usage low on small models.
+         */
+        fun buildMinimalSystemPrompt(): String {
+            return "You are a helpful assistant with access to tools. " +
+                    "When a tool is needed, respond with the tool call JSON. " +
+                    "Otherwise, respond in plain text."
+        }
+
         /**
          * Create a ToolCallManager with pre-registered common tools
          *

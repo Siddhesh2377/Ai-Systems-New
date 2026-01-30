@@ -30,9 +30,11 @@
 #include <chrono>
 #include <sstream>
 #include <algorithm>
+#include <stdexcept>
 #include <sys/stat.h>
 
 static std::mutex g_init_mtx;
+static std::mutex g_generate_mtx;  // Shared by nativeGenerateStream + nativeGenerateStreamMultiTurn
 static std::atomic<bool> g_stop_requested{false};
 
 struct GenerationMetrics {
@@ -335,6 +337,113 @@ static const char *get_model_description(llama_model *model) {
 }
 
 
+// ============================================================================
+// MULTI-TURN MESSAGE PARSING HELPERS
+// Minimal JSON parsing for known schema (no external JSON library)
+// ============================================================================
+
+/**
+ * Extract a quoted string value for a JSON key from an object string.
+ * Handles JSON escape sequences (\", \\, \n, \r, \t).
+ */
+static std::string extract_json_string_value(const std::string& json, const std::string& key) {
+    std::string needle = "\"" + key + "\"";
+    size_t pos = 0;
+    while (true) {
+        pos = json.find(needle, pos);
+        if (pos == std::string::npos) return "";
+        size_t after = pos + needle.size();
+        // Skip whitespace
+        while (after < json.size() && (json[after] == ' ' || json[after] == '\t'
+               || json[after] == '\n' || json[after] == '\r'))
+            ++after;
+        if (after < json.size() && json[after] == ':') {
+            ++after;
+            // Skip whitespace
+            while (after < json.size() && (json[after] == ' ' || json[after] == '\t'
+                   || json[after] == '\n' || json[after] == '\r'))
+                ++after;
+            if (after < json.size() && json[after] == '"') {
+                ++after;
+                std::string result;
+                while (after < json.size() && json[after] != '"') {
+                    if (json[after] == '\\' && after + 1 < json.size()) {
+                        char esc = json[after + 1];
+                        switch (esc) {
+                            case '"':  result += '"';  break;
+                            case '\\': result += '\\'; break;
+                            case 'n':  result += '\n'; break;
+                            case 'r':  result += '\r'; break;
+                            case 't':  result += '\t'; break;
+                            default:   result += esc;  break;
+                        }
+                        after += 2;
+                    } else {
+                        result += json[after++];
+                    }
+                }
+                return result;
+            }
+        }
+        pos += needle.size(); // not a key, try next occurrence
+    }
+}
+
+/**
+ * Parse a JSON array of {role, content} message objects into ChatMessage vector.
+ * Input format: [{"role":"system","content":"..."},{"role":"user","content":"..."},...]
+ */
+static std::vector<chat::ChatMessage> parse_messages_json(const std::string& json) {
+    std::vector<chat::ChatMessage> messages;
+
+    size_t pos = json.find('[');
+    if (pos == std::string::npos) return messages;
+    ++pos;
+
+    while (pos < json.size()) {
+        // Skip whitespace and commas
+        while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t'
+               || json[pos] == '\n' || json[pos] == '\r' || json[pos] == ','))
+            ++pos;
+
+        if (pos >= json.size() || json[pos] == ']') break;
+        if (json[pos] != '{') { ++pos; continue; }
+
+        // Find matching '}' with brace counting (skip quoted strings)
+        size_t obj_start = pos;
+        int depth = 1;
+        ++pos;
+        while (pos < json.size() && depth > 0) {
+            if (json[pos] == '"') {
+                ++pos;
+                while (pos < json.size() && json[pos] != '"') {
+                    if (json[pos] == '\\') ++pos;
+                    ++pos;
+                }
+                if (pos < json.size()) ++pos;
+                continue;
+            }
+            if (json[pos] == '{') ++depth;
+            else if (json[pos] == '}') --depth;
+            ++pos;
+        }
+
+        if (depth != 0) break;
+
+        std::string obj = json.substr(obj_start, pos - obj_start);
+
+        chat::ChatMessage msg;
+        msg.role = extract_json_string_value(obj, "role");
+        msg.content = extract_json_string_value(obj, "content");
+
+        if (!msg.role.empty()) {
+            messages.push_back(std::move(msg));
+        }
+    }
+
+    return messages;
+}
+
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_mp_ai_1gguf_GGUFNativeLib_nativeGenerateStream(JNIEnv *env, jobject, jstring jprompt,
                                                         jint max_tokens, jobject jcallback) {
@@ -350,7 +459,6 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeGenerateStream(JNIEnv *env, jobject, js
     LOG_INFO("prepare_for_generation completed");
     g_stop_requested.store(false, std::memory_order_relaxed);
 
-    static std::mutex g_generate_mtx;
     std::lock_guard<std::mutex> lock(g_generate_mtx);
 
     // Initialize metrics
@@ -464,7 +572,20 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeGenerateStream(JNIEnv *env, jobject, js
             break;
         }
 
-        llama_sampler_accept(g_state.sampler, tok);
+        // Accept token - grammar sampler may throw on multi-char BPE tokens
+        try {
+            llama_sampler_accept(g_state.sampler, tok);
+        } catch (const std::runtime_error& e) {
+            LOG_WARN("Grammar accept threw: %s - rebuilding sampler without grammar", e.what());
+            // Disable grammar for the rest of this generation turn.
+            // Save and restore the master grammar_sampler pointer so it's
+            // available for future turns (it will be re-cloned next time).
+            llama_sampler* saved_grammar = g_state.grammar_sampler;
+            g_state.grammar_sampler = nullptr;
+            g_state.rebuild_sampler_cached();
+            g_state.grammar_sampler = saved_grammar;
+            // Don't re-accept - the new chain has no grammar state to update
+        }
 
         // Handle first-token edge case
         if (i == 0 && (tok == eos || tok == eot)) {
@@ -569,6 +690,253 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeGenerateStream(JNIEnv *env, jobject, js
     llama_batch_free(single);
 
     // Send completion callbacks (unless exception occurred)
+    if (!has_exception) {
+        send_metrics(env, jcallback, metrics);
+        send_done(env, jcallback);
+    }
+
+    return JNI_TRUE;
+}
+
+// ============================================================================
+// MULTI-TURN GENERATION
+// Processes a full conversation history and generates the next response.
+// Used by the Kotlin ToolCallManager orchestrator for multi-turn tool calling.
+// ============================================================================
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mp_ai_1gguf_GGUFNativeLib_nativeGenerateStreamMultiTurn(JNIEnv *env, jobject,
+                                                                  jstring jmessagesJson,
+                                                                  jint max_tokens,
+                                                                  jobject jcallback) {
+    // Validate model state
+    if (!g_state.is_ready()) {
+        send_error(env, jcallback, "Model not initialized");
+        return JNI_FALSE;
+    }
+
+    // Prepare for new generation (clear KV cache)
+    g_state.prepare_for_generation();
+    // Rebuild sampler with fresh grammar clone for this turn
+    g_state.rebuild_sampler_cached();
+    g_stop_requested.store(false, std::memory_order_relaxed);
+
+    std::lock_guard<std::mutex> lock(g_generate_mtx);
+
+    // Initialize metrics
+    GenerationMetrics metrics;
+    auto start_time = std::chrono::steady_clock::now();
+    bool first_token_generated = false;
+
+    // Parse messages JSON
+    const std::string messages_json = utf8::from_jstring(env, jmessagesJson);
+    auto messages = parse_messages_json(messages_json);
+
+    if (messages.empty()) {
+        send_error(env, jcallback, "Empty or invalid messages JSON");
+        return JNI_FALSE;
+    }
+
+    // Inject tool preamble so the model knows about available tools.
+    // The caller may or may not have included this in the system message;
+    // when tools are enabled we guarantee the preamble is present.
+    if (g_state.tools_enabled && !g_state.tools_json.empty()) {
+        std::string preamble = chat::build_tool_preamble(g_state.tools_json);
+        if (!messages.empty() && messages[0].role == "system") {
+            messages[0].content += "\n" + preamble;
+        } else {
+            chat::ChatMessage sys;
+            sys.role = "system";
+            sys.content = g_state.system_prompt.empty()
+                          ? preamble
+                          : g_state.system_prompt + "\n" + preamble;
+            messages.insert(messages.begin(), sys);
+        }
+    }
+
+    LOG_INFO("Multi-turn generation: %zu messages", messages.size());
+
+    // Get vocab
+    const llama_vocab *vocab = llama_model_get_vocab(g_state.model);
+    if (!vocab) {
+        send_error(env, jcallback, "Failed to get vocab");
+        return JNI_FALSE;
+    }
+
+    // Apply multi-turn chat template
+    const std::string prompt = chat::apply_template_multi(
+            g_state.model, messages,
+            g_state.chat_template_override,
+            true // add generation prompt
+    );
+
+    if (prompt.empty()) {
+        send_error(env, jcallback, "Chat template application failed");
+        return JNI_FALSE;
+    }
+
+    LOG_INFO("Multi-turn rendered prompt size=%zu", prompt.size());
+
+    // Tokenize prompt
+    std::vector<llama_token> prompt_toks = g_state.tokenize(prompt);
+    if (prompt_toks.empty()) {
+        send_error(env, jcallback, "Tokenization failed");
+        return JNI_FALSE;
+    }
+
+    metrics.prompt_tokens = static_cast<int32_t>(prompt_toks.size());
+    metrics.total_tokens = metrics.prompt_tokens;
+
+    // Check context size
+    int32_t available = g_state.ctx_size - metrics.prompt_tokens - 8;
+    if (available <= 0) {
+        send_error(env, jcallback, "Context overflow - conversation too long");
+        return JNI_TRUE;
+    }
+
+    int32_t to_generate = (max_tokens > 0) ? static_cast<int32_t>(max_tokens) : 128;
+    to_generate = std::min(to_generate, available);
+
+    // Decode prompt (prefill phase)
+    if (!g_state.decode_prompt(prompt_toks)) {
+        jni::on_error(env, jcallback, "Decoding prompt failed");
+        return JNI_TRUE;
+    }
+
+    // Verify logits
+    float *logits = llama_get_logits(g_state.ctx);
+    if (!logits) {
+        LOG_ERROR("No logits available after prompt decode");
+        jni::on_error(env, jcallback, "No logits available");
+        return JNI_TRUE;
+    }
+
+    // Initialize streaming components
+    ToolCallState tool_state;
+    Utf8StreamDecoder utf8_decoder;
+
+    llama_token eos = llama_vocab_eos(vocab);
+    llama_token eot = llama_vocab_eot(vocab);
+
+    llama_batch single = llama_batch_init(1, 0, 1);
+
+    constexpr int EXCEPTION_CHECK_INTERVAL = 64;
+    bool has_exception = false;
+
+    // ========================================================================
+    // GENERATION LOOP (identical logic to nativeGenerateStream)
+    // ========================================================================
+    for (int i = 0; i < to_generate && !g_stop_requested.load(std::memory_order_relaxed); ++i) {
+        int current_pos = static_cast<int>(prompt_toks.size()) + i;
+        if (current_pos >= g_state.ctx_size - 1) {
+            LOG_ERROR("Context overflow at pos %d, ctx_size %d", current_pos, g_state.ctx_size);
+            jni::on_error(env, jcallback, "Context size exceeded");
+            break;
+        }
+
+        llama_token tok = llama_sampler_sample(g_state.sampler, g_state.ctx, -1);
+
+        if (tok < 0) {
+            LOG_ERROR("llama_sampler_sample returned invalid token");
+            jni::on_error(env, jcallback, "Sampling failed");
+            break;
+        }
+
+        // Accept token - grammar sampler may throw on multi-char BPE tokens
+        try {
+            llama_sampler_accept(g_state.sampler, tok);
+        } catch (const std::runtime_error& e) {
+            LOG_WARN("Grammar accept threw: %s - rebuilding sampler without grammar", e.what());
+            llama_sampler* saved_grammar = g_state.grammar_sampler;
+            g_state.grammar_sampler = nullptr;
+            g_state.rebuild_sampler_cached();
+            g_state.grammar_sampler = saved_grammar;
+        }
+
+        if (i == 0 && (tok == eos || tok == eot)) {
+            tok = g_state.space_token();
+        }
+
+        if (tok == eos || tok == eot) {
+            break;
+        }
+
+        if (!first_token_generated) {
+            auto first_token_time = std::chrono::steady_clock::now();
+            metrics.time_to_first_token_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    first_token_time - start_time).count();
+            first_token_generated = true;
+        }
+
+        metrics.generated_tokens++;
+        metrics.total_tokens++;
+
+        std::string raw_piece = g_state.detokenize_single(tok);
+        std::string complete_chars = utf8_decoder.decode(raw_piece);
+
+        if (!complete_chars.empty()) {
+            bool tool_complete = false;
+
+            if (g_state.tools_enabled) {
+                tool_complete = tool_state.accumulate(complete_chars);
+                if (tool_complete) {
+                    std::string name, payload;
+                    if (tool_state.extract_tool_call(name, payload)) {
+                        send_toolcall(env, jcallback, name, payload);
+                        break;
+                    }
+                    tool_state.reset();
+                }
+            }
+
+            if (!tool_state.is_collecting()) {
+                send_token_immediate(env, jcallback, complete_chars);
+            }
+        }
+
+        single.n_tokens = 1;
+        single.token[0] = tok;
+        single.pos[0] = static_cast<int32_t>(prompt_toks.size() + i);
+        single.n_seq_id[0] = 1;
+        single.seq_id[0][0] = 0;
+        single.logits[0] = true;
+
+        int decode_result = llama_decode(g_state.ctx, single);
+        if (decode_result != 0) {
+            LOG_ERROR("llama_decode failed with code %d at token %d", decode_result, i);
+            jni::on_error(env, jcallback, "llama_decode failed during generation");
+            break;
+        }
+
+        if ((i & (EXCEPTION_CHECK_INTERVAL - 1)) == 0) {
+            if (env->ExceptionCheck()) {
+                LOG_ERROR("Java exception during callback - aborting");
+                env->ExceptionClear();
+                has_exception = true;
+                break;
+            }
+        }
+    }
+
+    // ========================================================================
+    // CLEANUP
+    // ========================================================================
+    std::string remaining = utf8_decoder.flush();
+    if (!remaining.empty()) {
+        send_token_immediate(env, jcallback, remaining);
+    }
+
+    auto end_time = std::chrono::steady_clock::now();
+    metrics.total_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            end_time - start_time).count();
+
+    if (metrics.total_time_ms > 0 && metrics.generated_tokens > 0) {
+        metrics.tokens_per_second =
+                (metrics.generated_tokens * 1000.0f) / static_cast<float>(metrics.total_time_ms);
+    }
+
+    llama_batch_free(single);
+
     if (!has_exception) {
         send_metrics(env, jcallback, metrics);
         send_done(env, jcallback);
@@ -744,7 +1112,8 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeSetChatTemplate(JNIEnv *env, jobject, j
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_mp_ai_1gguf_GGUFNativeLib_nativeSetToolsJson(JNIEnv *env, jobject, jstring jtools) {
-    g_state.tools_json = utf8::from_jstring(env, jtools);
+    std::string raw = utf8::from_jstring(env, jtools);
+    g_state.tools_json = chat::normalize_tools_json(raw);
     g_state.tools_enabled = !g_state.tools_json.empty();
     LOG_INFO("Tools JSON set (%zu bytes), enabled=%d", g_state.tools_json.size(),
              static_cast<int>(g_state.tools_enabled));
@@ -1290,16 +1659,10 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeIsToolCallingSupported(JNIEnv *env, job
         return JNI_FALSE;
     }
 
-    const char *arch = get_model_architecture(g_state.model);
-    if (!arch) {
-        return JNI_FALSE;
-    }
-
-    // Only Qwen models support tool calling
-    std::string arch_str(arch);
-    std::transform(arch_str.begin(), arch_str.end(), arch_str.begin(), ::tolower);
-
-    return (arch_str.find("qwen") != std::string::npos) ? JNI_TRUE : JNI_FALSE;
+    // Any model with a chat template can support tool calling
+    // (grammar enforcement ensures valid JSON regardless of model architecture)
+    const char *tmpl = llama_model_chat_template(g_state.model, nullptr);
+    return (tmpl && *tmpl) ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -1309,82 +1672,22 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeEnableToolCalling(JNIEnv *env, jobject,
         return JNI_FALSE;
     }
 
-    // Check if model supports tool calling
-    const char *arch = get_model_architecture(g_state.model);
-    if (!arch) {
-        LOG_ERROR("Cannot enable tool calling: failed to get model architecture");
-        return JNI_FALSE;
-    }
+    // Set tools JSON (normalize in case of double-nested "function" wrappers)
+    const std::string raw_json = utf8::from_jstring(env, jtools);
+    g_state.tools_json = chat::normalize_tools_json(raw_json);
+    g_state.tools_enabled = !g_state.tools_json.empty();
 
-    std::string arch_str(arch);
-    std::transform(arch_str.begin(), arch_str.end(), arch_str.begin(), ::tolower);
-
-    if (arch_str.find("qwen") == std::string::npos) {
-        LOG_ERROR("Tool calling only supported for Qwen models, got: %s", arch);
-        return JNI_FALSE;
-    }
-
-    // Set tools JSON
-    const std::string tools_json = utf8::from_jstring(env, jtools);
-    g_state.tools_json = tools_json;
-    g_state.tools_enabled = !tools_json.empty();
-
-    // Set tool calling system prompt
-    const std::string tool_system_prompt =
-            "You are a function-calling assistant. When tools are available, respond ONLY with a JSON object in this EXACT format:\n"
-            "\n"
-            "{\n"
-            "  \"tool_calls\": [{\n"
-            "    \"name\": \"toolName\",\n"
-            "    \"arguments\": {\n"
-            "      \"param1\": \"value1\",\n"
-            "      \"param2\": \"value2\"\n"
-            "    }\n"
-            "  }]\n"
-            "}\n"
-            "\n"
-            "CRITICAL RULES:\n"
-            "1. Use \"arguments\" as an object containing all parameters\n"
-            "2. NEVER put parameters directly in the tool_calls object\n"
-            "3. NEVER include any text before or after the JSON\n"
-            "4. The \"arguments\" field must be a JSON object, not a string\n"
-            "5. Match parameter names exactly as defined in the tool schema\n"
-            "\n"
-            "If no tool is needed, respond with plain text.";
-
-    g_state.system_prompt = tool_system_prompt;
-
-    // Set Qwen chat template with tool calling support
-    const std::string qwen_template =
-            "{%- if professional is defined or emotional is defined -%}\n"
-            "<|im_start|>system\n"
-            "The assistant should modulate style accordingly while staying accurate.\n"
-            "<|im_end|>\n"
-            "{%- endif -%}\n"
-            "{%- if gbnf is defined and gbnf|length > 0 -%}\n"
-            "<|im_start|>system\n"
-            "The assistant's NEXT message MUST conform to the following GBNF grammar.\n"
-            "If a token would violate the grammar, do not emit it.\n"
-            "<GBNF>\n"
-            "{{ gbnf }}\n"
-            "</GBNF>\n"
-            "<|im_end|>\n"
-            "{%- endif -%}\n"
-            "{%- for m in messages -%}\n"
-            "<|im_start|>{{ m['role'] }}\n"
-            "{{ m['content'] }}\n"
-            "<|im_end|>\n"
-            "{%- endfor -%}\n"
-            "{%- if add_generation_prompt -%}\n"
-            "<|im_start|>assistant\n"
-            "{%- endif -%}";
-
-    g_state.chat_template_override = qwen_template;
+    // System prompt and chat template are set separately from Kotlin
+    // via nativeSetSystemPrompt() and nativeSetChatTemplate().
+    // This allows the caller to configure them per-model instead of
+    // hardcoding a specific architecture's format.
 
     // Initialize grammar
     maybe_init_grammar();
 
-    LOG_INFO("Tool calling enabled for Qwen model (%zu bytes of tools JSON)", tools_json.size());
+    const char *arch = get_model_architecture(g_state.model);
+    LOG_INFO("Tool calling enabled for %s model (%zu bytes of tools JSON)",
+             arch ? arch : "unknown", g_state.tools_json.size());
     return JNI_TRUE;
 }
 
@@ -1401,4 +1704,44 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeDisableToolCalling(JNIEnv *env, jobject
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_mp_ai_1gguf_GGUFNativeLib_nativeIsToolCallingEnabled(JNIEnv *env, jobject) {
     return g_state.tools_enabled ? JNI_TRUE : JNI_FALSE;
+}
+
+// ============================================================================
+// GRAMMAR MODE CONFIGURATION
+// ============================================================================
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_mp_ai_1gguf_GGUFNativeLib_nativeSetGrammarMode(JNIEnv *, jobject, jint mode) {
+    g_state.grammar_mode = (mode == 1) ? GrammarMode::LAZY : GrammarMode::STRICT;
+    g_state.invalidate_grammar();
+    LOG_INFO("Grammar mode set to %s", (mode == 1) ? "LAZY" : "STRICT");
+
+    // Re-enable tools from tools_json if they were incorrectly disabled
+    if (!g_state.tools_enabled && !g_state.tools_json.empty()) {
+        g_state.tools_enabled = true;
+        LOG_INFO("Re-enabled tool calling from existing tools_json");
+    }
+
+    // Rebuild grammar if tools are enabled
+    if (g_state.tools_enabled) {
+        maybe_init_grammar();
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_mp_ai_1gguf_GGUFNativeLib_nativeSetTypedGrammar(JNIEnv *, jobject, jboolean enabled) {
+    g_state.use_typed_grammar = (enabled == JNI_TRUE);
+    g_state.invalidate_grammar();
+    LOG_INFO("Typed grammar %s", g_state.use_typed_grammar ? "enabled" : "disabled");
+
+    // Re-enable tools from tools_json if they were incorrectly disabled
+    if (!g_state.tools_enabled && !g_state.tools_json.empty()) {
+        g_state.tools_enabled = true;
+        LOG_INFO("Re-enabled tool calling from existing tools_json");
+    }
+
+    // Rebuild grammar if tools are enabled
+    if (g_state.tools_enabled) {
+        maybe_init_grammar();
+    }
 }

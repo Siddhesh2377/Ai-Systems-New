@@ -39,7 +39,11 @@ void ModelState::rebuild_sampler(
         float mirostatEta,
         int seed)
 {
-    // Free existing sampler
+    // Cache params for multi-turn rebuilds
+    cached_sampler_params = {topK, topP, temp, minP, mirostat, mirostatTau, mirostatEta, seed};
+
+    // Free existing sampler chain (this frees all samplers added to the chain,
+    // but NOT our master grammar_sampler since we clone it before adding)
     if (sampler) {
         llama_sampler_free(sampler);
         sampler = nullptr;
@@ -55,9 +59,16 @@ void ModelState::rebuild_sampler(
     auto sparams = llama_sampler_chain_default_params();
     llama_sampler* chain = llama_sampler_chain_init(sparams);
 
-    // Add grammar sampler first if tools are enabled
+    // Add a CLONE of grammar sampler first if tools are enabled.
+    // The master grammar_sampler is owned by ModelState for reuse across turns.
+    // The chain takes ownership of the clone and frees it when the chain is freed.
     if (tools_enabled && grammar_sampler) {
-        llama_sampler_chain_add(chain, grammar_sampler);
+        llama_sampler* grammar_clone = llama_sampler_clone(grammar_sampler);
+        if (grammar_clone) {
+            llama_sampler_chain_add(chain, grammar_clone);
+        } else {
+            LOG_WARN("Failed to clone grammar sampler, proceeding without grammar");
+        }
     }
 
     // Mirostat sampling branch
@@ -71,8 +82,7 @@ void ModelState::rebuild_sampler(
         );
         llama_sampler_chain_add(chain, mirostatSampler);
     }
-        // Standard sampling branch
-        // Standard sampling branch
+    // Standard sampling branch
     else {
         // 1. TEMPERATURE FIRST - must scale logits before filtering
         if (temp > 0.0f && std::abs(temp - 1.0f) > 1e-3f) {
@@ -106,6 +116,18 @@ void ModelState::rebuild_sampler(
              "mirostat=%d, tau=%.2f, eta=%.2f, seed=%d",
              topK, topP, temp, minP,
              mirostat, mirostatTau, mirostatEta, seed);
+}
+
+void ModelState::rebuild_sampler_cached() {
+    const auto& p = cached_sampler_params;
+    rebuild_sampler(p.topK, p.topP, p.temp, p.minP,
+                    p.mirostat, p.mirostatTau, p.mirostatEta, p.seed);
+}
+
+void ModelState::reset_grammar_sampler() {
+    if (grammar_sampler) {
+        llama_sampler_reset(grammar_sampler);
+    }
 }
 
 // ============================================================================
@@ -421,13 +443,17 @@ void ModelState::update_grammar_if_needed() {
         return;
     }
 
-    // Check if we can reuse cached grammar
-    if (!grammar_needs_rebuild && tools_json == cached_tools_json && grammar_sampler) {
-        LOG_INFO("Reusing cached grammar sampler");
+    // Check if we can reuse cached grammar (including "no grammar" cached state)
+    if (!grammar_needs_rebuild && tools_json == cached_tools_json) {
+        if (grammar_sampler) {
+            LOG_INFO("Reusing cached grammar sampler");
+        }
         return;
     }
 
-    LOG_INFO("Building new grammar sampler for tools");
+    LOG_INFO("Building new grammar sampler (mode=%s, typed=%s)",
+             grammar_mode == GrammarMode::STRICT ? "strict" : "lazy",
+             use_typed_grammar ? "yes" : "no");
 
     // Free existing grammar sampler
     if (grammar_sampler) {
@@ -435,30 +461,114 @@ void ModelState::update_grammar_if_needed() {
         grammar_sampler = nullptr;
     }
 
-    // Build new grammar
-    const std::string grammar = chat::build_tool_grammar(tools_json);
-    if (grammar.empty()) {
-        LOG_ERROR("Failed to build tool grammar");
-        tools_enabled = false;
+    // Build both grammar strings upfront
+    std::string typed_grammar;
+    if (use_typed_grammar) {
+        typed_grammar = chat::build_tool_grammar_typed(tools_json);
+    }
+    std::string generic_grammar = chat::build_tool_grammar(tools_json);
+
+    if (typed_grammar.empty() && generic_grammar.empty()) {
+        LOG_WARN("Failed to build any tool grammar string - continuing without grammar");
+        cached_tools_json = tools_json;
+        grammar_needs_rebuild = false;
         return;
+    }
+
+    // Log grammar strings for debugging
+    if (!typed_grammar.empty()) {
+        LOG_INFO("Typed grammar length: %zu chars", typed_grammar.size());
+    }
+    if (!generic_grammar.empty()) {
+        LOG_INFO("Generic grammar length: %zu chars", generic_grammar.size());
     }
 
     const llama_vocab* vocab = llama_model_get_vocab(model);
     if (!vocab) {
         LOG_ERROR("Failed to get vocab for grammar");
+        cached_tools_json = tools_json;
+        grammar_needs_rebuild = false;
         return;
     }
 
-    grammar_sampler = llama_sampler_init_grammar(vocab, grammar.c_str(), "root");
+    // Helper: try to init sampler with given grammar in the preferred mode
+    auto try_init_preferred = [&](const std::string& g) -> llama_sampler* {
+        if (g.empty()) return nullptr;
+        if (grammar_mode == GrammarMode::LAZY) {
+            const char* tp[] = { "\\{" };
+            return llama_sampler_init_grammar_lazy_patterns(
+                vocab, g.c_str(), "root", tp, 1, nullptr, 0);
+        } else {
+            return llama_sampler_init_grammar(vocab, g.c_str(), "root");
+        }
+    };
 
-    if (!grammar_sampler) {
-        LOG_ERROR("Grammar sampler initialization failed");
-        tools_enabled = false;
-    } else {
-        // Cache for next time
-        cached_tools_json = tools_json;
-        grammar_needs_rebuild = false;
+    // Helper: try to init sampler with given grammar in the alternate mode
+    auto try_init_alt = [&](const std::string& g) -> llama_sampler* {
+        if (g.empty()) return nullptr;
+        if (grammar_mode == GrammarMode::LAZY) {
+            // Preferred is lazy, alt is strict
+            return llama_sampler_init_grammar(vocab, g.c_str(), "root");
+        } else {
+            // Preferred is strict, alt is lazy
+            const char* tp[] = { "\\{" };
+            return llama_sampler_init_grammar_lazy_patterns(
+                vocab, g.c_str(), "root", tp, 1, nullptr, 0);
+        }
+    };
+
+    // Attempt 1: typed grammar + preferred mode
+    if (!typed_grammar.empty()) {
+        grammar_sampler = try_init_preferred(typed_grammar);
+        if (grammar_sampler) {
+            LOG_INFO("Grammar sampler created: typed + %s mode",
+                     grammar_mode == GrammarMode::STRICT ? "strict" : "lazy");
+        }
+    }
+
+    // Attempt 2: generic grammar + preferred mode
+    if (!grammar_sampler && !generic_grammar.empty()) {
+        LOG_INFO("Trying generic grammar with preferred mode...");
+        grammar_sampler = try_init_preferred(generic_grammar);
+        if (grammar_sampler) {
+            LOG_INFO("Grammar sampler created: generic + %s mode",
+                     grammar_mode == GrammarMode::STRICT ? "strict" : "lazy");
+        }
+    }
+
+    // Attempt 3: typed grammar + alternate mode
+    if (!grammar_sampler && !typed_grammar.empty()) {
+        LOG_INFO("Trying typed grammar with alternate mode...");
+        grammar_sampler = try_init_alt(typed_grammar);
+        if (grammar_sampler) {
+            LOG_INFO("Grammar sampler created: typed + %s mode",
+                     grammar_mode == GrammarMode::STRICT ? "lazy" : "strict");
+        }
+    }
+
+    // Attempt 4: generic grammar + alternate mode
+    if (!grammar_sampler && !generic_grammar.empty()) {
+        LOG_INFO("Trying generic grammar with alternate mode...");
+        grammar_sampler = try_init_alt(generic_grammar);
+        if (grammar_sampler) {
+            LOG_INFO("Grammar sampler created: generic + %s mode",
+                     grammar_mode == GrammarMode::STRICT ? "lazy" : "strict");
+        }
+    }
+
+    // Cache state regardless of success - avoid retrying every generation
+    cached_tools_json = tools_json;
+    grammar_needs_rebuild = false;
+
+    if (grammar_sampler) {
         LOG_INFO("Grammar sampler cached successfully");
+    } else {
+        // IMPORTANT: Do NOT set tools_enabled = false.
+        // Grammar is optional - the model still sees the tool preamble in its
+        // prompt, and ToolCallState detects tool calls in the output stream.
+        // Grammar only makes tool calls more reliable by constraining output.
+        LOG_WARN("All grammar init attempts failed - tool calling continues WITHOUT grammar constraints");
+        LOG_WARN("Model will generate freely; tool calls detected via ToolCallState");
     }
 }
 

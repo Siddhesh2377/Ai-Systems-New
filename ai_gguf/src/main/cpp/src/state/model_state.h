@@ -9,6 +9,7 @@
  * - Efficient UTF-8 handling
  * - Grammar caching for tool calls
  * - Configurable batch sizes for low-end devices
+ * - Multi-turn tool calling with lazy grammar support
  */
 
 #include "llama.h"
@@ -26,6 +27,28 @@ struct MemoryMetrics {
     size_t context_size_bytes = 0;    // KV cache and context memory
     size_t peak_memory_bytes = 0;     // Peak observed memory
     float memory_usage_percent = 0.0f; // Percentage of available memory
+};
+
+/**
+ * Grammar mode for tool calling
+ */
+enum class GrammarMode {
+    STRICT,  // Grammar active from first token (forces tool call output)
+    LAZY     // Grammar activates only on trigger pattern (model chooses tool vs text)
+};
+
+/**
+ * Cached sampler parameters for multi-turn rebuilds
+ */
+struct SamplerParams {
+    int topK = 40;
+    float topP = 0.9f;
+    float temp = 0.7f;
+    float minP = 0.05f;
+    int mirostat = 0;
+    float mirostatTau = 5.0f;
+    float mirostatEta = 0.1f;
+    int seed = -1;
 };
 
 /**
@@ -52,9 +75,16 @@ public:
     std::string tools_json;
     bool tools_enabled = false;
 
+    // Grammar configuration
+    GrammarMode grammar_mode = GrammarMode::STRICT;
+    bool use_typed_grammar = true;  // Use parameter-aware GBNF
+
     // Grammar caching for tool calls
     std::string cached_tools_json;     // Last tools JSON used to build grammar
     bool grammar_needs_rebuild = true;  // Flag to trigger grammar rebuild
+
+    // Cached sampler params for multi-turn rebuilds
+    SamplerParams cached_sampler_params;
 
     // UTF-8 carry buffer for incomplete sequences (legacy)
     std::string utf8_carry_buffer;
@@ -97,6 +127,12 @@ public:
             int seed
     );
 
+    /**
+     * Rebuild sampler using cached parameters (for multi-turn)
+     * Each call creates a fresh grammar clone in the sampler chain
+     */
+    void rebuild_sampler_cached();
+
     // ========================================================================
     // GRAMMAR MANAGEMENT (Optimized for low-end devices)
     // ========================================================================
@@ -104,8 +140,14 @@ public:
     /**
      * Initialize or update grammar sampler for tool calls
      * Only rebuilds if tools_json has changed (caching)
+     * Respects grammar_mode (STRICT vs LAZY) and use_typed_grammar
      */
     void update_grammar_if_needed();
+
+    /**
+     * Reset grammar sampler state for reuse across turns
+     */
+    void reset_grammar_sampler();
 
     /**
      * Check if grammar needs to be rebuilt

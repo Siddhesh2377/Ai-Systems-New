@@ -1,0 +1,1 @@
+-keep class com.mp.ai_supertonic_tts.** { *; }
