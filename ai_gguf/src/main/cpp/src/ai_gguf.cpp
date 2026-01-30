@@ -737,24 +737,91 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeGenerateStreamMultiTurn(JNIEnv *env, jo
         return JNI_FALSE;
     }
 
-    // Inject tool preamble so the model knows about available tools.
-    // The caller may or may not have included this in the system message;
-    // when tools are enabled we guarantee the preamble is present.
+    // ====================================================================
+    // TOOL PREAMBLE INJECTION
+    // Skip if the caller already included tool instructions (e.g. from
+    // ToolCallManager.generateWithTools which builds its own system msg).
+    // ====================================================================
     if (g_state.tools_enabled && !g_state.tools_json.empty()) {
-        std::string preamble = chat::build_tool_preamble(g_state.tools_json);
+        bool already_has_preamble = false;
         if (!messages.empty() && messages[0].role == "system") {
-            messages[0].content += "\n" + preamble;
-        } else {
-            chat::ChatMessage sys;
-            sys.role = "system";
-            sys.content = g_state.system_prompt.empty()
-                          ? preamble
-                          : g_state.system_prompt + "\n" + preamble;
-            messages.insert(messages.begin(), sys);
+            already_has_preamble =
+                messages[0].content.find("Available tools") != std::string::npos;
+        }
+
+        if (!already_has_preamble) {
+            std::string preamble = chat::build_tool_preamble(g_state.tools_json);
+            if (!messages.empty() && messages[0].role == "system") {
+                messages[0].content += "\n" + preamble;
+            } else {
+                chat::ChatMessage sys;
+                sys.role = "system";
+                sys.content = g_state.system_prompt.empty()
+                              ? preamble
+                              : g_state.system_prompt + "\n" + preamble;
+                messages.insert(messages.begin(), sys);
+            }
+        }
+    }
+
+    // ====================================================================
+    // MESSAGE FORMAT TRANSFORMATION
+    // Convert tool-calling messages to the format the chat template expects.
+    //
+    // Most chat templates (Qwen, ChatML) don't natively support "tool" role
+    // in their C implementation. Qwen expects:
+    //   - Assistant tool calls wrapped in <tool_call> tags
+    //   - Tool responses as user messages with <tool_response> tags
+    //
+    // This transformation ensures multi-turn tool calling works regardless
+    // of whether the template has native tool role support.
+    // ====================================================================
+    for (auto& msg : messages) {
+        if (msg.role == "tool") {
+            // Convert tool result to user message with <tool_response> wrapping
+            msg.role = "user";
+            msg.content = "<tool_response>\n" + msg.content + "\n</tool_response>";
+        } else if (msg.role == "assistant" &&
+                   msg.content.find("\"tool_calls\"") != std::string::npos) {
+            // Extract inner call object from {"tool_calls":[{...}]}
+            // and wrap it in <tool_call> tags for the model
+            size_t arr_start = msg.content.find('[');
+            if (arr_start != std::string::npos) {
+                size_t obj_start = msg.content.find('{', arr_start + 1);
+                if (obj_start != std::string::npos) {
+                    int depth = 1;
+                    size_t pos = obj_start + 1;
+                    while (pos < msg.content.size() && depth > 0) {
+                        if (msg.content[pos] == '"') {
+                            ++pos;
+                            while (pos < msg.content.size() && msg.content[pos] != '"') {
+                                if (msg.content[pos] == '\\') ++pos;
+                                ++pos;
+                            }
+                            if (pos < msg.content.size()) ++pos;
+                            continue;
+                        }
+                        if (msg.content[pos] == '{') ++depth;
+                        else if (msg.content[pos] == '}') --depth;
+                        ++pos;
+                    }
+                    if (depth == 0) {
+                        std::string inner_call = msg.content.substr(
+                            obj_start, pos - obj_start);
+                        msg.content = "<tool_call>\n" + inner_call + "\n</tool_call>";
+                    }
+                }
+            }
         }
     }
 
     LOG_INFO("Multi-turn generation: %zu messages", messages.size());
+    for (size_t mi = 0; mi < messages.size(); ++mi) {
+        LOG_INFO("  msg[%zu] role=%s content_len=%zu first40=%.40s",
+                 mi, messages[mi].role.c_str(),
+                 messages[mi].content.size(),
+                 messages[mi].content.c_str());
+    }
 
     // Get vocab
     const llama_vocab *vocab = llama_model_get_vocab(g_state.model);
