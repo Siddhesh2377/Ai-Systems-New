@@ -89,6 +89,12 @@ public:
     // UTF-8 carry buffer for incomplete sequences (legacy)
     std::string utf8_carry_buffer;
 
+    // Stop strings for detecting end-of-turn in generated text.
+    // Small/quantized models often emit turn markers (e.g. <end_of_turn>,
+    // <|im_end|>) as regular text tokens instead of the special EOT token.
+    // These strings are checked during generation to stop the loop.
+    std::vector<std::string> stop_strings;
+
     // Memory tracking
     MemoryMetrics memory_metrics;
 
@@ -226,6 +232,26 @@ public:
      * Estimate memory needed for given context size
      */
     static size_t estimate_context_memory(int32_t ctx_size, int32_t n_embd, int32_t n_layer);
+
+    // ========================================================================
+    // STOP STRING DETECTION
+    // ========================================================================
+
+    /**
+     * Auto-apply a chat template if the model doesn't have one baked in.
+     * Detects architecture (gemma, llama, phi, etc.) and sets the correct
+     * template so the model gets proper turn formatting instead of the
+     * broken "User: / Assistant:" fallback.
+     * Called after model loading, before detect_stop_strings().
+     */
+    void apply_fallback_chat_template();
+
+    /**
+     * Auto-detect stop strings from the model's chat template.
+     * Called after model loading and after setting a custom chat template.
+     * Detects turn boundary markers for Gemma, ChatML, Llama3, Phi, etc.
+     */
+    void detect_stop_strings();
 
     // ========================================================================
     // STATE PERSISTENCE

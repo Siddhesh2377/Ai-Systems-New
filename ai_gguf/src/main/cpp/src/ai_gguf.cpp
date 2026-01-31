@@ -37,6 +37,92 @@ static std::mutex g_init_mtx;
 static std::mutex g_generate_mtx;  // Shared by nativeGenerateStream + nativeGenerateStreamMultiTurn
 static std::atomic<bool> g_stop_requested{false};
 
+/**
+ * Stop string checker for streaming generation.
+ *
+ * Small/quantized models often generate chat template turn markers
+ * (e.g. <end_of_turn>, <|im_end|>) as regular text tokens instead of the
+ * special EOT token ID. This causes the model to keep generating fake
+ * conversation turns in a loop.
+ *
+ * This class buffers recent output and checks for stop strings. Text is
+ * only released for streaming once it's confirmed not to be the start of
+ * a stop string, so stop markers are never sent to the user.
+ */
+class StopStringChecker {
+public:
+    void init(const std::vector<std::string>& stops) {
+        stop_strings_ = stops;
+        max_len_ = 0;
+        for (const auto& s : stops) {
+            if (s.size() > max_len_) max_len_ = s.size();
+        }
+        pending_.clear();
+        pending_.reserve(max_len_ * 2 + 64);
+    }
+
+    bool has_stops() const { return !stop_strings_.empty(); }
+
+    /**
+     * Feed new text. Returns text that is safe to send to the user.
+     * Sets `stopped` to true if a stop string was found.
+     */
+    std::string feed(const std::string& text, bool& stopped) {
+        stopped = false;
+        if (stop_strings_.empty()) return text;
+
+        pending_ += text;
+
+        // Check for any stop string in the pending buffer
+        for (const auto& stop : stop_strings_) {
+            size_t pos = pending_.find(stop);
+            if (pos != std::string::npos) {
+                // Found a stop string — return everything before it
+                stopped = true;
+                std::string safe = pending_.substr(0, pos);
+                pending_.clear();
+                return safe;
+            }
+        }
+
+        // No complete match yet. Hold back the last max_len_ characters
+        // because they could be the start of a stop string.
+        if (pending_.size() > max_len_) {
+            size_t safe_len = pending_.size() - max_len_;
+            std::string safe = pending_.substr(0, safe_len);
+            pending_ = pending_.substr(safe_len);
+            return safe;
+        }
+
+        // Everything is still in the danger zone — hold it all
+        return "";
+    }
+
+    /**
+     * Flush remaining buffered text (call at end of generation).
+     * Strips any trailing stop string if present.
+     */
+    std::string flush() {
+        // Final check for stop strings before flushing
+        for (const auto& stop : stop_strings_) {
+            size_t pos = pending_.find(stop);
+            if (pos != std::string::npos) {
+                std::string safe = pending_.substr(0, pos);
+                pending_.clear();
+                return safe;
+            }
+        }
+        std::string result = std::move(pending_);
+        pending_.clear();
+        return result;
+    }
+
+private:
+    std::vector<std::string> stop_strings_;
+    std::string pending_;
+    size_t max_len_ = 0;
+};
+
 struct GenerationMetrics {
     int32_t total_tokens = 0;
     int32_t prompt_tokens = 0;
@@ -529,6 +615,8 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeGenerateStream(JNIEnv *env, jobject, js
     // Initialize streaming components
     ToolCallState tool_state;
     Utf8StreamDecoder utf8_decoder;
+    StopStringChecker stop_checker;
+    stop_checker.init(g_state.stop_strings);
 
     llama_token eos = llama_vocab_eos(vocab);
     llama_token eot = llama_vocab_eot(vocab);
@@ -540,6 +628,7 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeGenerateStream(JNIEnv *env, jobject, js
     // Check every 64 tokens or so
     constexpr int EXCEPTION_CHECK_INTERVAL = 64;
     bool has_exception = false;
+    bool hit_stop_string = false;
 
     // ========================================================================
     // LAZY TOOL DETECTION OPTIMIZATION
@@ -614,7 +703,7 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeGenerateStream(JNIEnv *env, jobject, js
         std::string complete_chars = utf8_decoder.decode(raw_piece);
 
         // ====================================================================
-        // IMMEDIATE TOKEN STREAMING - NO BUFFERING
+        // TOKEN STREAMING WITH STOP STRING DETECTION
         // ====================================================================
         if (!complete_chars.empty()) {
             bool tool_complete = false;
@@ -632,9 +721,24 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeGenerateStream(JNIEnv *env, jobject, js
                 }
             }
 
-            // Stream token immediately (unless collecting a tool call)
+            // Stream token (unless collecting a tool call)
             if (!tool_state.is_collecting()) {
-                send_token_immediate(env, jcallback, complete_chars);
+                if (stop_checker.has_stops()) {
+                    // Feed through stop string checker — it buffers text
+                    // and only releases what's confirmed safe
+                    bool stopped = false;
+                    std::string safe = stop_checker.feed(complete_chars, stopped);
+                    if (!safe.empty()) {
+                        send_token_immediate(env, jcallback, safe);
+                    }
+                    if (stopped) {
+                        LOG_INFO("Stop string detected at token %d — ending generation", i);
+                        hit_stop_string = true;
+                        break;
+                    }
+                } else {
+                    send_token_immediate(env, jcallback, complete_chars);
+                }
             }
         }
 
@@ -673,7 +777,23 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeGenerateStream(JNIEnv *env, jobject, js
     // Flush any remaining UTF-8 bytes
     std::string remaining = utf8_decoder.flush();
     if (!remaining.empty()) {
-        send_token_immediate(env, jcallback, remaining);
+        if (stop_checker.has_stops()) {
+            bool stopped = false;
+            std::string safe = stop_checker.feed(remaining, stopped);
+            if (!safe.empty()) {
+                send_token_immediate(env, jcallback, safe);
+            }
+        } else {
+            send_token_immediate(env, jcallback, remaining);
+        }
+    }
+
+    // Flush stop checker buffer (anything held back that wasn't a stop string)
+    if (stop_checker.has_stops()) {
+        std::string buffered = stop_checker.flush();
+        if (!buffered.empty()) {
+            send_token_immediate(env, jcallback, buffered);
+        }
     }
 
     // Calculate final metrics
@@ -881,6 +1001,8 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeGenerateStreamMultiTurn(JNIEnv *env, jo
     // Initialize streaming components
     ToolCallState tool_state;
     Utf8StreamDecoder utf8_decoder;
+    StopStringChecker stop_checker;
+    stop_checker.init(g_state.stop_strings);
 
     llama_token eos = llama_vocab_eos(vocab);
     llama_token eot = llama_vocab_eot(vocab);
@@ -889,9 +1011,10 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeGenerateStreamMultiTurn(JNIEnv *env, jo
 
     constexpr int EXCEPTION_CHECK_INTERVAL = 64;
     bool has_exception = false;
+    bool hit_stop_string = false;
 
     // ========================================================================
-    // GENERATION LOOP (identical logic to nativeGenerateStream)
+    // GENERATION LOOP (with stop string detection)
     // ========================================================================
     for (int i = 0; i < to_generate && !g_stop_requested.load(std::memory_order_relaxed); ++i) {
         int current_pos = static_cast<int>(prompt_toks.size()) + i;
@@ -957,7 +1080,20 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeGenerateStreamMultiTurn(JNIEnv *env, jo
             }
 
             if (!tool_state.is_collecting()) {
-                send_token_immediate(env, jcallback, complete_chars);
+                if (stop_checker.has_stops()) {
+                    bool stopped = false;
+                    std::string safe = stop_checker.feed(complete_chars, stopped);
+                    if (!safe.empty()) {
+                        send_token_immediate(env, jcallback, safe);
+                    }
+                    if (stopped) {
+                        LOG_INFO("Stop string detected at token %d — ending generation", i);
+                        hit_stop_string = true;
+                        break;
+                    }
+                } else {
+                    send_token_immediate(env, jcallback, complete_chars);
+                }
             }
         }
 
@@ -990,7 +1126,23 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeGenerateStreamMultiTurn(JNIEnv *env, jo
     // ========================================================================
     std::string remaining = utf8_decoder.flush();
     if (!remaining.empty()) {
-        send_token_immediate(env, jcallback, remaining);
+        if (stop_checker.has_stops()) {
+            bool stopped = false;
+            std::string safe = stop_checker.feed(remaining, stopped);
+            if (!safe.empty()) {
+                send_token_immediate(env, jcallback, safe);
+            }
+        } else {
+            send_token_immediate(env, jcallback, remaining);
+        }
+    }
+
+    // Flush stop checker buffer
+    if (stop_checker.has_stops()) {
+        std::string buffered = stop_checker.flush();
+        if (!buffered.empty()) {
+            send_token_immediate(env, jcallback, buffered);
+        }
     }
 
     auto end_time = std::chrono::steady_clock::now();
@@ -1080,7 +1232,14 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeLoadModelFromFd(JNIEnv *env, jobject, j
     g_state.rebuild_sampler(static_cast<int>(topK), topP, temp, minP, mirostat, mirostatTau,
                             mirostatEta, seed);
     g_state.warmup_context();
+
+    // If model has no chat template, apply one based on architecture
+    g_state.apply_fallback_chat_template();
+
     maybe_init_grammar();
+
+    // Auto-detect stop strings from chat template
+    g_state.detect_stop_strings();
 
     LOG_INFO("Model initialized successfully from fd");
     return JNI_TRUE;
@@ -1151,8 +1310,14 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeLoadModel(JNIEnv *env, jobject, jstring
     // Warm up context
     g_state.warmup_context();
 
+    // If model has no chat template, apply one based on architecture
+    g_state.apply_fallback_chat_template();
+
     // Initialize grammar if tools are enabled
     maybe_init_grammar();
+
+    // Auto-detect stop strings from chat template
+    g_state.detect_stop_strings();
 
     LOG_INFO("Model initialized successfully");
     return JNI_TRUE;
@@ -1175,6 +1340,8 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_mp_ai_1gguf_GGUFNativeLib_nativeSetChatTemplate(JNIEnv *env, jobject, jstring jtemplate) {
     g_state.chat_template_override = utf8::from_jstring(env, jtemplate);
     LOG_INFO("Chat template override set (%zu bytes)", g_state.chat_template_override.size());
+    // Re-detect stop strings since template changed
+    g_state.detect_stop_strings();
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -1792,6 +1959,30 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeSetGrammarMode(JNIEnv *, jobject, jint 
     // Rebuild grammar if tools are enabled
     if (g_state.tools_enabled) {
         maybe_init_grammar();
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_mp_ai_1gguf_GGUFNativeLib_nativeSetStopStrings(JNIEnv *env, jobject, jobjectArray jstrings) {
+    g_state.stop_strings.clear();
+
+    if (jstrings) {
+        jsize len = env->GetArrayLength(jstrings);
+        for (jsize i = 0; i < len; ++i) {
+            auto jstr = static_cast<jstring>(env->GetObjectArrayElement(jstrings, i));
+            if (jstr) {
+                std::string s = utf8::from_jstring(env, jstr);
+                if (!s.empty()) {
+                    g_state.stop_strings.push_back(std::move(s));
+                }
+                env->DeleteLocalRef(jstr);
+            }
+        }
+    }
+
+    LOG_INFO("Stop strings set: %zu entries", g_state.stop_strings.size());
+    for (const auto& s : g_state.stop_strings) {
+        LOG_INFO("  stop: \"%s\"", s.c_str());
     }
 }
 

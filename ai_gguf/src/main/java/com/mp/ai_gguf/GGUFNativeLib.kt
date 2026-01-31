@@ -34,6 +34,24 @@ class GGUFNativeLib {
     external fun nativeSetSystemPrompt(prompt: String)
     external fun nativeGetModelInfo(): String
     external fun nativeStopGeneration()
+
+    /**
+     * Set custom stop strings for generation.
+     *
+     * Stop strings are checked during token generation to detect when the
+     * model's turn has ended. This is critical for small/quantized models
+     * that emit turn markers (e.g. `<end_of_turn>`, `<|im_end|>`) as
+     * regular text tokens instead of the special EOT token.
+     *
+     * By default, stop strings are auto-detected from the model's chat
+     * template when the model is loaded. Use this function to override
+     * with custom stop strings, or pass an empty array to disable.
+     *
+     * @param strings Array of stop strings. Generation stops when any of
+     *                these is detected in the output. The stop string
+     *                itself is not included in the output.
+     */
+    external fun nativeSetStopStrings(strings: Array<String>)
     external fun nativeClearMemory()
     external fun llamaPrintTimings()
 

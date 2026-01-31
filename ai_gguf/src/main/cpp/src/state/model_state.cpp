@@ -14,6 +14,7 @@
 #include "../chat/chat_template.h"
 
 #include <cstring>
+#include <cctype>
 #include <algorithm>
 #include <jni.h>
 
@@ -318,6 +319,7 @@ void ModelState::release() {
     }
 
     utf8_carry_buffer.clear();
+    stop_strings.clear();
     llama_backend_free();
 
     LOG_INFO("ModelState: all resources released");
@@ -569,6 +571,177 @@ void ModelState::update_grammar_if_needed() {
         // Grammar only makes tool calls more reliable by constraining output.
         LOG_WARN("All grammar init attempts failed - tool calling continues WITHOUT grammar constraints");
         LOG_WARN("Model will generate freely; tool calls detected via ToolCallState");
+    }
+}
+
+// ============================================================================
+// FALLBACK CHAT TEMPLATE
+// ============================================================================
+
+void ModelState::apply_fallback_chat_template() {
+    if (!model) return;
+
+    // Skip if a custom template is already set
+    if (!chat_template_override.empty()) {
+        LOG_INFO("Custom chat template already set, skipping fallback");
+        return;
+    }
+
+    // Skip if the model already has a built-in template
+    const char* builtin = llama_model_chat_template(model, nullptr);
+    if (builtin && *builtin) {
+        LOG_INFO("Model has built-in chat template, skipping fallback");
+        return;
+    }
+
+    // No template — detect architecture and apply the right one
+    static char arch_buf[128] = {0};
+    int32_t len = llama_model_meta_val_str(model, "general.architecture",
+                                           arch_buf, sizeof(arch_buf));
+    std::string arch = (len > 0) ? std::string(arch_buf) : "";
+
+    // Convert to lowercase for comparison
+    for (auto& c : arch) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+    if (arch.find("gemma") != std::string::npos) {
+        // Gemma / Gemma2 template
+        chat_template_override =
+            "{% for message in messages %}"
+            "{% if message['role'] == 'system' %}"
+            "{{ message['content'] }}\n"
+            "{% elif message['role'] == 'user' %}"
+            "<start_of_turn>user\n"
+            "{{ message['content'] }}<end_of_turn>\n"
+            "<start_of_turn>model\n"
+            "{% elif message['role'] == 'assistant' or message['role'] == 'model' %}"
+            "{{ message['content'] }}<end_of_turn>\n"
+            "{% endif %}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}<start_of_turn>model\n{% endif %}";
+        LOG_INFO("Applied fallback Gemma chat template for architecture: %s", arch.c_str());
+    }
+    else if (arch.find("llama") != std::string::npos ||
+             arch.find("mistral") != std::string::npos ||
+             arch.find("mixtral") != std::string::npos) {
+        // Llama 3 / Mistral — ChatML-style
+        chat_template_override =
+            "{% for message in messages %}"
+            "<|im_start|>{{ message['role'] }}\n"
+            "{{ message['content'] }}<|im_end|>\n"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+        LOG_INFO("Applied fallback ChatML template for architecture: %s", arch.c_str());
+    }
+    else if (arch.find("phi") != std::string::npos) {
+        // Phi template
+        chat_template_override =
+            "{% for message in messages %}"
+            "<|{{ message['role'] }}|>\n"
+            "{{ message['content'] }}<|end|>\n"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}<|assistant|>\n{% endif %}";
+        LOG_INFO("Applied fallback Phi template for architecture: %s", arch.c_str());
+    }
+    else if (arch.find("qwen") != std::string::npos) {
+        // Qwen — ChatML
+        chat_template_override =
+            "{% for message in messages %}"
+            "<|im_start|>{{ message['role'] }}\n"
+            "{{ message['content'] }}<|im_end|>\n"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+        LOG_INFO("Applied fallback ChatML template for architecture: %s", arch.c_str());
+    }
+    else {
+        // Generic ChatML fallback — works reasonably with most models
+        chat_template_override =
+            "{% for message in messages %}"
+            "<|im_start|>{{ message['role'] }}\n"
+            "{{ message['content'] }}<|im_end|>\n"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+        LOG_INFO("Applied generic ChatML fallback template for unknown architecture: %s",
+                 arch.empty() ? "(none)" : arch.c_str());
+    }
+}
+
+// ============================================================================
+// STOP STRING DETECTION
+// ============================================================================
+
+void ModelState::detect_stop_strings() {
+    stop_strings.clear();
+
+    if (!model) return;
+
+    // Use custom template if set, otherwise use model's built-in template
+    const char* tmpl = chat_template_override.empty()
+                       ? llama_model_chat_template(model, nullptr)
+                       : chat_template_override.c_str();
+
+    bool matched_template = false;
+
+    if (tmpl && *tmpl) {
+        std::string t(tmpl);
+
+        // Gemma: <start_of_turn>user\n...<end_of_turn>\n<start_of_turn>model\n
+        if (t.find("<start_of_turn>") != std::string::npos) {
+            stop_strings.push_back("<end_of_turn>");
+            stop_strings.push_back("<start_of_turn>");
+            matched_template = true;
+        }
+        // ChatML: <|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n
+        else if (t.find("<|im_start|>") != std::string::npos) {
+            stop_strings.push_back("<|im_end|>");
+            stop_strings.push_back("<|im_start|>");
+            matched_template = true;
+        }
+        // Llama 3: <|start_header_id|>user<|end_header_id|>\n...<|eot_id|>
+        else if (t.find("<|start_header_id|>") != std::string::npos) {
+            stop_strings.push_back("<|eot_id|>");
+            stop_strings.push_back("<|start_header_id|>");
+            matched_template = true;
+        }
+        // Phi: <|user|>\n...<|end|>\n<|assistant|>\n
+        else if (t.find("<|assistant|>") != std::string::npos) {
+            stop_strings.push_back("<|end|>");
+            stop_strings.push_back("<|user|>");
+            matched_template = true;
+        }
+        // Mistral/Mixtral: [INST]...[/INST]
+        else if (t.find("[INST]") != std::string::npos) {
+            stop_strings.push_back("</s>");
+            stop_strings.push_back("[INST]");
+            matched_template = true;
+        }
+        // Command-R
+        else if (t.find("<|END_OF_TURN_TOKEN|>") != std::string::npos) {
+            stop_strings.push_back("<|END_OF_TURN_TOKEN|>");
+            stop_strings.push_back("<|START_OF_TURN_TOKEN|>");
+            matched_template = true;
+        }
+    }
+
+    // ====================================================================
+    // FALLBACK STOP STRINGS
+    // If no chat template or unrecognized template, the code uses a plain
+    // "User: ... Assistant: ..." format. Small models will generate past
+    // their turn and produce fake "User:" lines. Always add these as a
+    // safety net — they catch the conversation-loop problem regardless
+    // of template type.
+    // ====================================================================
+    stop_strings.push_back("\nUser:");
+    stop_strings.push_back("\nHuman:");
+    stop_strings.push_back("\n### User");
+    stop_strings.push_back("\n<|user|>");
+
+    if (matched_template) {
+        LOG_INFO("Detected %zu stop strings (template + fallback):", stop_strings.size());
+    } else {
+        LOG_INFO("No chat template — using %zu fallback stop strings:", stop_strings.size());
+    }
+    for (const auto& s : stop_strings) {
+        LOG_INFO("  stop: \"%s\"", s.c_str());
     }
 }
 
