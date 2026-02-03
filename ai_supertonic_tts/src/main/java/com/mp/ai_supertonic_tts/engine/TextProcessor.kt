@@ -147,7 +147,7 @@ class TextProcessor(private val unicodeIndexer: LongArray) {
          * The file is a flat JSON array of integers mapping codepoint -> vocab index.
          */
         fun loadUnicodeIndexer(path: String): LongArray {
-            val json = File(path).readText()
+            val json = File(path).readText(Charsets.UTF_8)
             return parseIndexerJson(json)
         }
 
@@ -155,7 +155,7 @@ class TextProcessor(private val unicodeIndexer: LongArray) {
          * Load the Unicode indexer from an InputStream.
          */
         fun loadUnicodeIndexerFromStream(stream: InputStream): LongArray {
-            val json = stream.bufferedReader().readText()
+            val json = stream.bufferedReader(Charsets.UTF_8).readText()
             return parseIndexerJson(json)
         }
 

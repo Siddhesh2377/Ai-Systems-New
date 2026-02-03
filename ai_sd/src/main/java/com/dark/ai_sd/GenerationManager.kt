@@ -15,6 +15,7 @@ import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.IOException
 import java.io.InputStreamReader
+import java.nio.charset.StandardCharsets
 import java.util.Base64
 import java.util.concurrent.TimeUnit
 
@@ -203,7 +204,7 @@ class GenerationManager(private val context: Context) {
         width: Int,
         height: Int
     ) = withContext(Dispatchers.IO) {
-        val reader = BufferedReader(InputStreamReader(responseBody.byteStream()))
+        val reader = BufferedReader(InputStreamReader(responseBody.byteStream(), StandardCharsets.UTF_8))
         
         try {
             while (isActive) {

@@ -210,7 +210,7 @@ class SupertonicTTS(private val context: Context? = null) {
      * Read text from a file and speak it.
      */
     suspend fun speakFromFile(path: String, config: TTSConfig = TTSConfig()) {
-        val text = File(path).readText()
+        val text = File(path).readText(Charsets.UTF_8)
         speak(text, config)
     }
 
@@ -221,7 +221,7 @@ class SupertonicTTS(private val context: Context? = null) {
     suspend fun speakFromUri(uri: Uri, config: TTSConfig = TTSConfig()) {
         val ctx = context ?: throw IllegalStateException("Context required for URI reading. Pass context in constructor.")
         val text = ctx.contentResolver.openInputStream(uri)?.use { stream ->
-            BufferedReader(InputStreamReader(stream)).readText()
+            BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).readText()
         } ?: throw IllegalArgumentException("Could not open URI: $uri")
         speak(text, config)
     }
@@ -230,7 +230,7 @@ class SupertonicTTS(private val context: Context? = null) {
      * Read text from an InputStream and speak it.
      */
     suspend fun speakFromStream(stream: InputStream, config: TTSConfig = TTSConfig()) {
-        val text = BufferedReader(InputStreamReader(stream)).readText()
+        val text = BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).readText()
         speak(text, config)
     }
 
@@ -241,7 +241,7 @@ class SupertonicTTS(private val context: Context? = null) {
         path: String,
         config: TTSConfig = TTSConfig()
     ): SynthesisResult {
-        val text = File(path).readText()
+        val text = File(path).readText(Charsets.UTF_8)
         return synthesize(text, config)
     }
 
@@ -254,7 +254,7 @@ class SupertonicTTS(private val context: Context? = null) {
     ): SynthesisResult {
         val ctx = context ?: throw IllegalStateException("Context required for URI reading. Pass context in constructor.")
         val text = ctx.contentResolver.openInputStream(uri)?.use { stream ->
-            BufferedReader(InputStreamReader(stream)).readText()
+            BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).readText()
         } ?: throw IllegalArgumentException("Could not open URI: $uri")
         return synthesize(text, config)
     }

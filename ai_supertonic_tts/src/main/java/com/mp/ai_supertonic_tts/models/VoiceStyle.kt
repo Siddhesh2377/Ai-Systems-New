@@ -44,7 +44,7 @@ data class VoiceStyle(
          */
         fun loadFromJson(path: String): VoiceStyle {
             val name = File(path).nameWithoutExtension
-            val json = File(path).readText()
+            val json = File(path).readText(Charsets.UTF_8)
             return parseJson(json, name)
         }
 
@@ -52,7 +52,7 @@ data class VoiceStyle(
          * Load a voice style from an InputStream.
          */
         fun loadFromInputStream(stream: InputStream, name: String): VoiceStyle {
-            val json = stream.bufferedReader().readText()
+            val json = stream.bufferedReader(Charsets.UTF_8).readText()
             return parseJson(json, name)
         }
 

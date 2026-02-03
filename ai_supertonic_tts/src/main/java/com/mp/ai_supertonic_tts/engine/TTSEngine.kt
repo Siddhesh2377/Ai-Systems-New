@@ -377,7 +377,7 @@ class TTSEngine(private val nativeLib: SupertonicNativeLib) {
     // ========================================================================
 
     private fun loadConfig(path: String) {
-        val json = JSONObject(File(path).readText())
+        val json = JSONObject(File(path).readText(Charsets.UTF_8))
         val ae = json.getJSONObject("ae")
         sampleRate = ae.getInt("sample_rate")
         baseChunkSize = ae.getInt("base_chunk_size")
