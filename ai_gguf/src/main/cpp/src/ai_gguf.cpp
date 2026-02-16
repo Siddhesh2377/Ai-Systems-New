@@ -835,10 +835,13 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeGenerateStreamMultiTurn(JNIEnv *env, jo
         return JNI_FALSE;
     }
 
-    // Prepare for new generation (clear KV cache)
-    g_state.prepare_for_generation();
-    // Rebuild sampler with fresh grammar clone for this turn
+    // DON'T call prepare_for_generation() here — we may reuse the KV cache.
+    // Sampler reset + grammar rebuild is still needed for each turn.
+    if (g_state.sampler) {
+        llama_sampler_reset(g_state.sampler);
+    }
     g_state.rebuild_sampler_cached();
+    g_state.utf8_carry_buffer.clear();
     g_stop_requested.store(false, std::memory_order_relaxed);
 
     std::lock_guard<std::mutex> lock(g_generate_mtx);
@@ -984,11 +987,58 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeGenerateStreamMultiTurn(JNIEnv *env, jo
     int32_t to_generate = (max_tokens > 0) ? static_cast<int32_t>(max_tokens) : 128;
     to_generate = std::min(to_generate, available);
 
-    // Decode prompt (prefill phase)
-    if (!g_state.decode_prompt(prompt_toks)) {
-        jni::on_error(env, jcallback, "Decoding prompt failed");
-        return JNI_TRUE;
+    // ====================================================================
+    // INCREMENTAL KV CACHE REUSE
+    //
+    // Chat templates are prefix-preserving: adding messages to the end of
+    // a conversation only appends tokens to the rendered prompt. So if the
+    // first N tokens of the new prompt match the cached prompt, the KV
+    // entries for those N tokens are still valid.
+    //
+    // We trim the KV cache to the common prefix length and only decode
+    // the new suffix tokens. On CPU at 100-300 t/s prefill, reusing a
+    // 500-token prefix saves ~1.5-5s per turn.
+    // ====================================================================
+    int32_t common = g_state.prompt_cache.common_prefix_length(prompt_toks);
+
+    if (common > 0) {
+        // Trim KV cache: remove everything after the common prefix
+        // (this removes previously generated tokens + old suffix)
+        llama_memory_t mem = llama_get_memory(g_state.ctx);
+        if (mem) {
+            llama_memory_seq_rm(mem, 0, common, -1);
+        }
+
+        int32_t suffix_len = static_cast<int32_t>(prompt_toks.size()) - common;
+        LOG_INFO("Incremental KV: reusing %d tokens, decoding %d new tokens (saved %.1f%%)",
+                 common, suffix_len,
+                 100.0f * common / static_cast<float>(prompt_toks.size()));
+
+        // Decode only the new suffix tokens
+        if (!g_state.decode_prompt_from(prompt_toks, common, common)) {
+            // Fallback: clear everything and decode the full prompt
+            LOG_WARN("Incremental decode failed, falling back to full decode");
+            if (mem) llama_memory_clear(mem, true);
+            if (!g_state.decode_prompt(prompt_toks)) {
+                jni::on_error(env, jcallback, "Decoding prompt failed");
+                return JNI_TRUE;
+            }
+        }
+    } else {
+        // No common prefix — full clear and decode
+        llama_memory_t mem = llama_get_memory(g_state.ctx);
+        if (mem) llama_memory_clear(mem, true);
+
+        if (!g_state.decode_prompt(prompt_toks)) {
+            jni::on_error(env, jcallback, "Decoding prompt failed");
+            return JNI_TRUE;
+        }
     }
+
+    // Update prompt cache for next turn
+    g_state.prompt_cache.tokens = prompt_toks;
+    g_state.prompt_cache.n_past = static_cast<int32_t>(prompt_toks.size());
+    g_state.prompt_cache.valid = true;
 
     // Verify logits
     float *logits = llama_get_logits(g_state.ctx);
@@ -1175,10 +1225,10 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeLoadModelFromFd(JNIEnv *env, jobject, j
     g_state.release();
     llama_backend_init();
 
-    int phys = count_physical_cores();
-    int nthreads = (jthreads > 0) ? static_cast<int>(jthreads) : phys;
+    int nthreads = (jthreads > 0) ? static_cast<int>(jthreads) : get_optimal_thread_count();
 
-    LOG_INFO("Initializing model from fd=%d (threads=%d, ctx=%d)", fd, nthreads, ctxSize);
+    LOG_INFO("Initializing model from fd=%d (threads=%d, ctx=%d, perf_cores=%d)",
+             fd, nthreads, ctxSize, count_performance_cores());
 
     // Get file size via fstat
     struct stat st;
@@ -1208,18 +1258,35 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeLoadModelFromFd(JNIEnv *env, jobject, j
 
     LOG_INFO("Model loaded successfully from fd");
 
-    // Context setup
+    // Context setup - CPU optimized
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = ctxSize;
-    cparams.n_batch = 512;
-    cparams.n_ubatch = 256;
+    // Scale batch sizes: more threads → larger batches for prefill throughput
+    cparams.n_batch = (nthreads >= 6) ? 1024 : 512;
+    cparams.n_ubatch = (nthreads >= 6) ? 512 : 256;
     cparams.n_threads = nthreads;
     cparams.n_threads_batch = nthreads;
     cparams.offload_kqv = false;
     cparams.n_seq_max = 1;
     cparams.no_perf = false;
 
+    // Flash attention: reduces memory bandwidth during attention (major CPU bottleneck)
+    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+
+    // Quantized KV cache: halves KV memory, reduces bandwidth pressure during decode
+    cparams.type_k = GGML_TYPE_Q8_0;
+    cparams.type_v = GGML_TYPE_Q8_0;
+
     g_state.ctx = llama_init_from_model(g_state.model, cparams);
+    if (!g_state.ctx) {
+        // Flash attention or Q8 KV may not be supported by all models —
+        // fall back to defaults if init fails
+        LOG_WARN("Context init failed with optimized params, retrying with defaults");
+        cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        cparams.type_k = GGML_TYPE_F16;
+        cparams.type_v = GGML_TYPE_F16;
+        g_state.ctx = llama_init_from_model(g_state.model, cparams);
+    }
     if (!g_state.ctx) {
         LOG_ERROR("Failed to create context");
         g_state.release();
@@ -1260,11 +1327,11 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeLoadModel(JNIEnv *env, jobject, jstring
     g_state.release();
     llama_backend_init();
 
-    // Detect optimal thread count
-    int phys = count_physical_cores();
-    int nthreads = (jthreads > 0) ? static_cast<int>(jthreads) : phys;
+    // Detect optimal thread count (prefers performance cores on big.LITTLE SoCs)
+    int nthreads = (jthreads > 0) ? static_cast<int>(jthreads) : get_optimal_thread_count();
 
-    LOG_INFO("Initializing model '%s' (threads=%d, ctx=%d)", path.c_str(), nthreads, ctxSize);
+    LOG_INFO("Initializing model '%s' (threads=%d, ctx=%d, perf_cores=%d)",
+             path.c_str(), nthreads, ctxSize, count_performance_cores());
 
     // Model parameters
     llama_model_params mparams = llama_model_default_params();
@@ -1281,19 +1348,34 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeLoadModel(JNIEnv *env, jobject, jstring
         return JNI_FALSE;
     }
 
-    // Context parameters
+    // Context parameters - CPU optimized
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = ctxSize;
-    cparams.n_batch = 512;
-    cparams.n_ubatch = 256;
+    cparams.n_batch = (nthreads >= 6) ? 1024 : 512;
+    cparams.n_ubatch = (nthreads >= 6) ? 512 : 256;
     cparams.n_threads = nthreads;
     cparams.n_threads_batch = nthreads;
     cparams.offload_kqv = false;    // CPU-only
     cparams.n_seq_max = 1;
     cparams.no_perf = false;
 
+    // Flash attention: reduces memory bandwidth during attention
+    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+
+    // Quantized KV cache: halves KV memory, reduces bandwidth pressure
+    cparams.type_k = GGML_TYPE_Q8_0;
+    cparams.type_v = GGML_TYPE_Q8_0;
+
     // Create context
     g_state.ctx = llama_init_from_model(g_state.model, cparams);
+    if (!g_state.ctx) {
+        // Fallback if flash attn or Q8 KV not supported
+        LOG_WARN("Context init failed with optimized params, retrying with defaults");
+        cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        cparams.type_k = GGML_TYPE_F16;
+        cparams.type_v = GGML_TYPE_F16;
+        g_state.ctx = llama_init_from_model(g_state.model, cparams);
+    }
     if (!g_state.ctx) {
         LOG_ERROR("Failed to create context");
         g_state.release();
@@ -1636,8 +1718,7 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeLoadEmbeddingModelFromFd(JNIEnv *env, j
     g_embedding_state.release();
     llama_backend_init();
 
-    int phys = count_physical_cores();
-    int nthreads = (jthreads > 0) ? static_cast<int>(jthreads) : phys;
+    int nthreads = (jthreads > 0) ? static_cast<int>(jthreads) : get_optimal_thread_count();
 
     LOG_INFO("Loading embedding model from fd=%d (threads=%d, ctx=%d)", fd, nthreads, ctxSize);
 
@@ -1712,9 +1793,7 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeLoadEmbeddingModel(JNIEnv *env, jobject
     g_embedding_state.release();
     llama_backend_init();
 
-    // Detect optimal thread count
-    int phys = count_physical_cores();
-    int nthreads = (jthreads > 0) ? static_cast<int>(jthreads) : phys;
+    int nthreads = (jthreads > 0) ? static_cast<int>(jthreads) : get_optimal_thread_count();
 
     LOG_INFO("Loading embedding model '%s' (threads=%d, ctx=%d)", path.c_str(), nthreads,
              ctxSize);

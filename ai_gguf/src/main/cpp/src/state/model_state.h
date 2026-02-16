@@ -20,6 +20,46 @@
 #include <jni.h>
 
 /**
+ * Prompt cache for incremental KV reuse across multi-turn generations.
+ *
+ * After each multi-turn generation, the tokenized prompt is stored here.
+ * On the next turn, we find the common prefix with the new prompt and
+ * only decode the new suffix, avoiding redundant re-encoding.
+ *
+ * On CPU, prefill runs at 100-300 t/s. For a 500-token common prefix,
+ * this saves ~1.5-5s per turn.
+ */
+struct PromptCache {
+    std::vector<llama_token> tokens;  // Previous prompt's token IDs
+    int32_t n_past = 0;               // Tokens currently in KV cache (prompt only)
+    bool valid = false;
+
+    void invalidate() {
+        tokens.clear();
+        n_past = 0;
+        valid = false;
+    }
+
+    /**
+     * Find how many leading tokens match between cached and new prompts.
+     * Returns 0 if cache is invalid or empty.
+     */
+    int32_t common_prefix_length(const std::vector<llama_token>& new_tokens) const {
+        if (!valid || tokens.empty()) return 0;
+        int32_t limit = std::min(static_cast<int32_t>(tokens.size()),
+                                 static_cast<int32_t>(new_tokens.size()));
+        // Also don't exceed n_past (tokens actually in KV cache)
+        limit = std::min(limit, n_past);
+        int32_t common = 0;
+        for (int32_t i = 0; i < limit; ++i) {
+            if (tokens[i] != new_tokens[i]) break;
+            ++common;
+        }
+        return common;
+    }
+};
+
+/**
  * Memory usage metrics for monitoring
  */
 struct MemoryMetrics {
@@ -94,6 +134,9 @@ public:
     // <|im_end|>) as regular text tokens instead of the special EOT token.
     // These strings are checked during generation to stop the loop.
     std::vector<std::string> stop_strings;
+
+    // Prompt cache for incremental KV reuse in multi-turn
+    PromptCache prompt_cache;
 
     // Memory tracking
     MemoryMetrics memory_metrics;
@@ -208,6 +251,18 @@ public:
      * Decode prompt tokens (prefill phase)
      */
     bool decode_prompt(const std::vector<llama_token>& toks) const;
+
+    /**
+     * Decode a suffix of prompt tokens starting at a given position.
+     * Used for incremental KV reuse: only new tokens after the common
+     * prefix need to be decoded.
+     *
+     * @param toks Full token vector
+     * @param start_idx Index in toks to start decoding from
+     * @param start_pos KV cache position for the first decoded token
+     */
+    bool decode_prompt_from(const std::vector<llama_token>& toks,
+                            int32_t start_idx, int32_t start_pos) const;
 
     /**
      * Warm up context

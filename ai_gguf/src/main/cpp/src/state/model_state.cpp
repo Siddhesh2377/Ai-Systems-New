@@ -320,6 +320,7 @@ void ModelState::release() {
 
     utf8_carry_buffer.clear();
     stop_strings.clear();
+    prompt_cache.invalidate();
     llama_backend_free();
 
     LOG_INFO("ModelState: all resources released");
@@ -339,8 +340,9 @@ void ModelState::prepare_for_generation() {
     }
 
     utf8_carry_buffer.clear();
+    prompt_cache.invalidate();
 
-    LOG_INFO("prepare_for_generation: KV cache cleared, sampler reset");
+    LOG_INFO("prepare_for_generation: KV cache cleared, sampler reset, prompt cache invalidated");
 }
 
 // ============================================================================
@@ -378,6 +380,47 @@ bool ModelState::decode_prompt(const std::vector<llama_token>& toks) const {
 
         pos += take;
         idx += static_cast<size_t>(take);
+    }
+
+    llama_batch_free(batch);
+    return true;
+}
+
+bool ModelState::decode_prompt_from(const std::vector<llama_token>& toks,
+                                    int32_t start_idx, int32_t start_pos) const {
+    if (!ctx || toks.empty() || start_idx >= static_cast<int32_t>(toks.size())) return true;
+
+    int32_t remaining = static_cast<int32_t>(toks.size()) - start_idx;
+    if (remaining <= 0) return true;
+
+    llama_batch batch = llama_batch_init(batch_size, 0, 1);
+
+    int32_t pos = start_pos;
+    int32_t idx = start_idx;
+
+    while (idx < static_cast<int32_t>(toks.size())) {
+        int32_t take = std::min<int32_t>(
+                batch_size,
+                static_cast<int32_t>(toks.size()) - idx
+        );
+
+        batch.n_tokens = take;
+        for (int i = 0; i < take; ++i) {
+            batch.token[i] = toks[idx + i];
+            batch.pos[i] = pos + i;
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = 0;
+            batch.logits[i] = (idx + i == static_cast<int32_t>(toks.size()) - 1);
+        }
+
+        if (llama_decode(ctx, batch) != 0) {
+            LOG_ERROR("ModelState::decode_prompt_from: llama_decode failed at pos %d", pos);
+            llama_batch_free(batch);
+            return false;
+        }
+
+        pos += take;
+        idx += take;
     }
 
     llama_batch_free(batch);

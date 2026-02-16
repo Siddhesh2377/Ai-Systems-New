@@ -248,11 +248,14 @@ class GGUFNativeLib {
 
         /**
          * Recommended settings for low-end devices (< 4GB RAM)
+         *
+         * Thread count 0 = auto-detect performance cores (big.LITTLE aware).
+         * Batch sizes tuned for 4 performance cores.
          */
         object LowEndDefaults {
             const val CONTEXT_SIZE = 1024
-            const val BATCH_SIZE = 256
-            const val THREADS = 0  // Auto-detect
+            const val BATCH_SIZE = 512
+            const val THREADS = 0  // Auto-detect perf cores
             const val TEMPERATURE = 0.7f
             const val TOP_K = 40
             const val TOP_P = 0.9f
@@ -261,11 +264,14 @@ class GGUFNativeLib {
 
         /**
          * Recommended settings for mid-range devices (4-8GB RAM)
+         *
+         * Thread count 0 = auto-detect performance cores (big.LITTLE aware).
+         * Batch sizes scaled for 4-6 performance cores.
          */
         object MidRangeDefaults {
             const val CONTEXT_SIZE = 2048
             const val BATCH_SIZE = 512
-            const val THREADS = 0  // Auto-detect
+            const val THREADS = 0  // Auto-detect perf cores
             const val TEMPERATURE = 0.7f
             const val TOP_K = 40
             const val TOP_P = 0.9f
@@ -274,11 +280,14 @@ class GGUFNativeLib {
 
         /**
          * Recommended settings for high-end devices (> 8GB RAM)
+         *
+         * Thread count 0 = auto-detect performance cores (big.LITTLE aware).
+         * Batch sizes scaled for 6+ performance cores (auto-tuned in native).
          */
         object HighEndDefaults {
             const val CONTEXT_SIZE = 4096
-            const val BATCH_SIZE = 512
-            const val THREADS = 0  // Auto-detect
+            const val BATCH_SIZE = 1024
+            const val THREADS = 0  // Auto-detect perf cores
             const val TEMPERATURE = 0.7f
             const val TOP_K = 40
             const val TOP_P = 0.9f

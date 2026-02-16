@@ -31,9 +31,21 @@ android {
                 arguments += "-DLLAMA_BUILD_COMMON=ON"
                 arguments += "-DGGML_LLAMAFILE=ON"
                 arguments += "-DGGML_PAGE_SIZE=16384"
+                arguments += "-DGGML_OPENMP=OFF"
 
                 arguments += "-DCMAKE_BUILD_TYPE=Release"
-                cppFlags += listOf()
+                cppFlags += listOf(
+                    "-O3",
+                    "-ffast-math",
+                    "-fno-finite-math-only",
+                    "-ffp-contract=fast"
+                )
+                cFlags += listOf(
+                    "-O3",
+                    "-ffast-math",
+                    "-fno-finite-math-only",
+                    "-ffp-contract=fast"
+                )
             }
         }
 
