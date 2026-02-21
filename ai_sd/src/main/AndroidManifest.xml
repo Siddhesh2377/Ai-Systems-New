@@ -1,4 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <application>
+        <!-- Required for Hexagon NPU access via FastRPC (Android 12+ / API 31+) -->
+        <uses-native-library android:name="libcdsprpc.so" android:required="false" />
+
+        <!-- Required if using QNN GPU backend (Adreno OpenCL) -->
+        <uses-native-library android:name="libOpenCL.so" android:required="false" />
+    </application>
+
 </manifest>

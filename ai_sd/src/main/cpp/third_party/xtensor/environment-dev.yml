@@ -1,0 +1,11 @@
+name: xtensor
+channels:
+- conda-forge
+dependencies:
+- cmake
+- xtl=0.7.5
+- xsimd=13.2.0
+- nlohmann_json
+- doctest
+- pre-commit
+- ninja

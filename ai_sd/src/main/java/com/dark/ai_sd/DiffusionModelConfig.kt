@@ -12,7 +12,6 @@ data class DiffusionModelConfig(
     val runOnCpu: Boolean = false,
     val useCpuClip: Boolean = false,
     val isPony: Boolean = false,
-    val httpPort: Int = 8081,
     val safetyMode: Boolean = false
 )
 
@@ -29,12 +28,12 @@ data class DiffusionGenerationParams(
     val height: Int = 512,
     val scheduler: String = "dpm",
     val useOpenCL: Boolean = false,
-    
+
     // Img2Img specific
     val inputImage: String? = null,
     val mask: String? = null,
     val denoiseStrength: Float = 0.6f,
-    
+
     // Process visualization
     val showDiffusionProcess: Boolean = false,
     val showDiffusionStride: Int = 1
@@ -88,7 +87,6 @@ sealed class DiffusionGenerationResult {
  */
 data class DiffusionRuntimeConfig(
     val runtimeDir: String,
-    val executableName: String = "libstable_diffusion_core.so",
     val qnnLibsAssetPath: String = "qnnlibs",
     val safetyCheckerEnabled: Boolean = true,
     val safetyCheckerPath: String = "assets/safety_checker.mnn"

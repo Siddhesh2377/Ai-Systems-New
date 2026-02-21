@@ -189,8 +189,8 @@ std::string ModelState::detokenize_single(llama_token t) const {
     int n = llama_token_to_piece(
             vocab, t,
             buffer, sizeof(buffer) - 1,
-            0,     // lstrip
-            false  // special
+            0,    // lstrip
+            true  // special — include special tokens like <think>, </think>
     );
 
     if (n >= 0 && n < static_cast<int>(sizeof(buffer))) {
@@ -203,7 +203,7 @@ std::string ModelState::detokenize_single(llama_token t) const {
         n = llama_token_to_piece(
                 vocab, t,
                 out.data(), static_cast<int>(out.size()),
-                0, false
+                0, true  // special
         );
         if (n > 0) {
             out.resize(static_cast<size_t>(n));

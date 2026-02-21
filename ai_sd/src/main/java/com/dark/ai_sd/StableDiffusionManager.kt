@@ -4,34 +4,31 @@ import android.content.Context
 import kotlinx.coroutines.flow.StateFlow
 
 /**
- * Unified facade for Stable Diffusion operations
- * Combines DiffusionManager (backend/model management) and GenerationManager (image generation)
- * 
+ * Unified facade for Stable Diffusion operations.
+ *
+ * Delegates to [DiffusionManager] which handles both model management
+ * and image generation via JNI native calls.
+ *
  * Usage:
  * ```
  * val sdManager = StableDiffusionManager.getInstance(context)
- * 
- * // Initialize
+ *
+ * // Initialize runtime (extracts QNN libs)
  * sdManager.initialize()
- * 
+ *
  * // Load model
- * val model = ModelConfig(...)
- * sdManager.loadModel(model)
- * 
+ * sdManager.loadModel(modelConfig)
+ *
  * // Generate image
- * val params = GenerationParams(
- *     prompt = "a beautiful landscape",
- *     steps = 28
- * )
- * sdManager.generateImage(params)
- * 
+ * sdManager.generateImage(generationParams)
+ *
  * // Observe states
  * lifecycleScope.launch {
- *     sdManager.generationState.collect { state ->
+ *     sdManager.diffusionGenerationState.collect { state ->
  *         when (state) {
- *             is GenerationState.Progress -> updateProgress(state.progress)
- *             is GenerationState.Complete -> showResult(state.bitmap)
- *             is GenerationState.Error -> showError(state.message)
+ *             is DiffusionGenerationState.Progress -> updateProgress(state.progress)
+ *             is DiffusionGenerationState.Complete -> showResult(state.bitmap)
+ *             is DiffusionGenerationState.Error -> showError(state.message)
  *             else -> {}
  *         }
  *     }
@@ -46,102 +43,97 @@ class StableDiffusionManager private constructor(context: Context) {
 
         fun getInstance(context: Context): StableDiffusionManager {
             return instance ?: synchronized(this) {
-                instance ?: StableDiffusionManager(context.applicationContext).also { 
-                    instance = it 
+                instance ?: StableDiffusionManager(context.applicationContext).also {
+                    instance = it
                 }
             }
         }
     }
 
     private val diffusionManager = DiffusionManager.getInstance(context)
-    private val generationManager = GenerationManager.getInstance(context)
 
     // Expose state flows
     val diffusionBackendState: StateFlow<DiffusionBackendState> = diffusionManager.diffusionBackendState
-    val diffusionGenerationState: StateFlow<DiffusionGenerationState> = generationManager.diffusionGenerationState
-    val isGenerating: StateFlow<Boolean> = generationManager.isGenerating
+    val diffusionGenerationState: StateFlow<DiffusionGenerationState> = diffusionManager.diffusionGenerationState
+    val isGenerating: StateFlow<Boolean> = diffusionManager.isGenerating
 
     /**
-     * Initialize the runtime environment
-     * Must be called before any other operations
+     * Initialize the runtime environment.
+     * Must be called before any other operations.
      */
     suspend fun initialize(config: DiffusionRuntimeConfig = DiffusionRuntimeConfig("runtime_libs")) {
         diffusionManager.setupRuntimeAsync(config)
     }
 
     /**
-     * Load a model and start the backend server
-     * @return true if successful, false otherwise
+     * Load a model.
+     * @return true if successful
      */
     fun loadModel(diffusionModelConfig: DiffusionModelConfig, width: Int = 512, height: Int = 512): Boolean {
         return diffusionManager.loadModel(diffusionModelConfig, width, height)
     }
 
     /**
-     * Restart the backend with the current model
-     * @return true if successful, false otherwise
+     * Restart the backend with the current model.
      */
     fun restartBackend(): Boolean {
         return diffusionManager.restartBackend()
     }
 
     /**
-     * Stop the backend server
+     * Stop the backend and release model resources.
      */
     fun stopBackend() {
         diffusionManager.stopBackend()
     }
 
     /**
-     * Generate an image asynchronously
-     * Monitor progress through generationState flow
+     * Generate an image asynchronously.
+     * Monitor progress through [diffusionGenerationState] flow.
      */
     fun generateImage(params: DiffusionGenerationParams) {
-        generationManager.generateImage(params)
+        diffusionManager.generateImage(params)
     }
 
     /**
-     * Generate an image synchronously (suspending function)
-     * @return GenerationResult containing the bitmap or error
+     * Generate an image synchronously (suspending function).
      */
     suspend fun generateImageSync(params: DiffusionGenerationParams): DiffusionGenerationResult {
-        return generationManager.generateImageSync(params)
+        return diffusionManager.generateImageSync(params)
     }
 
     /**
-     * Cancel ongoing generation
+     * Cancel ongoing generation.
      */
     fun cancelGeneration() {
-        generationManager.cancelGeneration()
+        diffusionManager.cancelGeneration()
     }
 
     /**
-     * Reset generation state to idle
+     * Reset generation state to idle.
      */
     fun resetGenerationState() {
-        generationManager.resetState()
+        diffusionManager.resetGenerationState()
     }
 
     /**
-     * Get the currently loaded model
+     * Get the currently loaded model.
      */
     fun getCurrentModel(): DiffusionModelConfig? {
         return diffusionManager.getCurrentModel()
     }
 
     /**
-     * Check if the backend is running
+     * Check if the backend is running.
      */
     fun isBackendRunning(): Boolean {
         return diffusionManager.isBackendRunning()
     }
 
     /**
-     * Cleanup all resources
-     * Should be called when the app is being destroyed
+     * Cleanup all resources.
      */
     fun cleanup() {
-        generationManager.cleanup()
         diffusionManager.cleanup()
     }
 }

@@ -89,6 +89,9 @@ public:
         // because they could be the start of a stop string.
         if (pending_.size() > max_len_) {
             size_t safe_len = pending_.size() - max_len_;
+            // Align to UTF-8 character boundary to avoid splitting multi-byte chars
+            safe_len = align_to_utf8_boundary(pending_, safe_len);
+            if (safe_len == 0) return ""; // All in danger zone
             std::string safe = pending_.substr(0, safe_len);
             pending_ = pending_.substr(safe_len);
             return safe;
@@ -121,6 +124,21 @@ private:
     std::vector<std::string> stop_strings_;
     std::string pending_;
     size_t max_len_ = 0;
+
+    /**
+     * Adjust a byte position backwards to a valid UTF-8 character boundary.
+     * If pos lands in the middle of a multi-byte sequence (continuation byte
+     * 10xxxxxx), back up to the start byte. This prevents splitting characters
+     * like smart quotes (U+2019 = 3 bytes) or emojis (4 bytes) across chunks.
+     */
+    static size_t align_to_utf8_boundary(const std::string& s, size_t pos) {
+        if (pos >= s.size()) return s.size();
+        // Back up while pointing at a continuation byte (10xxxxxx)
+        while (pos > 0 && (static_cast<unsigned char>(s[pos]) & 0xC0) == 0x80) {
+            --pos;
+        }
+        return pos;
+    }
 };
 
 struct GenerationMetrics {
@@ -297,8 +315,9 @@ public:
     }
 
     /**
-     * Process raw token bytes and return complete UTF-8 characters
-     * Incomplete sequences are buffered until the next token completes them
+     * Process raw token bytes and return complete UTF-8 characters.
+     * Incomplete sequences are buffered until the next token completes them.
+     * Invalid sequences emit U+FFFD replacement character instead of being silently dropped.
      */
     std::string decode(const std::string &raw_bytes) {
         if (raw_bytes.empty()) return {};
@@ -321,7 +340,9 @@ public:
             size_t char_len = utf8_char_length(c);
 
             if (char_len == 0) {
-                // Invalid start byte - skip
+                // Invalid start byte (e.g., a lone continuation byte 0x80-0xBF)
+                // Emit replacement character and advance
+                complete.append("\xEF\xBF\xBD"); // U+FFFD
                 ++i;
                 continue;
             }
@@ -347,8 +368,18 @@ public:
                 complete.append(input.data() + i, char_len);
                 i += char_len;
             } else {
-                // Invalid sequence - skip start byte
+                // Invalid sequence - emit replacement for the start byte
+                complete.append("\xEF\xBF\xBD"); // U+FFFD
                 ++i;
+                // Skip any orphaned continuation bytes that follow
+                while (i < input.size()) {
+                    unsigned char next = static_cast<unsigned char>(input[i]);
+                    if ((next & 0xC0) == 0x80) {
+                        ++i; // Skip continuation byte
+                    } else {
+                        break; // Found a valid start byte, resume normal parsing
+                    }
+                }
             }
         }
 
@@ -378,7 +409,7 @@ private:
         if ((c & 0xE0) == 0xC0) return 2;      // 110xxxxx
         if ((c & 0xF0) == 0xE0) return 3;      // 1110xxxx
         if ((c & 0xF8) == 0xF0) return 4;      // 11110xxx
-        return 0; // Invalid start byte
+        return 0; // Invalid start byte (continuation byte or 0xFE/0xFF)
     }
 };
 
@@ -801,7 +832,12 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeGenerateStream(JNIEnv *env, jobject, js
     metrics.total_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             end_time - start_time).count();
 
-    if (metrics.total_time_ms > 0 && metrics.generated_tokens > 0) {
+    // Report decode speed (exclude prefill) — comparable to ChatterUI/llama.cpp metrics
+    int64_t decode_ms = metrics.total_time_ms - metrics.time_to_first_token_ms;
+    if (decode_ms > 0 && metrics.generated_tokens > 1) {
+        metrics.tokens_per_second =
+                ((metrics.generated_tokens - 1) * 1000.0f) / static_cast<float>(decode_ms);
+    } else if (metrics.generated_tokens > 0 && metrics.total_time_ms > 0) {
         metrics.tokens_per_second =
                 (metrics.generated_tokens * 1000.0f) / static_cast<float>(metrics.total_time_ms);
     }
@@ -1199,7 +1235,12 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeGenerateStreamMultiTurn(JNIEnv *env, jo
     metrics.total_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             end_time - start_time).count();
 
-    if (metrics.total_time_ms > 0 && metrics.generated_tokens > 0) {
+    // Report decode speed (exclude prefill) — comparable to ChatterUI/llama.cpp metrics
+    int64_t decode_ms = metrics.total_time_ms - metrics.time_to_first_token_ms;
+    if (decode_ms > 0 && metrics.generated_tokens > 1) {
+        metrics.tokens_per_second =
+                ((metrics.generated_tokens - 1) * 1000.0f) / static_cast<float>(decode_ms);
+    } else if (metrics.generated_tokens > 0 && metrics.total_time_ms > 0) {
         metrics.tokens_per_second =
                 (metrics.generated_tokens * 1000.0f) / static_cast<float>(metrics.total_time_ms);
     }

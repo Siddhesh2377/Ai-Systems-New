@@ -15,9 +15,29 @@ android {
 
     defaultConfig {
         minSdk = 27
+
         ndk {
             //noinspection ChromeOsAbiSupport
             abiFilters += listOf("arm64-v8a")
+        }
+
+        externalNativeBuild {
+            cmake {
+                arguments += "-DCMAKE_BUILD_TYPE=Release"
+                targets += "ai_sd"
+                cppFlags += listOf(
+                    "-O3",
+                    "-ffast-math",
+                    "-fno-finite-math-only",
+                    "-ffp-contract=fast"
+                )
+                cFlags += listOf(
+                    "-O3",
+                    "-ffast-math",
+                    "-fno-finite-math-only",
+                    "-ffp-contract=fast"
+                )
+            }
         }
     }
 
@@ -29,14 +49,10 @@ android {
             )
         }
     }
-    sourceSets {
-        getByName("main") {
-            jniLibs.setSrcDirs(listOf("src/main/jniLibs"))
-        }
-    }
-    packaging {
-        jniLibs {
-            useLegacyPackaging = true
+    externalNativeBuild {
+        cmake {
+            path("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
         }
     }
     compileOptions {
@@ -48,12 +64,18 @@ android {
             jvmTarget.set(JvmTarget.JVM_17)
         }
     }
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
 }
 
 dependencies {
-    implementation (libs.commons.compress)
-    implementation (libs.xz)
-    implementation(libs.okhttp)
+    // Keep: tar.xz extraction for QNN libs from assets
+    implementation(libs.commons.compress)
+    implementation(libs.xz)
+    // Removed: okhttp (no more HTTP client)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.appcompat)
     implementation(libs.material)

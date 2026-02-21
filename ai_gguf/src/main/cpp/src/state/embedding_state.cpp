@@ -73,9 +73,24 @@ std::vector<llama_token> EmbeddingState::tokenize(const std::string& text) const
             false   // parse_special
     );
 
+    // If buffer too small, -n_tokens is the required size; resize and retry
     if (n_tokens < 0) {
-        LOG_ERROR("Tokenization failed or buffer too small");
-        return {};
+        int32_t required = -n_tokens;
+        LOG_INFO("Token buffer too small (%d), retrying with %d", max_tokens, required);
+        tokens.resize(required);
+        n_tokens = llama_tokenize(
+                vocab,
+                text.c_str(),
+                text.length(),
+                tokens.data(),
+                required,
+                true,
+                false
+        );
+        if (n_tokens < 0) {
+            LOG_ERROR("Tokenization failed even after resize to %d", required);
+            return {};
+        }
     }
 
     tokens.resize(n_tokens);
@@ -186,11 +201,21 @@ EmbeddingOutput EmbeddingState::encode(
         return output;
     }
 
+    // Clear memory so each encoding is independent
+    llama_memory_clear(llama_get_memory(ctx), true);
+
     // Tokenize input
     std::vector<llama_token> tokens = tokenize(text);
     if (tokens.empty()) {
         LOG_ERROR("Tokenization failed");
         return output;
+    }
+
+    // Truncate to context size to prevent position embedding overflow
+    if (static_cast<int32_t>(tokens.size()) > ctx_size) {
+        LOG_WARN("Token count (%zu) exceeds context size (%d), truncating",
+                 tokens.size(), ctx_size);
+        tokens.resize(ctx_size);
     }
 
     output.num_tokens = static_cast<int32_t>(tokens.size());

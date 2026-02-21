@@ -76,9 +76,9 @@ fun extractTarXzWithCommonsCompress(tarXzFile: File, targetDir: File) {
 // Bitmap extensions
 
 /**
- * Convert bitmap to base64 RGB string for img2img operations
+ * Convert bitmap to raw RGB byte array for img2img operations via JNI
  */
-fun Bitmap.toBase64Rgb(): String {
+fun Bitmap.toRgbByteArray(): ByteArray {
     val pixels = IntArray(width * height)
     getPixels(pixels, 0, width, 0, 0, width, height)
 
@@ -91,7 +91,14 @@ fun Bitmap.toBase64Rgb(): String {
         rgbBytes[index + 2] = (pixel and 0xFF).toByte()          // B
     }
 
-    return Base64.getEncoder().encodeToString(rgbBytes)
+    return rgbBytes
+}
+
+/**
+ * Convert bitmap to base64 RGB string for img2img operations
+ */
+fun Bitmap.toBase64Rgb(): String {
+    return Base64.getEncoder().encodeToString(toRgbByteArray())
 }
 
 /**
@@ -116,26 +123,6 @@ fun Bitmap.saveToFile(
  */
 fun Bitmap.sizeInBytes(): Int {
     return allocationByteCount
-}
-
-// File extensions
-
-/**
- * Write base64 string to file for img2img operations
- */
-fun File.writeBase64(base64String: String) {
-    writeText(base64String)
-}
-
-/**
- * Read base64 string from file
- */
-fun File.readBase64(): String? {
-    return try {
-        if (exists()) readText() else null
-    } catch (e: Exception) {
-        null
-    }
 }
 
 // Context extensions
@@ -227,7 +214,6 @@ class ModelConfigBuilder {
     private var runOnCpu: Boolean = false
     private var useCpuClip: Boolean = false
     private var isPony: Boolean = false
-    private var httpPort: Int = 8081
     private var safetyMode: Boolean = false
 
     fun name(name: String) = apply { this.name = name }
@@ -236,7 +222,6 @@ class ModelConfigBuilder {
     fun runOnCpu(cpu: Boolean) = apply { this.runOnCpu = cpu }
     fun useCpuClip(cpuClip: Boolean) = apply { this.useCpuClip = cpuClip }
     fun isPony(pony: Boolean) = apply { this.isPony = pony }
-    fun httpPort(port: Int) = apply { this.httpPort = port }
     fun setSafetyMode(safetyMode: Boolean) = apply { this.safetyMode = safetyMode }
 
     fun build(): DiffusionModelConfig {
@@ -250,7 +235,6 @@ class ModelConfigBuilder {
             runOnCpu = runOnCpu,
             useCpuClip = useCpuClip,
             isPony = isPony,
-            httpPort = httpPort,
             safetyMode = safetyMode
         )
     }
