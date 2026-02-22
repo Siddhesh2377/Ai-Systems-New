@@ -43,7 +43,6 @@ set(ABI ${ANDROID_ABI})
 target_link_libraries(ai_gguf
         PRIVATE llama
         PRIVATE ggml
-        PRIVATE ggml-cpu
         PRIVATE ggml-base
         PRIVATE cpufeatures
         PRIVATE android

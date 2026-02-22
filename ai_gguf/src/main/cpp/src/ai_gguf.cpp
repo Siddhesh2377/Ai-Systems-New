@@ -24,6 +24,7 @@
 #include "tool_calling/tool_call_state.h"
 
 #include <jni.h>
+#include <dlfcn.h>
 #include <string>
 #include <mutex>
 #include <atomic>
@@ -36,6 +37,32 @@
 static std::mutex g_init_mtx;
 static std::mutex g_generate_mtx;  // Shared by nativeGenerateStream + nativeGenerateStreamMultiTurn
 static std::atomic<bool> g_stop_requested{false};
+static std::atomic<bool> g_backends_loaded{false};
+
+/**
+ * Auto-detect and load GGML dynamic backends from the same directory as libai_gguf.so.
+ * Uses dladdr to find our own .so path, then tells ggml to search that directory
+ * for CPU variant backends (libggml-cpu-android_*.so).
+ * Called automatically before first model load; safe to call multiple times.
+ */
+static void ensure_backends_loaded() {
+    if (g_backends_loaded.exchange(true)) return;
+
+    Dl_info info;
+    if (dladdr((void *)&g_init_mtx, &info) && info.dli_fname) {
+        std::string so_path(info.dli_fname);
+        auto pos = so_path.rfind('/');
+        if (pos != std::string::npos) {
+            std::string dir = so_path.substr(0, pos);
+            LOG_INFO("Loading GGML backends from: %s", dir.c_str());
+            ggml_backend_load_all_from_path(dir.c_str());
+            LOG_INFO("GGML backends loaded");
+            return;
+        }
+    }
+    LOG_INFO("Could not detect native lib dir, loading backends from default path");
+    ggml_backend_load_all();
+}
 
 /**
  * Stop string checker for streaming generation.
@@ -1264,6 +1291,7 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeLoadModelFromFd(JNIEnv *env, jobject, j
     std::lock_guard<std::mutex> lk(g_init_mtx);
 
     g_state.release();
+    ensure_backends_loaded();
     llama_backend_init();
 
     int nthreads = (jthreads > 0) ? static_cast<int>(jthreads) : get_optimal_thread_count();
@@ -1366,6 +1394,7 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeLoadModel(JNIEnv *env, jobject, jstring
 
     const std::string path = utf8::from_jstring(env, jpath);
     g_state.release();
+    ensure_backends_loaded();
     llama_backend_init();
 
     // Detect optimal thread count (prefers performance cores on big.LITTLE SoCs)
@@ -1757,6 +1786,7 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeLoadEmbeddingModelFromFd(JNIEnv *env, j
     std::lock_guard<std::mutex> lk(g_init_mtx);
 
     g_embedding_state.release();
+    ensure_backends_loaded();
     llama_backend_init();
 
     int nthreads = (jthreads > 0) ? static_cast<int>(jthreads) : get_optimal_thread_count();
@@ -1832,6 +1862,7 @@ Java_com_mp_ai_1gguf_GGUFNativeLib_nativeLoadEmbeddingModel(JNIEnv *env, jobject
 
     const std::string path = utf8::from_jstring(env, jpath);
     g_embedding_state.release();
+    ensure_backends_loaded();
     llama_backend_init();
 
     int nthreads = (jthreads > 0) ? static_cast<int>(jthreads) : get_optimal_thread_count();

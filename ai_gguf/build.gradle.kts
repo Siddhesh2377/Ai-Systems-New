@@ -29,9 +29,14 @@ android {
                 arguments += "-DGGML_USE_BLAS=ON"
                 arguments += "-DLLAMA_CURL=OFF"
                 arguments += "-DLLAMA_BUILD_COMMON=ON"
-                arguments += "-DGGML_LLAMAFILE=ON"
+                arguments += "-DGGML_LLAMAFILE=OFF"
                 arguments += "-DGGML_PAGE_SIZE=16384"
                 arguments += "-DGGML_OPENMP=OFF"
+
+                // ARM CPU variant optimizations (dotprod, i8mm, sve) with runtime selection
+                arguments += "-DGGML_NATIVE=OFF"
+                arguments += "-DGGML_CPU_ALL_VARIANTS=ON"
+                arguments += "-DGGML_BACKEND_DL=ON"
 
                 arguments += "-DCMAKE_BUILD_TYPE=Release"
                 cppFlags += listOf(
