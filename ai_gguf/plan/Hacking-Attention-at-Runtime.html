@@ -1,0 +1,1340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hacking Attention — Runtime Modification of LLM Attention</title>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:ital,wght@0,300;0,400;0,500;1,300&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        :root{
+          --bg:#09090e;--surface:#111118;--card:#15151e;--card2:#1a1a26;
+          --border:#21212e;--border2:#2a2a3a;
+          --accent:#6ee7b7;--accent2:#818cf8;--accent3:#f472b6;--accent4:#fbbf24;
+          --text:#dde4f0;--muted:#5a6478;--muted2:#3e4557;
+        }
+        *{margin:0;padding:0;box-sizing:border-box}
+        html{scroll-behavior:smooth}
+        body{background:var(--bg);color:var(--text);font-family:'Syne',sans-serif;overflow-x:hidden}
+        body::after{content:'';position:fixed;inset:0;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.035'/%3E%3C/svg%3E");pointer-events:none;z-index:999;opacity:.5}
+
+        .hero{padding:56px 20px 36px;text-align:center}
+        .hero-tag{font-family:'DM Mono',monospace;font-size:10px;letter-spacing:.22em;color:var(--accent3);text-transform:uppercase;margin-bottom:14px;opacity:0;animation:fUp .5s .1s ease forwards}
+        .hero h1{font-size:clamp(26px,6.5vw,60px);font-weight:800;letter-spacing:-.03em;line-height:1.05;opacity:0;animation:fUp .5s .2s ease forwards}
+        .hero h1 em{color:var(--accent3);font-style:normal}
+        .hero-sub{margin-top:12px;font-family:'DM Mono',monospace;font-size:12px;color:var(--muted);opacity:0;animation:fUp .5s .32s ease forwards;line-height:1.8}
+        .hero-pills{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:18px;opacity:0;animation:fUp .5s .44s ease forwards}
+        .hero-pill{font-family:'DM Mono',monospace;font-size:10px;padding:5px 13px;border-radius:20px;border:1px solid;letter-spacing:.06em}
+        @keyframes fUp{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:none}}
+
+        .snav{position:sticky;top:0;z-index:200;background:rgba(9,9,14,.9);backdrop-filter:blur(14px);border-bottom:1px solid var(--border);display:flex;gap:5px;flex-wrap:wrap;justify-content:center;padding:9px 14px}
+        .snav a{font-family:'DM Mono',monospace;font-size:9px;letter-spacing:.08em;padding:4px 10px;border-radius:20px;border:1px solid var(--border2);color:var(--muted);text-decoration:none;transition:all .18s}
+        .snav a:hover,.snav a.on{border-color:var(--accent3);color:var(--accent3);background:rgba(244,114,182,.06)}
+
+        .wrap{max-width:780px;margin:0 auto;padding:0 18px 120px}
+        .conn{display:flex;justify-content:center;height:26px;color:var(--muted2);font-size:14px;opacity:.6;font-family:'DM Mono',monospace;align-items:center}
+
+        .step{background:var(--card);border:1px solid var(--border);border-radius:18px;margin-bottom:10px;overflow:hidden;opacity:0;transform:translateY(26px);transition:opacity .5s,transform .5s}
+        .step.vis{opacity:1;transform:none}
+        .step::before{content:'';display:block;height:1px;background:linear-gradient(90deg,transparent,var(--accent3) 40%,transparent);opacity:.3}
+        .step-top{padding:24px 24px 20px}
+        .sh{display:flex;align-items:center;gap:12px;margin-bottom:14px;flex-wrap:wrap}
+        .snum{font-family:'DM Mono',monospace;font-size:10px;color:var(--accent3);background:rgba(244,114,182,.08);border:1px solid rgba(244,114,182,.18);padding:3px 9px;border-radius:5px}
+        .stitle{font-size:17px;font-weight:700;letter-spacing:-.02em}
+        .sbadge{font-family:'DM Mono',monospace;font-size:9px;padding:2px 8px;border-radius:5px;letter-spacing:.06em}
+        .sdesc{font-family:'DM Mono',monospace;font-size:12px;color:var(--muted);line-height:1.8}
+        .hl{color:var(--accent)}.hl2{color:var(--accent2)}.hl3{color:var(--accent3)}.hl4{color:var(--accent4)}
+        .vlabel{font-family:'DM Mono',monospace;font-size:9px;color:var(--muted);letter-spacing:.14em;text-transform:uppercase;margin-bottom:10px}
+        .vbox{background:var(--surface);border:1px solid var(--border);border-radius:11px;padding:16px}
+
+        .expand-btn{width:100%;background:transparent;border:none;border-top:1px solid var(--border);padding:12px 24px;display:flex;align-items:center;justify-content:space-between;cursor:pointer;font-family:'DM Mono',monospace;font-size:11px;color:var(--muted);transition:all .2s;letter-spacing:.07em}
+        .expand-btn:hover{background:rgba(244,114,182,.04);color:var(--accent3)}
+        .expand-btn .arr{transition:transform .3s}
+        .expand-btn.open .arr{transform:rotate(180deg)}
+        .expand-panel{max-height:0;overflow:hidden;transition:max-height .6s cubic-bezier(.4,0,.2,1)}
+        .expand-panel.open{max-height:6000px}
+        .epanel-inner{padding:24px;border-top:1px solid var(--border);background:rgba(0,0,0,.18)}
+        .tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:18px}
+        .tab{font-family:'DM Mono',monospace;font-size:10px;padding:5px 12px;border-radius:8px;border:1px solid var(--border2);color:var(--muted);cursor:pointer;transition:all .18s;background:none}
+        .tab.active,.tab:hover{border-color:var(--accent2);color:var(--accent2);background:rgba(129,140,248,.07)}
+        .tab-content{display:none}.tab-content.active{display:block}
+
+        canvas{display:block;max-width:100%}
+        .formula{font-family:'DM Mono',monospace;font-size:12px;color:var(--accent4);text-align:center;padding:12px 16px;background:rgba(251,191,36,.04);border:1px solid rgba(251,191,36,.15);border-radius:10px;margin:12px 0;letter-spacing:.03em;line-height:1.8}
+        .info-box{background:rgba(110,231,183,.04);border:1px solid rgba(110,231,183,.15);border-radius:9px;padding:13px 16px;margin:12px 0;font-family:'DM Mono',monospace;font-size:11px;color:var(--muted);line-height:1.8}
+        .info-box.indigo{background:rgba(129,140,248,.04);border-color:rgba(129,140,248,.15)}
+        .info-box.pink{background:rgba(244,114,182,.04);border-color:rgba(244,114,182,.15)}
+        .info-box.amber{background:rgba(251,191,36,.04);border-color:rgba(251,191,36,.15)}
+        .info-box.red{background:rgba(248,113,113,.04);border-color:rgba(248,113,113,.15)}
+
+        .code-block{background:#0a0a10;border:1px solid var(--border2);border-radius:9px;padding:14px 16px;font-family:'DM Mono',monospace;font-size:11px;color:#a0aec0;overflow-x:auto;margin:12px 0;line-height:1.7}
+        .code-block .kw{color:#818cf8}
+        .code-block .fn{color:#6ee7b7}
+        .code-block .cm{color:#3e4557}
+        .code-block .st{color:#fbbf24}
+        .code-block .nm{color:#f472b6}
+
+        .cmp{display:grid;gap:1px;background:var(--border);border-radius:10px;overflow:hidden;font-family:'DM Mono',monospace;font-size:10px}
+        .cmp-cell{background:var(--card2);padding:9px 12px;line-height:1.6}
+        .cmp-cell.hdr{color:var(--accent2);font-size:9px;letter-spacing:.1em;text-transform:uppercase;background:var(--surface)}
+
+        .sl-row{display:flex;align-items:center;gap:12px;margin:10px 0;flex-wrap:wrap}
+        .sl-row label{font-family:'DM Mono',monospace;font-size:10px;color:var(--muted);min-width:110px}
+        .sl-val{font-family:'DM Mono',monospace;font-size:11px;color:var(--accent);min-width:50px}
+        input[type=range]{accent-color:var(--accent3);cursor:pointer;flex:1}
+
+        .attn-cell-grid{display:grid;gap:2px;margin:12px 0}
+        .head-pill{font-family:'DM Mono',monospace;font-size:10px;padding:5px 12px;border-radius:20px;border:1px solid;cursor:pointer;transition:all .2s;display:inline-block;margin:3px}
+        .tok-span{font-family:'DM Mono',monospace;font-size:12px;padding:5px 10px;border-radius:7px;border:1px solid var(--border2);margin:3px;display:inline-block;cursor:pointer;transition:all .22s}
+        .tok-span:hover{border-color:var(--accent3);color:var(--accent3)}
+        .matrix-wrap{overflow-x:auto;margin:12px 0}
+        table.mat{border-collapse:collapse;font-family:'DM Mono',monospace;font-size:10px;width:100%}
+        table.mat td,table.mat th{padding:6px 8px;border:1px solid var(--border);text-align:center;transition:background .3s}
+        table.mat th{color:var(--accent2);background:var(--surface)}
+        table.mat td.hot{background:rgba(244,114,182,.18);color:var(--accent3)}
+        table.mat td.mid{background:rgba(129,140,248,.1);color:var(--accent2)}
+        table.mat td.cold{background:rgba(30,30,46,.5);color:var(--muted)}
+        table.mat td.neg{background:rgba(0,0,0,.6);color:#3e4557}
+    </style>
+</head>
+<body>
+
+<div class="hero">
+    <div class="hero-tag">source-code level · runtime intervention</div>
+    <h1>Hacking <em>Attention</em><br>at Runtime</h1>
+    <div class="hero-sub">
+        You have the model. You have the source. What can you actually change in the attention math<br>
+        to alter behavior — without retraining a single weight?
+    </div>
+    <div class="hero-pills">
+        <span class="hero-pill" style="color:var(--accent);border-color:rgba(110,231,183,.3)">Lab-Grade Techniques</span>
+        <span class="hero-pill" style="color:var(--accent2);border-color:rgba(129,140,248,.3)">Production Approaches</span>
+        <span class="hero-pill" style="color:var(--accent3);border-color:rgba(244,114,182,.3)">Zero Retraining</span>
+        <span class="hero-pill" style="color:var(--accent4);border-color:rgba(251,191,36,.3)">Theory + Code</span>
+    </div>
+</div>
+
+<nav class="snav" id="snav">
+    <a href="#s0">Map</a>
+    <a href="#s1">Score Inject</a>
+    <a href="#s2">Sparse Patterns</a>
+    <a href="#s3">Attention Sinks</a>
+    <a href="#s4">KV Compression</a>
+    <a href="#s5">KV Pruning</a>
+    <a href="#s6">Activation Steer</a>
+    <a href="#s7">Softmax Surgery</a>
+    <a href="#s8">Prod Stack</a>
+</nav>
+
+<div class="wrap">
+
+    <!-- ═══════════════════ S0: THE MAP ═══════════════════ -->
+    <div class="step" id="s0">
+        <div class="step-top">
+            <div class="sh">
+                <span class="snum">00</span>
+                <span class="stitle">The Intervention Map</span>
+                <span class="sbadge" style="background:rgba(251,191,36,.1);color:var(--accent4);border:1px solid rgba(251,191,36,.2)">theory</span>
+            </div>
+            <div class="sdesc">
+                If you control the source, every line of the attention forward pass is a potential intervention point. The standard attention equation is <span class="hl">Attn(Q,K,V) = softmax( Q·Kᵀ / √dₖ + M ) · V</span>, but each component of that equation can be intercepted and altered. There are <span class="hl2">six distinct intervention surfaces</span>: the QKV projections, the raw scores, the mask M, the softmax function itself, the values, and the KV cache. Each targets a different aspect of model behavior.
+            </div>
+            <div style="margin-top:16px">
+                <div class="vlabel">Forward Pass — Intervention Points</div>
+                <div id="mapDiag"></div>
+            </div>
+        </div>
+        <button class="expand-btn" onclick="toggleExpand(this)">
+            <span>▸ Full Theory: What Each Intervention Controls</span>
+            <span class="arr">▾</span>
+        </button>
+        <div class="expand-panel">
+            <div class="epanel-inner">
+                <div class="tabs">
+                    <button class="tab active" onclick="switchTab(this,'m0')">Intervention Taxonomy</button>
+                    <button class="tab" onclick="switchTab(this,'m1')">Effect vs Cost</button>
+                    <button class="tab" onclick="switchTab(this,'m2')">When to Use What</button>
+                </div>
+                <div class="tab-content active" id="m0">
+                    <div class="cmp" style="grid-template-columns:130px 1fr 1fr">
+                        <div class="cmp-cell hdr">Point</div><div class="cmp-cell hdr">What it controls</div><div class="cmp-cell hdr">Techniques that use it</div>
+                        <div class="cmp-cell" style="color:var(--accent3)">QKV projections</div><div class="cmp-cell">Which subspace tokens project into — their "meaning" before comparison</div><div class="cmp-cell">Activation steering, LoRA (needs training), head ablation</div>
+                        <div class="cmp-cell" style="color:var(--accent4)">Raw scores (pre-softmax)</div><div class="cmp-cell">Which token pairs see each other, by how much</div><div class="cmp-cell">Logit bias injection, ALiBi, score clamping, sink tokens</div>
+                        <div class="cmp-cell" style="color:var(--accent)">Mask M</div><div class="cmp-cell">Which attention connections are blocked entirely</div><div class="cmp-cell">Sparse attention, sliding window, causal masking variants</div>
+                        <div class="cmp-cell" style="color:var(--accent2)">Softmax function</div><div class="cmp-cell">How scores are normalized, whether competition exists</div><div class="cmp-cell">Sigmoid attention, linear attention, temperature scaling</div>
+                        <div class="cmp-cell" style="color:var(--accent3)">Values V</div><div class="cmp-cell">What information gets passed when attended to</div><div class="cmp-cell">Value steering, KV bias injection</div>
+                        <div class="cmp-cell" style="color:var(--accent)">KV Cache</div><div class="cmp-cell">What past context the model can reference</div><div class="cmp-cell">H2O, SnapKV, StreamingLLM, MQA/GQA</div>
+                    </div>
+                </div>
+                <div class="tab-content" id="m1">
+                    <div id="costEffectChart"></div>
+                </div>
+                <div class="tab-content" id="m2">
+                    <div class="info-box">
+                        <span class="hl">Behavior control</span> (what the model says, focus, style) → <span class="hl2">Score injection + Activation steering</span><br>
+                        <span class="hl">Long context efficiency</span> (fit more tokens) → <span class="hl">Sparse patterns + Sliding window + Sinks</span><br>
+                        <span class="hl">Memory reduction</span> (smaller KV footprint) → <span class="hl2">MQA/GQA/MLA + KV pruning</span><br>
+                        <span class="hl">Speed improvement</span> (faster per-token decode) → <span class="hl3">GQA + FlashAttention + Sparse compute</span><br>
+                        <span class="hl">Factual grounding</span> (anchor to specific tokens) → <span class="hl4">Score boosting on key positions</span><br>
+                        <span class="hl">Safety / alignment steering</span> → <span class="hl3">Activation steering on specific heads</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="conn">↓</div>
+
+    <!-- ═══════════════════ S1: SCORE INJECTION ═══════════════════ -->
+    <div class="step" id="s1">
+        <div class="step-top">
+            <div class="sh">
+                <span class="snum">01</span>
+                <span class="stitle">Score Injection & Bias</span>
+                <span class="sbadge" style="background:rgba(110,231,183,.08);color:var(--accent);border:1px solid rgba(110,231,183,.2)">lab + prod</span>
+            </div>
+            <div class="sdesc">
+                The most direct intervention: <span class="hl">add a bias matrix B to the attention scores</span> before softmax. The full equation becomes: <span class="hl2">softmax( (Q·Kᵀ / √dₖ) + B + M )</span>. Since B is added pre-softmax, each entry B[i,j] exponentially amplifies or suppresses the attention from token i to token j. A value of +5 ≈ 148× more likely to attend; -∞ = complete block.<br><br>
+                This is how <span class="hl3">ALiBi</span> (Attention with Linear Biases) encodes relative position, how <span class="hl4">attention sinks</span> are forcibly maintained, and how you can <span class="hl">surgically amplify a model's focus</span> on specific tokens (e.g., the system prompt, a retrieved document).
+            </div>
+            <div style="margin-top:16px">
+                <div class="vlabel">Interactive — Drag the bias sliders for any token pair</div>
+                <div id="scoreInjViz"></div>
+            </div>
+        </div>
+        <button class="expand-btn" onclick="toggleExpand(this)">
+            <span>▸ ALiBi Position Encoding, Score Clamping, Logit Lens</span>
+            <span class="arr">▾</span>
+        </button>
+        <div class="expand-panel">
+            <div class="epanel-inner">
+                <div class="tabs">
+                    <button class="tab active" onclick="switchTab(this,'si0')">ALiBi Explained</button>
+                    <button class="tab" onclick="switchTab(this,'si1')">Score Clamping</button>
+                    <button class="tab" onclick="switchTab(this,'si2')">KV Bias (Sun et al.)</button>
+                </div>
+                <div class="tab-content active" id="si0">
+                    <div class="formula">B_alibi[i,j] = −m · |i − j|  &nbsp;&nbsp; where m = 2^(−8/h) per head</div>
+                    <div class="info-box">
+                        <span class="hl">ALiBi (Press et al. 2021)</span> eliminates positional encodings entirely. Instead, it adds a static, non-learned bias to each score equal to negative distance between tokens, scaled per head. Head 1 uses slope m₁ ≈ 0.5, head 2 uses m₂ ≈ 0.25, etc.<br><br>
+                        Effect: Each head has a different "attention horizon" — some heads focus locally (steep slope), some globally (shallow slope). No parameters added.<br><br>
+                        <span class="hl2">Runtime power</span>: If you control source, you can change these slopes dynamically. Increase all slopes → make the model more local (useful for tasks that need nearby context). Decrease slopes → make it more global. You can even make slopes negative (inverted distance bias) to make tokens attend to tokens far away. Used in MPT-7B, BLOOM.
+                    </div>
+                </div>
+                <div class="tab-content" id="si1">
+                    <div class="info-box amber">
+                        <span class="hl4">Score Clamping</span>: Before softmax, you can clamp attention scores to a range [−c, +c]. This prevents any single token from dominating attention with extremely high scores — a known failure mode where models fixate on one token ("attention collapse").<br><br>
+                        <code style="font-family:'DM Mono',monospace;font-size:10px;color:var(--accent)">scores = torch.clamp(scores, min=-50.0, max=50.0)</code><br><br>
+                        More surgical version: <span class="hl2">score quantile filtering</span> — zero out scores in the bottom p-th percentile per row. This forces the model to distribute attention more broadly, reducing overconfidence. Useful when you observe attention collapse in long generations.
+                    </div>
+                    <div class="info-box pink">
+                        <span class="hl3">Importance: the softmax temperature</span>. Dividing scores by a constant T before softmax controls sharpness:<br><br>
+                        T &lt; 1 → sharper, more peaked distribution → model is more "confident" in what to attend to<br>
+                        T &gt; 1 → flatter, more uniform → model attends more broadly, less focused<br><br>
+                        This is the attention analog of output temperature. You can apply different T per layer, per head. Early layers often benefit from flatter attention (building broad context), later layers from sharper (extracting specific patterns).
+                    </div>
+                </div>
+                <div class="tab-content" id="si2">
+                    <div class="info-box indigo">
+                        <span class="hl2">Sun et al. (2024)</span> — Learnable KV Bias: Instead of modifying scores, inject learned bias vectors directly into the Key and Value projections:<br><br>
+                        <code style="font-family:'DM Mono',monospace;font-size:10px;color:var(--accent2)">K_biased = K + b_k  # b_k is a learned [1 × d_head] bias<br>V_biased = V + b_v  # shared across all tokens</code><br><br>
+                        This creates a "default" Key that every query can always attend to — effectively an always-present sink token. Used to combat attention sink instability and reduce quantization outliers in activations. Adopted in OpenAI's open-weight models to enable aggressive INT4 quantization.
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="conn">↓</div>
+
+    <!-- ═══════════════════ S2: SPARSE PATTERNS ═══════════════════ -->
+    <div class="step" id="s2">
+        <div class="step-top">
+            <div class="sh">
+                <span class="snum">02</span>
+                <span class="stitle">Sparse Attention Patterns</span>
+                <span class="sbadge" style="background:rgba(129,140,248,.08);color:var(--accent2);border:1px solid rgba(129,140,248,.2)">prod</span>
+            </div>
+            <div class="sdesc">
+                Full attention computes N² pairs — for N=8192 tokens, that's 67M entries. <span class="hl">Sparse attention</span> restricts which pairs are computed by setting most of the mask M to −∞. Different sparsity patterns balance <span class="hl2">local context</span> (nearby tokens) vs <span class="hl3">global context</span> (all-to-all).<br><br>
+                You implement this as a custom mask passed into your attention kernel. At source level, you're just changing what goes into M before softmax — but the kernel implementation determines whether you actually skip the computation (true sparse) or just mask it (still O(N²) compute). True sparsity requires custom CUDA kernels like <span class="hl4">FlashAttention with block sparsity</span>.
+            </div>
+            <div style="margin-top:16px">
+                <div class="vlabel">Click a pattern — see the mask matrix (dark = attended, grey = blocked)</div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px" id="patternBtns"></div>
+                <canvas id="sparseCanvas" width="360" height="360" style="border-radius:9px;display:block;margin:0 auto;max-width:360px"></canvas>
+                <div id="sparseDesc" style="margin-top:12px;font-family:'DM Mono',monospace;font-size:11px;color:var(--muted)"></div>
+            </div>
+        </div>
+        <button class="expand-btn" onclick="toggleExpand(this)">
+            <span>▸ Longformer, BigBird, MInference, Block-Sparse</span>
+            <span class="arr">▾</span>
+        </button>
+        <div class="expand-panel">
+            <div class="epanel-inner">
+                <div class="tabs">
+                    <button class="tab active" onclick="switchTab(this,'sp0')">Longformer</button>
+                    <button class="tab" onclick="switchTab(this,'sp1')">BigBird</button>
+                    <button class="tab" onclick="switchTab(this,'sp2')">MInference (2025)</button>
+                </div>
+                <div class="tab-content active" id="sp0">
+                    <div class="info-box">
+                        <span class="hl">Longformer</span> (Beltagy et al. 2020) combines three attention patterns:<br><br>
+                        1. <span class="hl2">Sliding window</span>: Each token attends to w/2 tokens on each side. O(n·w) complexity.<br>
+                        2. <span class="hl3">Dilated sliding window</span>: The window has gaps — attends to every d-th token. Covers longer range at same cost. Higher layers use larger dilation.<br>
+                        3. <span class="hl4">Global tokens</span>: Designated tokens (e.g., [CLS], task-specific question tokens) attend to all others AND are attended to by all. Full-cost but controllable.<br><br>
+                        <span class="hl">Runtime power</span>: You decide which tokens get "global" attention. For document QA, make the question tokens global at inference time. For summarization, make the first sentence global. This is pure mask surgery — change M, not weights.
+                    </div>
+                </div>
+                <div class="tab-content" id="sp1">
+                    <div class="info-box indigo">
+                        <span class="hl2">BigBird</span> (Zaheer et al. 2020) adds a fourth element: <span class="hl3">random attention</span>. Each token attends to r randomly chosen tokens, independent of position. Graph theory shows that random sparse connections are nearly as expressive as full attention for modeling long-range dependencies (a sparse graph with random edges has short path lengths between any two nodes).<br><br>
+                        At runtime, you can <span class="hl">change the random seed per layer</span> — different heads see different random connection patterns. This is structurally interesting: the model was never trained with a specific random pattern, yet performance is robust because the math holds for any random sparse graph.
+                    </div>
+                </div>
+                <div class="tab-content" id="sp2">
+                    <div class="info-box pink">
+                        <span class="hl3">MInference (Microsoft, 2025)</span>: The key insight is that attention patterns in trained LLMs are not uniformly sparse — they have three recurring shapes:<br><br>
+                        • <span class="hl">A-shape</span>: Heavy on first few tokens + recent window (like StreamingLLM)<br>
+                        • <span class="hl2">Vertical-slash</span>: Consistently high attention to specific token columns<br>
+                        • <span class="hl4">Block-diagonal</span>: Dense within contiguous chunks, sparse elsewhere<br><br>
+                        MInference detects which pattern each head uses at runtime (one forward pass on a calibration prompt), then applies the matching sparse kernel. No training. For 1M token contexts, achieves <span class="hl">10× speedup</span> with less than 1% accuracy loss. This is production-ready inference-time sparsity.
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="conn">↓</div>
+
+    <!-- ═══════════════════ S3: ATTENTION SINKS ═══════════════════ -->
+    <div class="step" id="s3">
+        <div class="step-top">
+            <div class="sh">
+                <span class="snum">03</span>
+                <span class="stitle">Attention Sinks & StreamingLLM</span>
+                <span class="sbadge" style="background:rgba(251,191,36,.08);color:var(--accent4);border:1px solid rgba(251,191,36,.2)">discovered phenomenon</span>
+            </div>
+            <div class="sdesc">
+                Xiao et al. (MIT, 2023) discovered something strange: <span class="hl">every layer in a trained LLM dumps large amounts of attention on the first 1–4 tokens</span> — regardless of whether those tokens are semantically relevant. These are "attention sinks." Why? Softmax forces attention weights to sum to 1. When no token is contextually relevant, the model needs somewhere to "park" the unused probability mass. The first few tokens serve as this garbage collector.<br><br>
+                Consequence: If you evict those first few tokens from the KV cache (to save memory), the model produces <span class="hl3">complete gibberish</span>. The fix: keep them always, even if old. This single insight unlocked infinite-length generation.
+            </div>
+            <div style="margin-top:16px">
+                <div class="vlabel">Attention Sink Pattern — token 0 absorbs excess weight regardless of content</div>
+                <canvas id="sinkCanvas" width="640" height="160" style="border-radius:9px;width:100%"></canvas>
+                <div class="sl-row" style="margin-top:10px">
+                    <label>Generation step:</label>
+                    <input type="range" min="0" max="100" value="0" id="genSlider" oninput="updateSinkViz()">
+                    <span class="sl-val" id="genVal">step 0</span>
+                </div>
+            </div>
+        </div>
+        <button class="expand-btn" onclick="toggleExpand(this)">
+            <span>▸ StreamingLLM, Why Sinks Form, Learnable Sinks</span>
+            <span class="arr">▾</span>
+        </button>
+        <div class="expand-panel">
+            <div class="epanel-inner">
+                <div class="tabs">
+                    <button class="tab active" onclick="switchTab(this,'sk0')">StreamingLLM</button>
+                    <button class="tab" onclick="switchTab(this,'sk1')">Why Sinks Form</button>
+                    <button class="tab" onclick="switchTab(this,'sk2')">Learnable Sinks</button>
+                </div>
+                <div class="tab-content active" id="sk0">
+                    <div class="formula">KV_cache = [sink_tokens(4)] + [recent_window(N-4)]</div>
+                    <div class="info-box">
+                        <span class="hl">StreamingLLM</span>: Permanently keep 4 sink tokens in KV cache. Slide a window of recent tokens. Discard the middle. Result: <span class="hl2">constant memory</span> regardless of generation length, stable text output even at 4M+ tokens.<br><br>
+                        Implementation is 3 lines of code change in your attention forward pass. Integrated in HuggingFace, NVIDIA TensorRT-LLM, and deployed on iPhone via Core ML. Also compatible with GQA/MQA models.<br><br>
+                        <span class="hl3">Limitation</span>: The model can only reference the last N tokens and the 4 sink tokens. Long-range factual recall fails. Good for: chat assistants, streaming generation. Bad for: document comprehension, long-form reasoning.
+                    </div>
+                    <div class="code-block">
+                        <span class="cm"># Standard attention</span>
+                        kv_cache = past_kv  <span class="cm"># shape: [layers, 2, batch, heads, seq, d_head]</span>
+
+                        <span class="cm"># StreamingLLM modification — just change how you build the cache</span>
+                        <span class="kw">def</span> <span class="fn">update_kv_streaming</span>(cache, new_k, new_v, sink_size=<span class="nm">4</span>, window=<span class="nm">2048</span>):
+                        sink_k = cache[<span class="nm">:sink_size</span>]  <span class="cm"># always keep first 4</span>
+                        sink_v = cache[<span class="nm">:sink_size</span>]
+                        recent_k = cache[<span class="nm">sink_size:</span>][<span class="nm">-(window-sink_size):</span>]  <span class="cm"># sliding window</span>
+                        recent_v = cache[<span class="nm">sink_size:</span>][<span class="nm">-(window-sink_size):</span>]
+                        <span class="kw">return</span> torch.cat([sink_k, recent_k, new_k], dim=<span class="nm">-2</span>)</div>
+                </div>
+                <div class="tab-content" id="sk1">
+                    <div class="info-box amber">
+                        <span class="hl4">Why sinks form — the variance explanation</span>:<br><br>
+                        Softmax is non-permutation-invariant — the first token naturally has highest variance in its key representations across training data (it's always present, always varied in meaning: sometimes it's BOS, sometimes a content word, sometimes punctuation).<br><br>
+                        After softmax normalization, tokens with high key variance attract more attention weight. The first token's KV accumulates this property over training. It becomes a "computational buffer" — when the model's query doesn't strongly match anything, it defaults to the high-variance first-token key.<br><br>
+                        <span class="hl">Implication</span>: You can <span class="hl2">design a dedicated sink token</span> — a special [SINK] token prepended to every input, given a deliberately high-variance key initialization. The model learns to use it as a sink from the first training steps. GPT-4 reportedly does this.
+                    </div>
+                </div>
+                <div class="tab-content" id="sk2">
+                    <div class="info-box pink">
+                        <span class="hl3">Learnable Sink Tokens</span> (Sun et al., 2024):<br><br>
+                        Instead of using actual input tokens as sinks, add learnable <span class="hl">KV bias vectors</span> that are always present in the attention:<br><br>
+                        <code style="font-family:'DM Mono',monospace;font-size:10px;color:var(--accent2)">K_full = [b_sink_k(trainable)] + K  # prepend learnable key<br>V_full = [b_sink_v(trainable)] + V  # prepend learnable value</code><br><br>
+                        Only ~2 × d_head parameters (≈128 floats for d_head=64). The learnable sink key adjusts during fine-tuning to absorb exactly the activation outliers in that model. <span class="hl">Side effect</span>: dramatically reduces activation outliers, making INT4 quantization stable. This is why OpenAI's open-weight models can be quantized so aggressively.
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="conn">↓</div>
+
+    <!-- ═══════════════════ S4: KV COMPRESSION ═══════════════════ -->
+    <div class="step" id="s4">
+        <div class="step-top">
+            <div class="sh">
+                <span class="snum">04</span>
+                <span class="stitle">KV Head Compression: MHA → MQA → GQA → MLA</span>
+                <span class="sbadge" style="background:rgba(110,231,183,.08);color:var(--accent);border:1px solid rgba(110,231,183,.2)">production</span>
+            </div>
+            <div class="sdesc">
+                In standard MHA with h=32 heads and d_k=128, the KV cache stores <span class="hl3">2 × 32 × 128 = 8192 floats per token per layer</span>. For a 32-layer model at 100K tokens: 100K × 32 × 8192 × 2 bytes = <span class="hl3">52 GB just for KV cache</span>. That's why MQA, GQA, and MLA exist — they change the structure of who shares keys and values.<br><br>
+                You have <span class="hl">source-level control</span> over this: `num_kv_heads` is a hyperparameter in your attention module. You can change how many distinct KV groups exist without changing Q heads or model dimension.
+            </div>
+            <div style="margin-top:16px">
+                <div class="vlabel">Click to see KV head sharing — Query heads (top) sharing Key/Value heads (bottom)</div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px">
+                    <button class="head-pill" style="color:var(--accent);border-color:rgba(110,231,183,.4)" onclick="setKVMode('mha')">MHA (32 KV)</button>
+                    <button class="head-pill" style="color:var(--accent2);border-color:rgba(129,140,248,.4)" onclick="setKVMode('gqa')">GQA (8 KV)</button>
+                    <button class="head-pill" style="color:var(--accent3);border-color:rgba(244,114,182,.4)" onclick="setKVMode('mqa')">MQA (1 KV)</button>
+                    <button class="head-pill" style="color:var(--accent4);border-color:rgba(251,191,36,.4)" onclick="setKVMode('mla')">MLA (latent)</button>
+                </div>
+                <canvas id="kvCanvas" width="640" height="180" style="border-radius:9px;width:100%"></canvas>
+                <div id="kvStats" style="margin-top:10px;font-family:'DM Mono',monospace;font-size:11px;color:var(--muted)"></div>
+            </div>
+        </div>
+        <button class="expand-btn" onclick="toggleExpand(this)">
+            <span>▸ Math, Memory Formulas, MLA Deep Dive</span>
+            <span class="arr">▾</span>
+        </button>
+        <div class="expand-panel">
+            <div class="epanel-inner">
+                <div class="tabs">
+                    <button class="tab active" onclick="switchTab(this,'kv0')">Math + Formulas</button>
+                    <button class="tab" onclick="switchTab(this,'kv1')">MLA (DeepSeek)</button>
+                    <button class="tab" onclick="switchTab(this,'kv2')">Upcast Trick</button>
+                </div>
+                <div class="tab-content active" id="kv0">
+                    <div class="formula">
+                        MHA cache: 2 · h · d_k · L · N  bytes<br>
+                        GQA cache: 2 · g · d_k · L · N  bytes  (g &lt;&lt; h)<br>
+                        MQA cache: 2 · 1 · d_k · L · N  bytes
+                    </div>
+                    <div class="info-box">
+                        For Llama-3-70B: h=64, g=8, d_k=128, L=80 layers, N=1000 tokens:<br><br>
+                        MHA: 2×64×128×80×1000 × 2 bytes = <span class="hl3">~2.6 GB</span> per 1K tokens<br>
+                        GQA (g=8): ÷8 = <span class="hl2">~325 MB</span> per 1K tokens<br><br>
+                        This is why Llama-3-70B can serve longer contexts in production — GQA was specifically chosen for memory budget reasons, not accuracy. The accuracy difference between MHA and GQA (g≥4) is typically less than 1% on standard benchmarks.
+                    </div>
+                    <div class="code-block">
+                        <span class="cm"># GQA forward — the key code in repeat_kv</span>
+                        <span class="kw">def</span> <span class="fn">repeat_kv</span>(x, n_rep):
+                        <span class="cm"># x: [batch, seq, n_kv_heads, head_dim]</span>
+                        <span class="kw">if</span> n_rep == <span class="nm">1</span>: <span class="kw">return</span> x
+                        bs, slen, n_kv, hd = x.shape
+                        <span class="kw">return</span> (x[:, :, :, None, :]
+                        .expand(bs, slen, n_kv, n_rep, hd)
+                        .reshape(bs, slen, n_kv * n_rep, hd))
+
+                        <span class="cm"># In attention forward:</span>
+                        n_rep = self.n_heads // self.n_kv_heads  <span class="cm"># e.g. 64//8 = 8</span>
+                        K = repeat_kv(K, n_rep)  <span class="cm"># broadcast K to all query heads</span>
+                        V = repeat_kv(V, n_rep)  <span class="cm"># broadcast V to all query heads</span></div>
+                </div>
+                <div class="tab-content" id="kv1">
+                    <div class="info-box amber">
+                        <span class="hl4">Multi-head Latent Attention (DeepSeek-V2, 2024)</span>:<br><br>
+                        Instead of reducing K/V heads, MLA compresses the K and V tensors themselves into a <span class="hl">low-rank latent</span>:<br><br>
+                        <code style="font-family:'DM Mono',monospace;font-size:10px;color:var(--accent2)">c_kv = x @ W_kv_down  # compress: [seq, d_model] → [seq, r]  where r << d_model<br>K = c_kv @ W_k_up    # expand back to key space per head<br>V = c_kv @ W_v_up    # expand back to value space per head</code><br><br>
+                        Store only c_kv in cache (r floats) instead of full K,V (2×h×d_k floats). For DeepSeek-V2: r=512, h×d_k=128×128=16384. Cache reduction: <span class="hl">32×</span> with higher expressiveness than GQA. The "absorb" trick fuses W_k_up into Q projection at inference time, eliminating the expand step entirely.
+                    </div>
+                </div>
+                <div class="tab-content" id="kv2">
+                    <div class="info-box pink">
+                        <span class="hl3">Converting MHA → GQA post-training (no full retrain)</span>:<br><br>
+                        You don't always need to retrain from scratch. The GQA paper showed you can convert an existing MHA model:<br><br>
+                        1. Group the h KV heads into g groups (e.g., h=32 → g=8)<br>
+                        2. For each group, mean-pool the h/g KV head weights: W_k_group = mean(W_k_i for i in group)<br>
+                        3. Fine-tune with ~5% of original compute budget to recover quality<br><br>
+                        This is used in production to create faster MQA/GQA inference versions of models originally trained with MHA. Works because nearby heads in the original model often learn correlated representations.
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="conn">↓</div>
+
+    <!-- ═══════════════════ S5: KV PRUNING ═══════════════════ -->
+    <div class="step" id="s5">
+        <div class="step-top">
+            <div class="sh">
+                <span class="snum">05</span>
+                <span class="stitle">KV Cache Pruning at Runtime</span>
+                <span class="sbadge" style="background:rgba(244,114,182,.08);color:var(--accent3);border:1px solid rgba(244,114,182,.2)">prod + lab</span>
+            </div>
+            <div class="sdesc">
+                Rather than changing model architecture, you <span class="hl">dynamically evict tokens from the KV cache</span> during inference based on how much attention they've received. The premise: tokens that have been attended to frequently are "important" and should stay; tokens consistently ignored can be dropped.<br><br>
+                This is pure runtime logic — your attention forward pass looks the same, but you <span class="hl2">decide which past KV entries to retain</span> at each decoding step. The model never "knows" anything was dropped — it just has a shorter KV sequence.
+            </div>
+            <div style="margin-top:16px">
+                <div class="vlabel">KV Eviction Strategies — click to compare (N=12 tokens, budget=6)</div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px">
+                    <button class="head-pill" style="color:var(--accent);border-color:rgba(110,231,183,.4)" onclick="setEvictMode('full')">Full Cache</button>
+                    <button class="head-pill" style="color:var(--accent4);border-color:rgba(251,191,36,.4)" onclick="setEvictMode('h2o')">H2O (top-k attn)</button>
+                    <button class="head-pill" style="color:var(--accent2);border-color:rgba(129,140,248,.4)" onclick="setEvictMode('snapkv')">SnapKV (prefix)</button>
+                    <button class="head-pill" style="color:var(--accent3);border-color:rgba(244,114,182,.4)" onclick="setEvictMode('stream')">StreamingLLM</button>
+                </div>
+                <canvas id="evictCanvas" width="640" height="120" style="border-radius:9px;width:100%"></canvas>
+                <div id="evictDesc" style="margin-top:10px;font-family:'DM Mono',monospace;font-size:11px;color:var(--muted)"></div>
+            </div>
+        </div>
+        <button class="expand-btn" onclick="toggleExpand(this)">
+            <span>▸ H2O, SnapKV, PyramidKV, KIVI Quantization</span>
+            <span class="arr">▾</span>
+        </button>
+        <div class="expand-panel">
+            <div class="epanel-inner">
+                <div class="tabs">
+                    <button class="tab active" onclick="switchTab(this,'ev0')">H2O</button>
+                    <button class="tab" onclick="switchTab(this,'ev1')">SnapKV</button>
+                    <button class="tab" onclick="switchTab(this,'ev2')">KIVI Quantization</button>
+                </div>
+                <div class="tab-content active" id="ev0">
+                    <div class="info-box">
+                        <span class="hl">H2O — Heavy-Hitter Oracle</span> (Zhang et al. 2024): Tracks cumulative attention scores for each token across all heads and layers. At each step, the "heavy hitters" — tokens with highest accumulated attention — are retained. The bottom (budget - heavy_hitters) are evicted.<br><br>
+                        <code style="font-family:'DM Mono',monospace;font-size:10px;color:var(--accent)">scores_accum += attn_weights.sum(dim=0)  # accumulate per-token<br>keep_idx = scores_accum.topk(budget).indices  # keep top-k<br>K_cache = K_cache[keep_idx]<br>V_cache = V_cache[keep_idx]</code><br><br>
+                        Achieves <span class="hl2">~4× KV cache compression</span> with less than 5% accuracy loss on most benchmarks. The key insight: a small fraction of tokens consistently attract most attention ("heavy hitters") across diverse inputs.
+                    </div>
+                </div>
+                <div class="tab-content" id="ev1">
+                    <div class="info-box indigo">
+                        <span class="hl2">SnapKV</span> (Li et al. 2024): A more structured approach for long-prompt inference. Observes that attention patterns stabilize after the prompt is processed. So:<br><br>
+                        1. Process the full prompt once (prefill phase)<br>
+                        2. Look at attention scores of the <em>last few tokens</em> of the prompt — these reveal which tokens the model deems important<br>
+                        3. Keep only those important prompt tokens in the KV cache + full recent window<br>
+                        4. Decode autoregressively with compressed prefix<br><br>
+                        Advantage over H2O: The selection is done once, not updated every step — cheaper. Disadvantage: assumes the important tokens for the query are visible from prompt-end attention. Works well for QA, RAG; less so for creative generation.
+                    </div>
+                </div>
+                <div class="tab-content" id="ev2">
+                    <div class="info-box amber">
+                        <span class="hl4">KIVI — KV Cache Quantization</span>: Instead of dropping tokens, quantize their stored KV vectors to INT2 or INT4. This is a different dimension of compression.<br><br>
+                        Key observation: K vectors tolerate lower precision than V vectors (V affects output directly; K only affects routing). KIVI uses INT2 for K and INT4 for V, keeping the last few tokens in FP16 (recent tokens are used more and need precision).<br><br>
+                        Practically: 4× memory reduction with under 1% quality loss on Llama. Combined with GQA, you can get 8–16× KV cache reduction. This is how you fit 128K context windows on consumer hardware.
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="conn">↓</div>
+
+    <!-- ═══════════════════ S6: ACTIVATION STEERING ═══════════════════ -->
+    <div class="step" id="s6">
+        <div class="step-top">
+            <div class="sh">
+                <span class="snum">06</span>
+                <span class="stitle">Activation Steering Through Attention</span>
+                <span class="sbadge" style="background:rgba(110,231,183,.08);color:var(--accent);border:1px solid rgba(110,231,183,.2)">lab-grade</span>
+            </div>
+            <div class="sdesc">
+                The most powerful runtime intervention: <span class="hl">add a steering vector to the residual stream</span> at specific layers. Because multi-head attention outputs are added to the residual stream (the "highway"), you can intercept this and inject a directional vector that biases what the attention represents.<br><br>
+                The technique (Zou et al. 2023, Anthropic 2023): run the model on <span class="hl2">contrastive pairs</span> (formal vs informal, factual vs hallucinating), extract the mean difference of residual stream activations at a target layer, then add α× that difference at runtime. Called <span class="hl3">Representation Engineering</span> — you're steering the model's internal representations, not its outputs.
+            </div>
+            <div style="margin-top:16px">
+                <div class="vlabel">Steering Vector Effect — Vary α to see the conceptual shift</div>
+                <canvas id="steerCanvas" width="640" height="160" style="border-radius:9px;width:100%"></canvas>
+                <div class="sl-row" style="margin-top:10px">
+                    <label>Steering strength α:</label>
+                    <input type="range" min="-30" max="30" value="0" step="1" id="steerSlider" oninput="updateSteer()">
+                    <span class="sl-val" id="steerVal">0</span>
+                </div>
+            </div>
+        </div>
+        <button class="expand-btn" onclick="toggleExpand(this)">
+            <span>▸ How to Extract Vectors, Head-Level Steering, Limitations</span>
+            <span class="arr">▾</span>
+        </button>
+        <div class="expand-panel">
+            <div class="epanel-inner">
+                <div class="tabs">
+                    <button class="tab active" onclick="switchTab(this,'st0')">Extracting Vectors</button>
+                    <button class="tab" onclick="switchTab(this,'st1')">Head-Level Targeting</button>
+                    <button class="tab" onclick="switchTab(this,'st2')">Limitations</button>
+                </div>
+                <div class="tab-content active" id="st0">
+                    <div class="info-box">
+                        <span class="hl">Step 1 — Build contrastive dataset</span>: ~20–100 pairs of prompts representing the contrast you want. Example for "formal vs casual": "Please write a business proposal" vs "hey write me a pitch".<br><br>
+                        <span class="hl2">Step 2 — Extract activations</span>: Run both sets through the model. For each layer, record the mean residual stream activation at the last token position.<br><br>
+                        <code style="font-family:'DM Mono',monospace;font-size:10px;color:var(--accent)">hooks = []
+                            residuals = {}
+                            def hook_fn(layer_idx):
+                            def h(module, input, output):
+                            residuals[layer_idx] = output[0].detach()  # residual stream
+                            return h
+                            for i, layer in enumerate(model.layers):
+                            hooks.append(layer.register_forward_hook(hook_fn(i)))</code><br><br>
+                        <span class="hl3">Step 3 — Compute vector</span>: steering_vec[layer] = mean(pos_acts) − mean(neg_acts)<br><br>
+                        <span class="hl4">Step 4 — Inject</span>: At inference, after each target layer's attention + FFN, add: hidden_states += α × steering_vec[layer]
+                    </div>
+                </div>
+                <div class="tab-content" id="st1">
+                    <div class="info-box indigo">
+                        <span class="hl2">Head-Level Steering</span> (UniBias, NeurIPS 2024): Instead of steering the full residual stream, identify <em>which specific heads</em> contribute to biased behavior, then zero or scale their outputs.<br><br>
+                        For each head h in layer l, compute: head_importance[l,h] = |contribution to biased token| × |frequency of activation|<br><br>
+                        At inference: for heads above importance threshold, multiply their output by (1 − suppress_factor). For heads below threshold, leave intact. This is more surgical than full activation steering — you preserve the neutral heads while suppressing the biased ones.<br><br>
+                        Used in production for: debiasing models toward specific labels, suppressing hallucination-prone heads, enforcing style consistency.
+                    </div>
+                </div>
+                <div class="tab-content" id="st2">
+                    <div class="info-box pink">
+                        <span class="hl3">Honest limitations of activation steering</span>:<br><br>
+                        1. <span class="hl">Entanglement</span>: Representation directions are rarely clean. "Formal tone" direction likely correlates with "financial domain" and "legal language" — you may get unintended side effects.<br><br>
+                        2. <span class="hl2">Coherence degradation</span>: High α values produce incoherent text. There's a practical ceiling around α=15–20 beyond which outputs fall apart.<br><br>
+                        3. <span class="hl4">Layer sensitivity</span>: The right layer varies by concept. Lower layers = surface style. Middle layers = factual content. Upper layers = task-specific behavior. Finding the right layer requires empirical search.<br><br>
+                        4. <span class="hl3">Transfer across models</span>: Vectors found in Llama-3-8B rarely transfer well to Mistral-7B, even if architecturally similar. Representations are not standardized.
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="conn">↓</div>
+
+    <!-- ═══════════════════ S7: SOFTMAX SURGERY ═══════════════════ -->
+    <div class="step" id="s7">
+        <div class="step-top">
+            <div class="sh">
+                <span class="snum">07</span>
+                <span class="stitle">Replacing Softmax: Sigmoid, Linear & Beyond</span>
+                <span class="sbadge" style="background:rgba(129,140,248,.08);color:var(--accent2);border:1px solid rgba(129,140,248,.2)">lab-grade</span>
+            </div>
+            <div class="sdesc">
+                The softmax is a bottleneck: it forces all attention weights to sum to 1, creating <span class="hl3">token competition</span>. Every token "takes" probability mass from others. This is why attention sinks exist, why increasing context length hurts focus, and why the model can't attend to two unrelated things simultaneously with equal strength.<br><br>
+                You can <span class="hl">replace softmax entirely</span> in the forward pass with different normalizations. Each changes the semantics of what attention means — from "distribution over tokens" to "independent relevance score per token."
+            </div>
+            <div style="margin-top:16px">
+                <div class="vlabel">Normalization Comparison — Same scores, different functions</div>
+                <canvas id="normCanvas" width="640" height="180" style="border-radius:9px;width:100%"></canvas>
+                <div class="sl-row" style="margin-top:10px">
+                    <label>Score spread:</label>
+                    <input type="range" min="0.5" max="5" step="0.1" value="1.5" id="spreadSlider" oninput="updateNormViz()">
+                    <span class="sl-val" id="spreadVal">1.5×</span>
+                </div>
+            </div>
+        </div>
+        <button class="expand-btn" onclick="toggleExpand(this)">
+            <span>▸ Sigmoid Attention, Linear Attention, RWKV, Mamba</span>
+            <span class="arr">▾</span>
+        </button>
+        <div class="expand-panel">
+            <div class="epanel-inner">
+                <div class="tabs">
+                    <button class="tab active" onclick="switchTab(this,'nm0')">Sigmoid Attention</button>
+                    <button class="tab" onclick="switchTab(this,'nm1')">Linear Attention</button>
+                    <button class="tab" onclick="switchTab(this,'nm2')">RWKV / SSMs</button>
+                </div>
+                <div class="tab-content active" id="nm0">
+                    <div class="formula">Attn_sigmoid(Q,K,V) = sigmoid(Q·Kᵀ / √dₖ + b) · V</div>
+                    <div class="info-box">
+                        <span class="hl">Sigmoid attention</span> (SWAT paper, 2025): Replace softmax with sigmoid applied independently to each score. No competition between tokens. The bias b = −log(n) keeps values calibrated for sequence length n.<br><br>
+                        Advantages:<br>
+                        • <span class="hl2">No attention sink</span>: Softmax needed sinks because weights must sum to 1. Sigmoid has no such constraint — it doesn't need to "dump" unused probability anywhere.<br>
+                        • <span class="hl3">Monotone</span>: Adding new tokens can't reduce attention to existing tokens (softmax competition shrinks all weights when new tokens enter).<br>
+                        • Better for <span class="hl4">sliding window</span>: Works stably when window drops old tokens, because there's no renormalization artifact.<br><br>
+                        Disadvantage: Output scale grows with n (sum of sigmoids can exceed 1). Need to divide by sequence length or use a learned scaling factor.
+                    </div>
+                </div>
+                <div class="tab-content" id="nm1">
+                    <div class="info-box amber">
+                        <span class="hl4">Linear Attention</span>: Replace softmax(QKᵀ) with a kernel function φ(Q)φ(K)ᵀ where φ is an element-wise feature map (e.g., ELU(x)+1 or ReLU(x)). This allows the associativity trick:<br><br>
+                        <code style="font-family:'DM Mono',monospace;font-size:10px;color:var(--accent2)"># Standard: O(N²d) — compute QKᵀ first (N×N matrix)<br>out = softmax(Q @ K.T) @ V<br><br># Linear: O(Nd²) — compute KᵀV first (d×d matrix!)<br>S = (phi_K.T @ V)     # [d, d] — context state<br>out = phi_Q @ S       # [N, d] — O(Nd²) not O(N²d)</code><br><br>
+                        This is the key to <span class="hl">O(N) attention</span>. The context "state" S is a d×d matrix that summarizes all past tokens. Can be computed recurrently — making it as fast as an RNN at inference while being trainable as a Transformer.
+                    </div>
+                </div>
+                <div class="tab-content" id="nm2">
+                    <div class="info-box pink">
+                        <span class="hl3">RWKV and SSMs (Mamba)</span>: The logical endpoint of replacing softmax — eliminate the attention matrix entirely:<br><br>
+                        <span class="hl">RWKV</span>: Uses time-mixing (learned decay) and channel-mixing instead of QKV. The "attention" is a linear recurrence: hidden_t = w × hidden_{t-1} + u × x_t, where w and u are learned per-channel scalars. O(1) per token at inference.<br><br>
+                        <span class="hl2">Mamba (SSM)</span>: State space models with input-dependent transition matrices. The "context" is a fixed-size hidden state that gets updated recurrently. Remarkably: Mamba-3B matches Transformer-3B on many benchmarks at 5× inference speed.<br><br>
+                        <span class="hl4">Runtime modification angle</span>: If you have a Transformer's source, you can replace specific attention layers with RWKV or SSM layers — hybrid architectures. Jamba (AI21), Zamba, and Bamba do exactly this: 60% attention layers + 40% Mamba layers, getting nearly Transformer quality at near-Mamba speed.
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="conn">↓</div>
+
+    <!-- ═══════════════════ S8: PRODUCTION STACK ═══════════════════ -->
+    <div class="step" id="s8">
+        <div class="step-top">
+            <div class="sh">
+                <span class="snum">08</span>
+                <span class="stitle">The Production Stack</span>
+                <span class="sbadge" style="background:rgba(251,191,36,.08);color:var(--accent4);border:1px solid rgba(251,191,36,.2)">systems</span>
+            </div>
+            <div class="sdesc">
+                Where these techniques live in real inference stacks. <span class="hl">FlashAttention</span> rewrites the attention kernel to never materialize the full N×N matrix in HBM — it tiles the computation in SRAM, reducing memory reads from O(N²) to O(N). It's transparent to the math: same outputs, radically different memory behavior.<br><br>
+                <span class="hl2">vLLM</span> adds PagedAttention — treating the KV cache like OS virtual memory with fixed-size pages, enabling non-contiguous token sequences and copy-on-write for beam search. <span class="hl3">TensorRT-LLM</span> compiles all of these into fused CUDA kernels at model-build time. The techniques above sit as configuration layers on top.
+            </div>
+            <div style="margin-top:16px">
+                <div class="vlabel">Production Stack — where each technique lives</div>
+                <div id="stackDiag"></div>
+            </div>
+        </div>
+        <button class="expand-btn" onclick="toggleExpand(this)">
+            <span>▸ FlashAttention Internals, FlexAttention API, vLLM Hooks</span>
+            <span class="arr">▾</span>
+        </button>
+        <div class="expand-panel">
+            <div class="epanel-inner">
+                <div class="tabs">
+                    <button class="tab active" onclick="switchTab(this,'pr0')">FlashAttention</button>
+                    <button class="tab" onclick="switchTab(this,'pr1')">FlexAttention (PyTorch)</button>
+                    <button class="tab" onclick="switchTab(this,'pr2')">vLLM + Hooks</button>
+                </div>
+                <div class="tab-content active" id="pr0">
+                    <div class="info-box">
+                        <span class="hl">FlashAttention-3</span> (Dao & Shah, 2024): GPU SRAM ≈ 192KB. The N×N attention matrix at N=8192 = 268MB. FlashAttention tiles this into blocks that fit in SRAM, computing each block fully before writing results to HBM.<br><br>
+                        Implications for custom attention:<br>
+                        • Custom masks: FlashAttention supports custom mask functions via the <span class="hl2">FlexAttention</span> API (PyTorch 2.5+) — you define a Python function that maps (b, h, q_idx, k_idx) → bias_value, and it gets JIT-compiled into an efficient kernel.<br>
+                        • Block sparsity: FlashAttention can skip entire blocks if the mask marks them as −∞. Real O(N·sparsity) compute.<br>
+                        • Custom score mods: Add ALiBi, RoPE, score clamping all within the kernel.
+                    </div>
+                    <div class="code-block">
+                        <span class="cm"># FlexAttention — define custom score modification (PyTorch 2.5+)</span>
+                        <span class="kw">from</span> torch.nn.attention.flex_attention <span class="kw">import</span> flex_attention, create_block_mask
+
+                        <span class="kw">def</span> <span class="fn">sliding_window_causal</span>(b, h, q_idx, kv_idx):
+                        <span class="cm"># Combined: causal + sliding window of 512</span>
+                        causal = q_idx >= kv_idx
+                        in_window = q_idx - kv_idx <= <span class="nm">512</span>
+                        <span class="kw">return</span> causal & in_window
+
+                        <span class="kw">def</span> <span class="fn">alibi_score_mod</span>(score, b, h, q_idx, kv_idx):
+                        slope = 2 ** (-(<span class="nm">8</span> / num_heads) * (h + <span class="nm">1</span>))
+                        bias = -slope * torch.abs(q_idx - kv_idx).float()
+                        <span class="kw">return</span> score + bias
+
+                        block_mask = create_block_mask(sliding_window_causal, B, H, SEQ, SEQ)
+                        out = flex_attention(Q, K, V, score_mod=alibi_score_mod, block_mask=block_mask)</div>
+                </div>
+                <div class="tab-content" id="pr1">
+                    <div class="info-box indigo">
+                        <span class="hl2">FlexAttention</span> is the cleanest API for everything discussed in this page. It exposes two hooks:<br><br>
+                        • <span class="hl">score_mod(score, b, h, q_idx, kv_idx) → score</span>: Modify pre-softmax scores. Use for: ALiBi, logit bias, attention sinks, score clamping, temperature per head.<br><br>
+                        • <span class="hl3">mask_mod(b, h, q_idx, kv_idx) → bool</span>: Define sparsity pattern as a boolean function. Use for: sliding window, prefix masking, document boundaries, custom causal patterns.<br><br>
+                        PyTorch compiles both into Triton kernels automatically. You get custom attention semantics at near-FlashAttention speed. This is the recommended production path for custom attention modifications in 2025+.
+                    </div>
+                </div>
+                <div class="tab-content" id="pr2">
+                    <div class="info-box amber">
+                        <span class="hl4">vLLM Hook Points</span>:<br><br>
+                        vLLM exposes attention backends that you can replace:<br>
+                        • <code style="font-family:'DM Mono',monospace;font-size:10px;color:var(--accent2)">FlashAttentionBackend</code> → swap for custom sparse backend<br>
+                        • <code style="font-family:'DM Mono',monospace;font-size:10px;color:var(--accent2)">get_kv_cache_shape()</code> → change KV layout for MLA / compressed formats<br>
+                        • <code style="font-family:'DM Mono',monospace;font-size:10px;color:var(--accent2)">forward()</code> in attention layer → inject score biases here<br><br>
+                        For StreamingLLM in vLLM: override the KV cache update logic to keep sink + recent window. Add <code style="font-family:'DM Mono',monospace;font-size:10px;color:var(--accent)">sink_token_length</code> and <code style="font-family:'DM Mono',monospace;font-size:10px;color:var(--accent)">max_attention_window_size</code> to your generation config — these are first-class parameters in TensorRT-LLM and supported in HuggingFace via <code style="font-family:'DM Mono',monospace;font-size:10px;color:var(--accent)">attention_sinks</code> library.
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+</div><!-- end .wrap -->
+
+<script>
+    // ═══════════════════════════════════════════════════════
+    // UTILS
+    // ═══════════════════════════════════════════════════════
+    function toggleExpand(btn){
+      btn.classList.toggle('open');
+      btn.nextElementSibling.classList.toggle('open');
+    }
+    function switchTab(el,id){
+      const p=el.closest('.epanel-inner');
+      p.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+      p.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));
+      el.classList.add('active');
+      document.getElementById(id).classList.add('active');
+    }
+
+    const observer=new IntersectionObserver(entries=>{
+      entries.forEach(e=>{if(e.isIntersecting)e.target.classList.add('vis');});
+    },{threshold:.05});
+    document.querySelectorAll('.step').forEach(s=>observer.observe(s));
+
+    const io2=new IntersectionObserver(entries=>{
+      entries.forEach(e=>{
+        if(e.isIntersecting){
+          const id=e.target.id;
+          document.querySelectorAll('.snav a').forEach(a=>{
+            a.classList.toggle('on',a.getAttribute('href')==='#'+id);
+          });
+        }
+      });
+    },{threshold:.3});
+    document.querySelectorAll('.step[id]').forEach(s=>io2.observe(s));
+
+    const TOKS=['[SYS]','The','cat','sat','on','mat','[EOS]'];
+    const N=7;
+
+    // ═══════════════════════════════════════════════════════
+    // S0: MAP DIAGRAM
+    // ═══════════════════════════════════════════════════════
+    function buildMapDiag(){
+      const el=document.getElementById('mapDiag');
+      const items=[
+        {label:'Input embeddings x',c:'var(--muted)',tag:''},
+        {label:'W_Q · x   W_K · x   W_V · x',c:'var(--accent2)',tag:'QKV proj ← inject here'},
+        {label:'scores = Q · Kᵀ / √dₖ',c:'var(--accent4)',tag:'raw scores ← inject bias B here'},
+        {label:'+ Mask M  (or custom sparse pattern)',c:'var(--accent)',tag:'mask ← modify pattern here'},
+        {label:'softmax(scores)  ← or replace with sigmoid / linear',c:'var(--accent3)',tag:'activation ← swap function here'},
+        {label:'weights · V   ← V can be steered',c:'var(--accent2)',tag:'values ← inject here'},
+        {label:'output + residual → LayerNorm',c:'var(--accent)',tag:'residual ← add steering vec here'},
+      ];
+      el.innerHTML=items.map((item,i)=>`
+        <div style="display:flex;align-items:center;gap:10px;padding:8px 14px;background:var(--card2);border:1px solid var(--border2);border-radius:8px;margin:3px 0">
+          <span style="font-family:'DM Mono',monospace;font-size:11px;color:${item.c};flex:1">${item.label}</span>
+          ${item.tag?`<span style="font-family:'DM Mono',monospace;font-size:9px;color:var(--accent3);padding:2px 8px;border:1px solid rgba(244,114,182,.2);border-radius:5px;white-space:nowrap">${item.tag}</span>`:''}
+        </div>
+        ${i<items.length-1?'<div style="text-align:center;font-family:DM Mono,monospace;font-size:11px;color:var(--muted2);opacity:.5;line-height:1">↓</div>':''}
+      `).join('');
+    }
+    buildMapDiag();
+
+    function buildCostChart(){
+      const el=document.getElementById('costEffectChart');
+      if(!el)return;
+      const techniques=[
+        {name:'Logit Bias',cost:1,effect:3,c:'#6ee7b7'},
+        {name:'Score Clamping',cost:1,effect:2,c:'#6ee7b7'},
+        {name:'ALiBi',cost:2,effect:4,c:'#fbbf24'},
+        {name:'Sliding Window',cost:3,effect:5,c:'#818cf8'},
+        {name:'StreamingLLM',cost:2,effect:4,c:'#fbbf24'},
+        {name:'H2O Pruning',cost:3,effect:5,c:'#818cf8'},
+        {name:'Activation Steer',cost:4,effect:6,c:'#f472b6'},
+        {name:'Sigmoid Attn',cost:5,effect:7,c:'#f472b6'},
+        {name:'GQA Conv.',cost:5,effect:8,c:'#6ee7b7'},
+      ];
+      el.innerHTML=`<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">` +
+      techniques.map(t=>`
+        <div style="background:var(--card2);border:1px solid var(--border2);border-radius:9px;padding:12px">
+          <div style="font-family:'DM Mono',monospace;font-size:11px;color:${t.c};margin-bottom:8px">${t.name}</div>
+          <div style="font-family:'DM Mono',monospace;font-size:9px;color:var(--muted);margin-bottom:4px">Implementation cost</div>
+          <div style="height:6px;background:var(--border);border-radius:3px;margin-bottom:8px">
+            <div style="width:${t.cost/8*100}%;height:100%;background:${t.c};border-radius:3px;opacity:.7"></div>
+          </div>
+          <div style="font-family:'DM Mono',monospace;font-size:9px;color:var(--muted);margin-bottom:4px">Behavior effect</div>
+          <div style="height:6px;background:var(--border);border-radius:3px">
+            <div style="width:${t.effect/8*100}%;height:100%;background:${t.c};border-radius:3px"></div>
+          </div>
+        </div>
+      `).join('') + `</div>`;
+    }
+    setTimeout(buildCostChart,200);
+
+    // ═══════════════════════════════════════════════════════
+    // S1: SCORE INJECTION VIZ
+    // ═══════════════════════════════════════════════════════
+    const biasMatrix=Array.from({length:N},()=>Array(N).fill(0));
+    let hovRow=-1,hovCol=-1;
+
+    function buildScoreInjViz(){
+      const el=document.getElementById('scoreInjViz');
+      el.innerHTML=`
+        <div class="matrix-wrap">
+        <div style="font-family:'DM Mono',monospace;font-size:10px;color:var(--muted);margin-bottom:8px">Click a cell then use +/− to inject bias. Current biased attention weights:</div>
+        <table class="mat" id="injTable"></table>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:10px">
+          <button onclick="changeBias(1)" style="font-family:'DM Mono',monospace;font-size:11px;background:rgba(110,231,183,.1);border:1px solid rgba(110,231,183,.3);color:var(--accent);padding:5px 14px;border-radius:7px;cursor:pointer">+ Boost selected</button>
+          <button onclick="changeBias(-1)" style="font-family:'DM Mono',monospace;font-size:11px;background:rgba(244,114,182,.1);border:1px solid rgba(244,114,182,.3);color:var(--accent3);padding:5px 14px;border-radius:7px;cursor:pointer">− Suppress selected</button>
+          <button onclick="resetBias()" style="font-family:'DM Mono',monospace;font-size:11px;background:var(--card2);border:1px solid var(--border2);color:var(--muted);padding:5px 14px;border-radius:7px;cursor:pointer">Reset</button>
+        </div>
+        <div id="injDesc" style="margin-top:8px;font-family:'DM Mono',monospace;font-size:10px;color:var(--muted)">No cell selected</div>
+      `;
+      renderInjTable();
+    }
+    function renderInjTable(){
+      const tbl=document.getElementById('injTable');
+      if(!tbl)return;
+      // Raw QK scores (fake)
+      const rawScores=[
+        [3.2,0.8,-0.5,0.4,0.2,0.1,0.3],
+        [0.9,3.1,1.2,0.3,-0.2,0.1,0.2],
+        [0.2,1.4,3.5,0.8,0.5,0.3,0.1],
+        [0.3,0.2,0.7,3.0,1.1,0.4,0.3],
+        [0.1,0.3,0.5,1.0,3.2,0.8,0.2],
+        [0.2,0.1,0.4,0.6,1.1,3.4,0.5],
+        [0.8,0.2,0.1,0.2,0.1,0.3,3.1],
+      ];
+      // Add bias and compute softmax
+      const biased=rawScores.map((row,i)=>row.map((v,j)=>v+biasMatrix[i][j]));
+      const softmax=biased.map(row=>{
+        const max=Math.max(...row);
+        const exps=row.map(v=>Math.exp(v-max));
+        const sum=exps.reduce((a,b)=>a+b,0);
+        return exps.map(e=>e/sum);
+      });
+
+      tbl.innerHTML=`<tr><th></th>${TOKS.map(t=>`<th>${t}</th>`).join('')}</tr>`+
+        softmax.map((row,i)=>`
+          <tr>
+            <th>${TOKS[i]}</th>
+            ${row.map((w,j)=>{
+              const isHov=i===hovRow&&j===hovCol;
+              const bias=biasMatrix[i][j];
+              const cls=w>0.25?'hot':w>0.1?'mid':'cold';
+              return `<td class="${cls}" style="${isHov?'outline:2px solid var(--accent3);':''};cursor:pointer"
+                onclick="selectCell(${i},${j})"
+                title="attn: ${w.toFixed(3)}, bias: ${bias.toFixed(1)}">
+                ${w.toFixed(2)}${bias!==0?`<sup style="font-size:8px;color:${bias>0?'var(--accent)':'var(--accent3)'}">${bias>0?'+':''}${bias}</sup>`:''}
+              </td>`;
+            }).join('')}
+          </tr>
+        `).join('');
+    }
+    function selectCell(r,c){
+      hovRow=r;hovCol=c;
+      document.getElementById('injDesc').textContent=
+        `Selected: "${TOKS[r]}" → "${TOKS[c]}" | Current bias: ${biasMatrix[r][c].toFixed(1)}`;
+      renderInjTable();
+    }
+    function changeBias(delta){
+      if(hovRow<0)return;
+      biasMatrix[hovRow][hovCol]=Math.max(-10,Math.min(10,biasMatrix[hovRow][hovCol]+delta));
+      document.getElementById('injDesc').textContent=
+        `"${TOKS[hovRow]}" → "${TOKS[hovCol]}" | Bias: ${biasMatrix[hovRow][hovCol].toFixed(1)} | Effect: ${biasMatrix[hovRow][hovCol]>0?`${Math.exp(biasMatrix[hovRow][hovCol]).toFixed(1)}× more attention`:`${(1/Math.exp(-biasMatrix[hovRow][hovCol])).toFixed(2)}× less attention`}`;
+      renderInjTable();
+    }
+    function resetBias(){
+      for(let i=0;i<N;i++)for(let j=0;j<N;j++)biasMatrix[i][j]=0;
+      hovRow=-1;hovCol=-1;
+      document.getElementById('injDesc').textContent='Reset — all biases cleared';
+      renderInjTable();
+    }
+    buildScoreInjViz();
+
+    // ═══════════════════════════════════════════════════════
+    // S2: SPARSE PATTERNS
+    // ═══════════════════════════════════════════════════════
+    const PATTERNS={
+      'Full':  {fn:(i,j,n)=>true, desc:'Full O(N²) attention — every token attends to every other. Maximum expressiveness, maximum cost.'},
+      'Causal':{fn:(i,j,n)=>j<=i, desc:'Causal (autoregressive) mask — token i can only attend to tokens 0..i. Standard in decoder-only models (GPT family).'},
+      'Window':{fn:(i,j,n)=>Math.abs(i-j)<=2&&j<=i, desc:'Sliding window (w=2) + causal. Each token attends only to its 2 nearest past neighbors. O(N·w). Mistral, Longformer local.'},
+      'Longformer':{fn:(i,j,n)=>{const local=Math.abs(i-j)<=2&&j<=i;const global=j===0||i===0;return local||global;}, desc:'Longformer: local window + global tokens. Token 0 ([SYS]) attends to and is attended by all. Choose which tokens are global at runtime.'},
+      'Dilated':{fn:(i,j,n)=>j<=i&&(i-j)%2===0&&i-j<=8, desc:'Dilated window (dilation=2, range=8). Attends to every 2nd past token up to distance 8. Covers more range than sliding window at same compute.'},
+      'Block':{fn:(i,j,n)=>{const bi=Math.floor(i/3);const bj=Math.floor(j/3);return bi===bj&&j<=i;}, desc:'Block-sparse: dense within contiguous chunks of 3, zero across chunks. MInference "block-diagonal" pattern. Ideal for chunked documents.'},
+      'BigBird':{fn:(i,j,n)=>{const local=Math.abs(i-j)<=1&&j<=i;const global=j===0;const rand=((i*7+j*13)%5===0)&&j<=i;return local||global||rand;}, desc:'BigBird: local window + global tokens + random connections. Random edges reduce graph diameter, preserving long-range expressiveness.'},
+    };
+    let curPattern='Full';
+
+    function buildPatternBtns(){
+      const el=document.getElementById('patternBtns');
+      el.innerHTML=Object.keys(PATTERNS).map(k=>`
+        <button class="head-pill" style="color:${k===curPattern?'var(--accent3)':'var(--muted)'};border-color:${k===curPattern?'rgba(244,114,182,.5)':'var(--border2)'}" onclick="setSparsePattern('${k}')">${k}</button>
+      `).join('');
+    }
+    function setSparsePattern(name){
+      curPattern=name;
+      buildPatternBtns();
+      drawSparseCanvas();
+      document.getElementById('sparseDesc').textContent=PATTERNS[name].desc;
+    }
+    function drawSparseCanvas(){
+      const canvas=document.getElementById('sparseCanvas');
+      if(!canvas)return;
+      const ctx=canvas.getContext('2d');
+      const S=canvas.width,cell=S/N;
+      ctx.clearRect(0,0,S,S);
+      const fn=PATTERNS[curPattern].fn;
+      for(let i=0;i<N;i++){
+        for(let j=0;j<N;j++){
+          const on=fn(i,j,N);
+          ctx.fillStyle=on?'rgba(244,114,182,0.7)':'rgba(20,20,35,0.95)';
+          ctx.fillRect(j*cell+1,i*cell+1,cell-2,cell-2);
+          if(on){
+            ctx.fillStyle='rgba(244,114,182,0.15)';
+            ctx.fillRect(j*cell,i*cell,cell,cell);
+          }
+        }
+      }
+      // Labels
+      ctx.font='10px DM Mono,monospace';ctx.textAlign='center';
+      TOKS.forEach((t,i)=>{
+        ctx.fillStyle='rgba(90,100,120,.9)';
+        ctx.fillText(t,(i+0.5)*cell,S-4);
+        ctx.save();ctx.translate(4,(i+0.5)*cell);ctx.rotate(-Math.PI/2);
+        ctx.fillText(t,0,0);ctx.restore();
+      });
+      // Count
+      let cnt=0;for(let i=0;i<N;i++)for(let j=0;j<N;j++)if(fn(i,j,N))cnt++;
+      ctx.fillStyle='rgba(244,114,182,.7)';ctx.font='10px DM Mono,monospace';ctx.textAlign='right';
+      ctx.fillText(`${cnt}/${N*N} connections (${(cnt/(N*N)*100).toFixed(0)}% dense)`,S-4,14);
+    }
+    buildPatternBtns();
+    setSparsePattern('Full');
+
+    // ═══════════════════════════════════════════════════════
+    // S3: ATTENTION SINK VIZ
+    // ═══════════════════════════════════════════════════════
+    function updateSinkViz(){
+      const step=parseInt(document.getElementById('genSlider').value);
+      document.getElementById('genVal').textContent=`step ${step}`;
+      const canvas=document.getElementById('sinkCanvas');
+      if(!canvas)return;
+      const ctx=canvas.getContext('2d');
+      const W=canvas.width,H=canvas.height;
+      ctx.clearRect(0,0,W,H);ctx.fillStyle='#0d0d12';ctx.fillRect(0,0,W,H);
+
+      const nToks=Math.min(N,4+Math.floor(step/15));
+      const labels=['[BOS]','The','cat','sat','on','mat','[EOS]'].slice(0,nToks);
+      const cellW=(W-60)/nToks;
+
+      // The sink effect: token 0 always gets high attention
+      const getWeight=(queryIdx,keyIdx,step)=>{
+        if(queryIdx<keyIdx)return 0;
+        const sinkBoost=keyIdx===0?0.4+Math.sin(step*0.1)*0.05:0;
+        const localBoost=queryIdx===keyIdx?0.3:0;
+        const raw=sinkBoost+localBoost+Math.random()*0.02;
+        return raw;
+      };
+
+      labels.forEach((t,qi)=>{
+        let weights=labels.map((_,ki)=>getWeight(qi,ki,step));
+        const sum=weights.reduce((a,b)=>a+b,0.001);
+        weights=weights.map(w=>w/sum);
+
+        weights.forEach((w,ki)=>{
+          if(ki>qi)return;
+          const x=60+ki*cellW,y=qi*(H-20)/nToks+10;
+          const isSink=ki===0;
+          ctx.fillStyle=isSink?`rgba(251,191,36,${w*1.5+0.05})`:`rgba(244,114,182,${w*2})`;
+          ctx.fillRect(x,y,cellW-2,(H-20)/nToks-4);
+        });
+
+        ctx.fillStyle='rgba(90,100,120,.8)';ctx.font='10px DM Mono,monospace';ctx.textAlign='right';
+        ctx.fillText(t,56,qi*(H-20)/nToks+(H-20)/nToks/2+4);
+      });
+
+      ctx.fillStyle='rgba(251,191,36,.8)';ctx.font='9px DM Mono,monospace';ctx.textAlign='center';
+      ctx.fillText('← attention sink (first token absorbs excess weight)',W/2,H-2);
+    }
+    updateSinkViz();
+
+    // ═══════════════════════════════════════════════════════
+    // S4: KV HEAD VIZ
+    // ═══════════════════════════════════════════════════════
+    let kvMode='mha';
+    const KV_MODES={
+      mha:{qH:8,kvH:8,label:'MHA — 8Q, 8KV',desc:'Every query head has its own K and V. Maximum expressiveness. KV cache size: 8× per layer.'},
+      gqa:{qH:8,kvH:2,label:'GQA — 8Q, 2KV',desc:'4 query heads share each KV group. 4× cache reduction. Used in Llama-3, Mistral, Qwen.'},
+      mqa:{qH:8,kvH:1,label:'MQA — 8Q, 1KV',desc:'All query heads share 1 KV pair. 8× cache reduction. Aggressive — some quality loss. Used in PaLM.'},
+      mla:{qH:8,kvH:1,label:'MLA — 8Q, latent C',desc:'K,V compressed to low-rank latent vector C (e.g. 512 dims). Stored C, not K/V. 32× cache reduction. DeepSeek-V2/V3.'},
+    };
+    function setKVMode(m){
+      kvMode=m;
+      drawKVCanvas();
+    }
+    function drawKVCanvas(){
+      const canvas=document.getElementById('kvCanvas');
+      if(!canvas)return;
+      const ctx=canvas.getContext('2d');
+      const W=canvas.width,H=canvas.height;
+      ctx.clearRect(0,0,W,H);ctx.fillStyle='#0d0d12';ctx.fillRect(0,0,W,H);
+
+      const mode=KV_MODES[kvMode];
+      const {qH,kvH}=mode;
+      const qColors=['#6ee7b7','#818cf8','#f472b6','#fbbf24','#6ee7b7','#818cf8','#f472b6','#fbbf24'];
+      const qY=35,kvY=H-45;
+      const qW=(W-40)/qH,kvW=(W-40)/(kvMode==='mla'?1:kvH);
+
+      // Query heads
+      for(let i=0;i<qH;i++){
+        const x=20+i*qW+qW/2;
+        ctx.fillStyle=qColors[i]+'33';ctx.strokeStyle=qColors[i]+'99';ctx.lineWidth=1.5;
+        ctx.beginPath();ctx.roundRect(x-qW/2+2,qY-12,qW-4,24,5);ctx.fill();ctx.stroke();
+        ctx.fillStyle=qColors[i];ctx.font='9px DM Mono,monospace';ctx.textAlign='center';
+        ctx.fillText(`Q${i+1}`,x,qY+4);
+      }
+      ctx.fillStyle='rgba(90,100,120,.7)';ctx.font='9px DM Mono,monospace';ctx.textAlign='left';
+      ctx.fillText('Query heads',20,15);
+
+      // KV heads / latent
+      const kvColor=kvMode==='mla'?'#fbbf24':'#818cf8';
+      const numKV=kvMode==='mla'?1:kvH;
+      for(let i=0;i<numKV;i++){
+        const x=20+i*kvW+kvW/2;
+        ctx.fillStyle=kvColor+'33';ctx.strokeStyle=kvColor+'99';ctx.lineWidth=1.5;
+        ctx.beginPath();ctx.roundRect(x-kvW/2+2,kvY-12,kvW-4,24,5);ctx.fill();ctx.stroke();
+        ctx.fillStyle=kvColor;ctx.font='9px DM Mono,monospace';ctx.textAlign='center';
+        ctx.fillText(kvMode==='mla'?'C (latent)':`KV${i+1}`,x,kvY+4);
+      }
+      ctx.fillStyle='rgba(90,100,120,.7)';ctx.font='9px DM Mono,monospace';ctx.textAlign='left';
+      ctx.fillText(kvMode==='mla'?'Compressed latent C (stored in cache)':'KV heads (stored in cache)',20,H-15);
+
+      // Connection lines
+      for(let qi=0;qi<qH;qi++){
+        const qx=20+qi*qW+qW/2;
+        const kvIdx=kvMode==='mla'?0:Math.floor(qi/Math.ceil(qH/kvH));
+        const kvx=20+kvIdx*kvW+kvW/2;
+        ctx.strokeStyle=qColors[qi]+'55';ctx.lineWidth=1;
+        ctx.beginPath();ctx.moveTo(qx,qY+12);ctx.lineTo(kvx,kvY-12);ctx.stroke();
+      }
+
+      // Stats
+      const ratio=kvMode==='mla'?32:qH/numKV;
+      document.getElementById('kvStats').textContent=
+        `${mode.label} | Cache reduction: ${ratio>1?ratio+'×':'-'} vs MHA | ${mode.desc}`;
+    }
+    drawKVCanvas();
+
+    // ═══════════════════════════════════════════════════════
+    // S5: KV EVICTION VIZ
+    // ═══════════════════════════════════════════════════════
+    let evictMode='full';
+    const EVICT_DATA={
+      full: {keep:[0,1,2,3,4,5,6,7,8,9,10,11],desc:'Full cache: all 12 tokens retained. Memory grows linearly with generation length.'},
+      h2o: {keep:[0,2,4,5,7,9,10,11],desc:'H2O: kept top-6 by cumulative attention + 2 recents. Tokens 1,3,6,8 evicted (low attention score).'},
+      snapkv:{keep:[0,1,4,5,9,10,11],desc:'SnapKV: kept 4 "important" prefix tokens (detected by last-token attention) + recent window of 3.'},
+      stream:{keep:[0,1,2,3,9,10,11],desc:'StreamingLLM: 4 sink tokens always kept (0-3) + recent window of 3. Middle tokens 4-8 evicted.'},
+    };
+    const attnScores=[0.22,0.08,0.18,0.06,0.21,0.15,0.07,0.19,0.05,0.16,0.18,0.20];
+
+    function setEvictMode(m){
+      evictMode=m;
+      document.querySelectorAll('#s5 .head-pill').forEach(p=>p.style.color='var(--muted)');
+      drawEvictCanvas();
+    }
+    function drawEvictCanvas(){
+      const canvas=document.getElementById('evictCanvas');
+      if(!canvas)return;
+      const ctx=canvas.getContext('2d');
+      const W=canvas.width,H=canvas.height;
+      ctx.clearRect(0,0,W,H);ctx.fillStyle='#0d0d12';ctx.fillRect(0,0,W,H);
+
+      const data=EVICT_DATA[evictMode];
+      const kept=new Set(data.keep);
+      const n=12;
+      const cellW=(W-20)/n;
+
+      for(let i=0;i<n;i++){
+        const isKept=kept.has(i);
+        const x=10+i*cellW;
+        const score=attnScores[i];
+
+        // Score bar
+        ctx.fillStyle=isKept?'rgba(110,231,183,0.3)':'rgba(30,30,46,0.6)';
+        ctx.fillRect(x+2,H/2-(score*H*0.35),cellW-4,score*H*0.35);
+
+        // Token box
+        ctx.fillStyle=isKept?'rgba(110,231,183,0.15)':'rgba(30,30,46,0.4)';
+        ctx.strokeStyle=isKept?'rgba(110,231,183,0.6)':'rgba(50,50,70,0.6)';
+        ctx.lineWidth=isKept?1.5:0.5;
+        ctx.beginPath();ctx.roundRect(x+2,H/2+4,cellW-4,30,4);ctx.fill();ctx.stroke();
+
+        ctx.fillStyle=isKept?'#6ee7b7':'#3e4557';
+        ctx.font='9px DM Mono,monospace';ctx.textAlign='center';
+        ctx.fillText(`T${i}`,x+cellW/2,H/2+24);
+
+        if(!isKept){
+          ctx.strokeStyle='rgba(244,114,182,0.6)';ctx.lineWidth=1.5;
+          ctx.beginPath();ctx.moveTo(x+4,H/2+6);ctx.lineTo(x+cellW-4,H/2+32);
+          ctx.moveTo(x+cellW-4,H/2+6);ctx.lineTo(x+4,H/2+32);
+          ctx.stroke();
+        }
+      }
+
+      ctx.fillStyle='rgba(110,231,183,.6)';ctx.font='9px DM Mono,monospace';ctx.textAlign='left';
+      ctx.fillText('↑ attn score',12,12);
+      ctx.fillStyle='rgba(90,100,120,.7)';ctx.textAlign='center';
+      ctx.fillText(`Kept: ${data.keep.length}/12 tokens`,W/2,H-4);
+
+      document.getElementById('evictDesc').textContent=data.desc;
+    }
+    drawEvictCanvas();
+
+    // ═══════════════════════════════════════════════════════
+    // S6: ACTIVATION STEERING
+    // ═══════════════════════════════════════════════════════
+    function updateSteer(){
+      const alpha=parseInt(document.getElementById('steerSlider').value);
+      document.getElementById('steerVal').textContent=`α=${alpha}`;
+      const canvas=document.getElementById('steerCanvas');
+      if(!canvas)return;
+      const ctx=canvas.getContext('2d');
+      const W=canvas.width,H=canvas.height;
+      ctx.clearRect(0,0,W,H);ctx.fillStyle='#0d0d12';ctx.fillRect(0,0,W,H);
+
+      const concepts=[
+        {label:'formal',neg:'casual',x:W*0.15,base:0.3},
+        {label:'factual',neg:'creative',x:W*0.35,base:0.5},
+        {label:'concise',neg:'verbose',x:W*0.55,base:0.5},
+        {label:'polite',neg:'neutral',x:W*0.75,base:0.4},
+        {label:'domain-specific',neg:'general',x:W*0.92,base:0.3},
+      ];
+
+      const clamp=(v,lo,hi)=>Math.max(lo,Math.min(hi,v));
+      const strength=clamp(alpha/20,-1,1);
+
+      concepts.forEach(({label,neg,x,base})=>{
+        const shifted=clamp(base+strength*0.4+Math.random()*0.02-0.01,0.05,0.95);
+        const mid=H/2;
+        const barH=(H-40)*0.4;
+
+        // Positive direction
+        const posH=shifted*barH;
+        ctx.fillStyle=`rgba(110,231,183,${0.3+shifted*0.5})`;
+        ctx.fillRect(x-18,mid-posH,36,posH);
+
+        // Negative direction
+        const negH=(1-shifted)*barH;
+        ctx.fillStyle=`rgba(244,114,182,${0.3+(1-shifted)*0.5})`;
+        ctx.fillRect(x-18,mid,36,negH);
+
+        ctx.fillStyle=shifted>0.5?'#6ee7b7':'#f472b6';
+        ctx.font='9px DM Mono,monospace';ctx.textAlign='center';
+        ctx.fillText(shifted>0.5?label:neg,x,mid-posH-5);
+        ctx.fillStyle='rgba(90,100,120,.6)';
+        ctx.fillText(shifted<0.5?label:neg,x,mid+negH+12);
+      });
+
+      ctx.fillStyle='rgba(90,100,120,.7)';ctx.font='9px DM Mono,monospace';ctx.textAlign='center';
+      ctx.fillText(alpha===0?'α=0: No steering — baseline behavior':
+        alpha>0?`α=${alpha}: Steering POSITIVE direction (+formal, +factual, +domain)`:
+        `α=${alpha}: Steering NEGATIVE direction (+casual, +creative, +general)`,
+        W/2,H-6);
+
+      // Center line
+      ctx.strokeStyle='rgba(255,255,255,.1)';ctx.lineWidth=1;
+      ctx.beginPath();ctx.moveTo(0,H/2);ctx.lineTo(W,H/2);ctx.stroke();
+    }
+    updateSteer();
+
+    // ═══════════════════════════════════════════════════════
+    // S7: NORMALIZATION COMPARISON
+    // ═══════════════════════════════════════════════════════
+    function updateNormViz(){
+      const spread=parseFloat(document.getElementById('spreadSlider').value);
+      document.getElementById('spreadVal').textContent=`${spread.toFixed(1)}×`;
+      const canvas=document.getElementById('normCanvas');
+      if(!canvas)return;
+      const ctx=canvas.getContext('2d');
+      const W=canvas.width,H=canvas.height;
+      ctx.clearRect(0,0,W,H);ctx.fillStyle='#0d0d12';ctx.fillRect(0,0,W,H);
+
+      const rawScores=[3.2,-0.5,1.1,0.8,2.1,1.5,-0.3].map(s=>s*spread);
+
+      // Softmax
+      const maxS=Math.max(...rawScores);
+      const exps=rawScores.map(s=>Math.exp(s-maxS));
+      const sumE=exps.reduce((a,b)=>a+b,0);
+      const softmaxW=exps.map(e=>e/sumE);
+
+      // Sigmoid (no competition)
+      const sigW=rawScores.map(s=>1/(1+Math.exp(-s)));
+
+      // Linear (ReLU-normalized)
+      const reluW=rawScores.map(s=>Math.max(0,s));
+      const sumR=reluW.reduce((a,b)=>a+b,0.001);
+      const linearW=reluW.map(w=>w/sumR);
+
+      const methods=[
+        {name:'Softmax',weights:softmaxW,c:'#6ee7b7',note:'Competitive — sum=1'},
+        {name:'Sigmoid',weights:sigW,c:'#f472b6',note:'Independent — no competition'},
+        {name:'ReLU-norm',weights:linearW,c:'#818cf8',note:'Sparse — ignores negatives'},
+      ];
+
+      const pad=50,bw=(W-pad*2)/rawScores.length,rowH=(H-20)/methods.length;
+
+      methods.forEach(({name,weights,c,note},mi)=>{
+        const y=mi*rowH+10;
+        ctx.fillStyle='rgba(90,100,120,.7)';ctx.font='9px DM Mono,monospace';ctx.textAlign='right';
+        ctx.fillText(name,pad-4,y+rowH/2+3);
+
+        weights.forEach((w,i)=>{
+          const x=pad+i*bw;
+          const barH=Math.min(1,w)*(rowH-12);
+          ctx.fillStyle=c+'55';
+          ctx.fillRect(x+2,y+rowH-6-barH,bw-4,barH);
+          ctx.strokeStyle=c+'99';ctx.lineWidth=1;
+          ctx.strokeRect(x+2,y+rowH-6-barH,bw-4,barH);
+          ctx.fillStyle=c;ctx.font='8px DM Mono,monospace';ctx.textAlign='center';
+          ctx.fillText(w.toFixed(2),x+bw/2,y+rowH-8-barH);
+        });
+
+        ctx.fillStyle='rgba(90,100,120,.5)';ctx.font='8px DM Mono,monospace';ctx.textAlign='left';
+        ctx.fillText(note,pad+rawScores.length*bw+6,y+rowH/2+3);
+      });
+
+      ctx.fillStyle='rgba(90,100,120,.6)';ctx.font='8px DM Mono,monospace';ctx.textAlign='center';
+      TOKS.slice(0,rawScores.length).forEach((t,i)=>{
+        ctx.fillText(t,pad+i*bw+bw/2,H-2);
+      });
+    }
+    updateNormViz();
+
+    // ═══════════════════════════════════════════════════════
+    // S8: PRODUCTION STACK DIAGRAM
+    // ═══════════════════════════════════════════════════════
+    function buildStackDiag(){
+      const el=document.getElementById('stackDiag');
+      const layers=[
+        {label:'Application Layer',items:['Prompt engineering','System prompt injection','Logit bias API'],c:'var(--muted)',bg:'rgba(90,100,120,.06)'},
+        {label:'Inference Framework (vLLM / TensorRT-LLM / HuggingFace)',items:['Score injection hooks','StreamingLLM sink config','H2O / SnapKV KV pruning','GQA group config'],c:'var(--accent)',bg:'rgba(110,231,183,.05)'},
+        {label:'Attention Backend (FlashAttention / FlexAttention)',items:['Custom mask_mod (sparse patterns)','Custom score_mod (ALiBi, clamping)','Block-sparse kernel dispatch','Fused RoPE + attention'],c:'var(--accent2)',bg:'rgba(129,140,248,.05)'},
+        {label:'KV Cache Manager',items:['PagedAttention (vLLM)','KV quantization (KIVI INT4)','Sink token preservation','Eviction policy (H2O)'],c:'var(--accent4)',bg:'rgba(251,191,36,.05)'},
+        {label:'Hardware (GPU / NPU)',items:['SRAM tiling (FlashAttn)','Tensor cores','HBM bandwidth limit (bottleneck)'],c:'var(--accent3)',bg:'rgba(244,114,182,.05)'},
+      ];
+      el.innerHTML=layers.map((layer,i)=>`
+        ${i>0?'<div class="conn" style="height:12px">↓</div>':''}
+        <div style="background:${layer.bg};border:1px solid var(--border2);border-radius:10px;padding:12px 16px">
+          <div style="font-family:'DM Mono',monospace;font-size:11px;color:${layer.c};margin-bottom:8px;font-weight:600">${layer.label}</div>
+          <div style="display:flex;flex-wrap:wrap;gap:6px">
+            ${layer.items.map(item=>`
+              <span style="font-family:'DM Mono',monospace;font-size:10px;color:var(--muted);background:var(--surface);border:1px solid var(--border2);padding:3px 9px;border-radius:5px">${item}</span>
+            `).join('')}
+          </div>
+        </div>
+      `).join('');
+    }
+    buildStackDiag();
+
+    // ═══════════════════════════════════════════════════════
+    // CANVAS INIT ON SCROLL
+    // ═══════════════════════════════════════════════════════
+    const drawOnReveal={
+      s2:()=>drawSparseCanvas(),
+      s3:()=>updateSinkViz(),
+      s4:()=>drawKVCanvas(),
+      s5:()=>drawEvictCanvas(),
+      s6:()=>updateSteer(),
+      s7:()=>updateNormViz(),
+    };
+    const revealObs=new IntersectionObserver(entries=>{
+      entries.forEach(e=>{
+        if(e.isIntersecting&&drawOnReveal[e.target.id]){
+          drawOnReveal[e.target.id]();
+        }
+      });
+    },{threshold:.1});
+    Object.keys(drawOnReveal).forEach(id=>{
+      const el=document.getElementById(id);
+      if(el)revealObs.observe(el);
+    });
+    setTimeout(()=>{
+      Object.keys(drawOnReveal).forEach(id=>{
+        const el=document.getElementById(id);
+        if(el){const r=el.getBoundingClientRect();if(r.top<window.innerHeight)drawOnReveal[id]();}
+      });
+    },400);
+    window.addEventListener('resize',()=>{
+      drawSparseCanvas();drawKVCanvas();drawEvictCanvas();
+    });
+</script>
+</body>
+</html>

@@ -1,0 +1,33 @@
+{
+  "model": "Qwen/Qwen2-0.5B-Instruct",
+  "architecture": "qwen2",
+  "n_embd": 896,
+  "n_layers": 24,
+  "layers_used": "7-16",
+  "axes": {
+    "warmth": {
+      "file": "warmth.gguf",
+      "description": "Warmth: -1.0 (cold/clinical) to +1.0 (warm/affectionate)"
+    },
+    "energy": {
+      "file": "energy.gguf",
+      "description": "Energy: -1.0 (calm/subdued) to +1.0 (excited/energetic)"
+    },
+    "humor": {
+      "file": "humor.gguf",
+      "description": "Humor: -1.0 (serious/dry) to +1.0 (playful/witty)"
+    },
+    "formality": {
+      "file": "formality.gguf",
+      "description": "Formality: -1.0 (casual/slang) to +1.0 (formal/professional)"
+    },
+    "verbosity": {
+      "file": "verbosity.gguf",
+      "description": "Verbosity: -1.0 (verbose/detailed) to +1.0 (terse/brief)"
+    },
+    "emotion": {
+      "file": "emotion.gguf",
+      "description": "Emotion: -1.0 (stoic/logical) to +1.0 (emotional/expressive)"
+    }
+  }
+}

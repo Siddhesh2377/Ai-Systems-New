@@ -1,0 +1,1395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Runtime Learning — Activation Steering + Live Weight Updates</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:ital,wght@0,300;0,400;0,500;1,300&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#09090e;--surface:#111118;--card:#15151e;--card2:#1a1a26;
+  --border:#21212e;--border2:#2a2a3a;
+  --accent:#6ee7b7;--accent2:#818cf8;--accent3:#f472b6;--accent4:#fbbf24;
+  --red:#f87171;--text:#dde4f0;--muted:#5a6478;--muted2:#3e4557;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--text);font-family:'Syne',sans-serif;overflow-x:hidden}
+body::after{content:'';position:fixed;inset:0;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.035'/%3E%3C/svg%3E");pointer-events:none;z-index:999;opacity:.5}
+
+/* ─── HERO ─── */
+.hero{padding:60px 20px 36px;text-align:center}
+.hero-tag{font-family:'DM Mono',monospace;font-size:10px;letter-spacing:.24em;color:var(--accent2);text-transform:uppercase;margin-bottom:14px;opacity:0;animation:fUp .5s .1s ease forwards}
+.hero h1{font-size:clamp(28px,6.5vw,62px);font-weight:800;letter-spacing:-.03em;line-height:1.05;opacity:0;animation:fUp .5s .2s ease forwards}
+.hero h1 em{color:var(--accent3);font-style:normal}
+.hero h1 span{color:var(--accent)}
+.hero-sub{margin-top:14px;font-family:'DM Mono',monospace;font-size:12px;color:var(--muted);opacity:0;animation:fUp .5s .32s ease forwards;line-height:2;max-width:640px;margin-left:auto;margin-right:auto}
+.hero-ex{margin-top:18px;font-family:'DM Mono',monospace;font-size:11px;background:rgba(110,231,183,.06);border:1px solid rgba(110,231,183,.18);border-radius:10px;padding:12px 18px;display:inline-block;color:var(--accent);opacity:0;animation:fUp .5s .44s ease forwards}
+.hero-ex span{color:var(--accent3)}
+@keyframes fUp{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:none}}
+
+/* ─── NAV ─── */
+.snav{position:sticky;top:0;z-index:200;background:rgba(9,9,14,.92);backdrop-filter:blur(16px);border-bottom:1px solid var(--border);display:flex;gap:4px;flex-wrap:wrap;justify-content:center;padding:8px 14px}
+.snav a{font-family:'DM Mono',monospace;font-size:9px;letter-spacing:.08em;padding:4px 10px;border-radius:20px;border:1px solid var(--border2);color:var(--muted);text-decoration:none;transition:all .18s}
+.snav a:hover,.snav a.on{border-color:var(--accent2);color:var(--accent2);background:rgba(129,140,248,.06)}
+
+/* ─── LAYOUT ─── */
+.wrap{max-width:800px;margin:0 auto;padding:0 18px 120px}
+.conn{display:flex;justify-content:center;height:28px;color:var(--muted2);font-size:13px;opacity:.5;font-family:'DM Mono',monospace;align-items:center}
+
+/* ─── STEP CARDS ─── */
+.step{background:var(--card);border:1px solid var(--border);border-radius:18px;margin-bottom:10px;overflow:hidden;opacity:0;transform:translateY(26px);transition:opacity .5s,transform .5s}
+.step.vis{opacity:1;transform:none}
+.step::before{content:'';display:block;height:1px;background:linear-gradient(90deg,transparent,var(--accent2) 40%,transparent);opacity:.3}
+.step-top{padding:26px 26px 22px}
+.sh{display:flex;align-items:center;gap:12px;margin-bottom:14px;flex-wrap:wrap}
+.snum{font-family:'DM Mono',monospace;font-size:10px;color:var(--accent2);background:rgba(129,140,248,.08);border:1px solid rgba(129,140,248,.18);padding:3px 9px;border-radius:5px}
+.stitle{font-size:18px;font-weight:700;letter-spacing:-.02em}
+.sbadge{font-family:'DM Mono',monospace;font-size:9px;padding:2px 8px;border-radius:5px;letter-spacing:.06em}
+.sdesc{font-family:'DM Mono',monospace;font-size:12px;color:var(--muted);line-height:1.85}
+.hl{color:var(--accent)}.hl2{color:var(--accent2)}.hl3{color:var(--accent3)}.hl4{color:var(--accent4)}.hlr{color:var(--red)}
+.vlabel{font-family:'DM Mono',monospace;font-size:9px;color:var(--muted);letter-spacing:.14em;text-transform:uppercase;margin-bottom:10px}
+.vbox{background:var(--surface);border:1px solid var(--border);border-radius:11px;padding:16px}
+
+/* ─── EXPAND ─── */
+.expand-btn{width:100%;background:transparent;border:none;border-top:1px solid var(--border);padding:12px 26px;display:flex;align-items:center;justify-content:space-between;cursor:pointer;font-family:'DM Mono',monospace;font-size:11px;color:var(--muted);transition:all .2s;letter-spacing:.07em}
+.expand-btn:hover{background:rgba(129,140,248,.04);color:var(--accent2)}
+.expand-btn .arr{transition:transform .3s}
+.expand-btn.open .arr{transform:rotate(180deg)}
+.expand-panel{max-height:0;overflow:hidden;transition:max-height .6s cubic-bezier(.4,0,.2,1)}
+.expand-panel.open{max-height:8000px}
+.epanel-inner{padding:24px;border-top:1px solid var(--border);background:rgba(0,0,0,.2)}
+.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:18px}
+.tab{font-family:'DM Mono',monospace;font-size:10px;padding:5px 12px;border-radius:8px;border:1px solid var(--border2);color:var(--muted);cursor:pointer;transition:all .18s;background:none}
+.tab.active,.tab:hover{border-color:var(--accent2);color:var(--accent2);background:rgba(129,140,248,.07)}
+.tab-content{display:none}.tab-content.active{display:block}
+
+/* ─── UI ATOMS ─── */
+.formula{font-family:'DM Mono',monospace;font-size:11.5px;color:var(--accent4);text-align:center;padding:12px 16px;background:rgba(251,191,36,.04);border:1px solid rgba(251,191,36,.14);border-radius:10px;margin:12px 0;letter-spacing:.03em;line-height:2}
+.info-box{background:rgba(110,231,183,.04);border:1px solid rgba(110,231,183,.14);border-radius:9px;padding:13px 16px;margin:12px 0;font-family:'DM Mono',monospace;font-size:11px;color:var(--muted);line-height:1.85}
+.info-box.indigo{background:rgba(129,140,248,.04);border-color:rgba(129,140,248,.14)}
+.info-box.pink{background:rgba(244,114,182,.04);border-color:rgba(244,114,182,.14)}
+.info-box.amber{background:rgba(251,191,36,.04);border-color:rgba(251,191,36,.14)}
+.info-box.red{background:rgba(248,113,113,.04);border-color:rgba(248,113,113,.14)}
+.info-box.green{background:rgba(110,231,183,.06);border-color:rgba(110,231,183,.2)}
+.code{background:#0a0a10;border:1px solid var(--border2);border-radius:9px;padding:14px 16px;font-family:'DM Mono',monospace;font-size:11px;color:#a0aec0;overflow-x:auto;margin:10px 0;line-height:1.75}
+.code .kw{color:#818cf8}.code .fn{color:#6ee7b7}.code .cm{color:#3e4557}.code .st{color:#fbbf24}.code .nm{color:#f472b6}.code .dc{color:#f87171}
+.sl-row{display:flex;align-items:center;gap:12px;margin:10px 0;flex-wrap:wrap}
+.sl-row label{font-family:'DM Mono',monospace;font-size:10px;color:var(--muted);min-width:120px}
+.sl-val{font-family:'DM Mono',monospace;font-size:11px;color:var(--accent4);min-width:60px}
+input[type=range]{accent-color:var(--accent3);cursor:pointer;flex:1;min-width:100px}
+.btn{font-family:'DM Mono',monospace;font-size:10px;padding:6px 14px;border-radius:7px;border:1px solid;cursor:pointer;transition:all .18s;background:none}
+.btn-g{color:var(--accent);border-color:rgba(110,231,183,.35);}.btn-g:hover{background:rgba(110,231,183,.1)}
+.btn-p{color:var(--accent3);border-color:rgba(244,114,182,.35)}.btn-p:hover{background:rgba(244,114,182,.1)}
+.btn-i{color:var(--accent2);border-color:rgba(129,140,248,.35)}.btn-i:hover{background:rgba(129,140,248,.1)}
+.btn-a{color:var(--accent4);border-color:rgba(251,191,36,.35)}.btn-a:hover{background:rgba(251,191,36,.1)}
+.row-btns{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
+canvas{display:block;max-width:100%}
+.cmp{display:grid;gap:1px;background:var(--border);border-radius:10px;overflow:hidden;font-family:'DM Mono',monospace;font-size:10px}
+.cc{background:var(--card2);padding:9px 12px;line-height:1.65}
+.cc.hdr{color:var(--accent2);font-size:9px;letter-spacing:.1em;text-transform:uppercase;background:var(--surface)}
+</style>
+</head>
+<body>
+
+<div class="hero">
+  <div class="hero-tag">runtime · edge device · zero-retraining</div>
+  <h1><em>Steering</em> Attention<br>+ <span>Self-Updating</span> Weights</h1>
+  <div class="hero-sub">
+    Can you make a model change what it thinks about — at runtime, no training pipeline?<br>
+    Can it actually update its own weights on an edge device as it runs?<br>
+    Both are real, working techniques. Here's the full theory + code.
+  </div>
+  <div class="hero-ex">Running example: <span>on-device medical assistant</span> that steers toward clinical tone<br>and learns from doctor corrections — without sending any data to the cloud.</div>
+</div>
+
+<nav class="snav" id="snav">
+  <a href="#s0">What is Steering</a>
+  <a href="#s1">Vector Extraction</a>
+  <a href="#s2">Live Injection</a>
+  <a href="#s3">Head Targeting</a>
+  <a href="#s4">Weight Updates?</a>
+  <a href="#s5">Fast Weights</a>
+  <a href="#s6">LoRA-as-Adapter</a>
+  <a href="#s7">TTT-E2E</a>
+  <a href="#s8">Edge Reality</a>
+  <a href="#s9">Full Stack</a>
+</nav>
+
+<div class="wrap">
+
+<!-- ══════════════════ S0: WHAT IS STEERING ══════════════════ -->
+<div class="step" id="s0">
+  <div class="step-top">
+    <div class="sh">
+      <span class="snum">00</span>
+      <span class="stitle">What is Activation Steering?</span>
+      <span class="sbadge" style="background:rgba(129,140,248,.08);color:var(--accent2);border:1px solid rgba(129,140,248,.2)">core concept</span>
+    </div>
+    <div class="sdesc">
+      Inside every transformer layer, there is a <span class="hl">residual stream</span> — a vector highway of dimension d_model that flows through the entire network. Attention outputs, FFN outputs — everything is <em>added</em> to this stream. The key insight: <span class="hl2">concepts are directions in this high-dimensional space</span>. "Clinical tone" is a direction. "Confident vs uncertain" is a direction. You can <span class="hl3">add a vector to the residual stream at runtime</span> and push the model's internal representation toward any concept — no weights touched, no gradients computed.
+    </div>
+    <div style="margin-top:16px">
+      <div class="vlabel">The residual stream — what gets added at each layer</div>
+      <canvas id="streamCanvas" width="720" height="130" style="width:100%;border-radius:10px"></canvas>
+    </div>
+  </div>
+  <button class="expand-btn" onclick="tog(this)">
+    <span>▸ Why the residual stream works as a steering target</span>
+    <span class="arr">▾</span>
+  </button>
+  <div class="expand-panel">
+    <div class="epanel-inner">
+      <div class="tabs">
+        <button class="tab active" onclick="swt(this,'s0t0')">Superposition Theory</button>
+        <button class="tab" onclick="swt(this,'s0t1')">Linear Representation Hypothesis</button>
+        <button class="tab" onclick="swt(this,'s0t2')">What you CAN'T steer</button>
+      </div>
+      <div class="tab-content active" id="s0t0">
+        <div class="info-box indigo">
+          <span class="hl2">Superposition hypothesis</span> (Elhage et al., Anthropic 2022): A model with d=4096 dimensions doesn't have 4096 features — it has <em>millions</em> of features packed into 4096 dims using nearly-orthogonal directions. Each concept occupies a direction, not an axis.<br><br>
+          Consequence: Adding a vector along the "clinical language" direction adds clinical-ness to every token's representation simultaneously, without disturbing the ~million other directions that are nearly orthogonal to it. The sparsity of real activations means interference is low.
+        </div>
+        <div class="formula">h_new[layer] = h[layer] + α · steering_vec[layer]<br>where steering_vec encodes a concept as a direction in ℝ^d_model</div>
+      </div>
+      <div class="tab-content" id="s0t1">
+        <div class="info-box amber">
+          <span class="hl4">Linear Representation Hypothesis</span>: Concepts are linearly encoded in activation space. The famous proof: in word2vec, king − man + woman ≈ queen. Same holds in LLMs — "Paris" − "France" + "Germany" ≈ "Berlin" in residual stream space.<br><br>
+          This is WHY adding a vector works. If concepts were non-linearly encoded (e.g., in specific attention pattern configurations), you couldn't steer with a simple vector addition. The linearity is what makes steering tractable.
+        </div>
+      </div>
+      <div class="tab-content" id="s0t2">
+        <div class="info-box red">
+          <span class="hlr">Hard limits of activation steering</span>:<br><br>
+          ✗ You cannot add new factual knowledge — you can't steer toward "knowing" something the model never saw in training<br>
+          ✗ You cannot reliably steer at high α without degrading coherence (the model breaks)<br>
+          ✗ Entanglement: most concept vectors are not pure — "formal tone" correlates with "corporate/legal language"<br>
+          ✗ The right layer varies per concept — there's no universal answer<br>
+          ✗ Vectors found in Llama-3 don't transfer to Mistral — not even same-size models<br><br>
+          <span class="hl">What you CAN do</span>: shift style, tone, confidence, verbosity, focus on specific domains, suppress or amplify certain behaviors — all within what the model already knows.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="conn">↓</div>
+
+<!-- ══════════════════ S1: VECTOR EXTRACTION ══════════════════ -->
+<div class="step" id="s1">
+  <div class="step-top">
+    <div class="sh">
+      <span class="snum">01</span>
+      <span class="stitle">Extracting Steering Vectors</span>
+      <span class="sbadge" style="background:rgba(110,231,183,.08);color:var(--accent);border:1px solid rgba(110,231,183,.2)">step-by-step</span>
+    </div>
+    <div class="sdesc">
+      You need a <span class="hl">contrastive dataset</span>: pairs of inputs that differ along exactly the dimension you want to control. For our medical assistant: "patient came in complaining of headaches" (casual) vs "patient presents with cephalgia" (clinical). Run both through the model, record the <span class="hl2">residual stream at each layer</span> at the last token position, take the mean difference. That difference vector <span class="hl3">is the steering direction</span> for "clinical tone." Step through the process below.
+    </div>
+    <div style="margin-top:16px">
+      <div class="vlabel">Extraction Pipeline — click NEXT to step through</div>
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:11px;padding:16px">
+        <div id="extractSteps" style="min-height:110px"></div>
+        <div class="row-btns" style="margin-top:12px">
+          <button class="btn btn-i" onclick="extractNext()">▶ Next Step</button>
+          <button class="btn btn-p" onclick="extractReset()">↺ Reset</button>
+          <span id="extractNum" style="font-family:'DM Mono',monospace;font-size:10px;color:var(--muted)">0 / 5</span>
+        </div>
+      </div>
+    </div>
+  </div>
+  <button class="expand-btn" onclick="tog(this)">
+    <span>▸ Full Code: Hook system, layer selection, normalisation</span>
+    <span class="arr">▾</span>
+  </button>
+  <div class="expand-panel">
+    <div class="epanel-inner">
+      <div class="tabs">
+        <button class="tab active" onclick="swt(this,'s1t0')">Hook System (PyTorch)</button>
+        <button class="tab" onclick="swt(this,'s1t1')">Layer Selection</button>
+        <button class="tab" onclick="swt(this,'s1t2')">Normalisation</button>
+      </div>
+      <div class="tab-content active" id="s1t0">
+        <div class="code">
+<span class="cm"># Full steering vector extraction pipeline</span>
+<span class="kw">import</span> torch
+<span class="kw">from</span> collections <span class="kw">import</span> defaultdict
+
+<span class="kw">class</span> <span class="fn">ResidualStreamCapture</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, model):
+        self.hooks = []
+        self.activations = defaultdict(list)  <span class="cm"># layer → [batch acts]</span>
+
+    <span class="kw">def</span> <span class="fn">register</span>(self, model):
+        <span class="kw">for</span> i, layer <span class="kw">in</span> enumerate(model.model.layers):
+            h = layer.register_forward_hook(
+                <span class="kw">lambda</span> mod, inp, out, idx=i:
+                    <span class="cm"># out[0] is residual stream post-layer: [batch, seq, d_model]</span>
+                    self.activations[idx].append(out[<span class="nm">0</span>][:, <span class="nm">-1</span>, :].detach())
+            )
+            self.hooks.append(h)
+
+    <span class="kw">def</span> <span class="fn">remove</span>(self):
+        [h.remove() <span class="kw">for</span> h <span class="kw">in</span> self.hooks]; self.hooks = []
+
+<span class="kw">def</span> <span class="fn">extract_steering_vector</span>(model, tokenizer, pos_texts, neg_texts):
+    capture = ResidualStreamCapture(model)
+    capture.register(model)
+
+    <span class="kw">def</span> <span class="fn">get_acts</span>(texts):
+        acts = defaultdict(list)
+        <span class="kw">for</span> text <span class="kw">in</span> texts:
+            inp = tokenizer(text, return_tensors=<span class="st">'pt'</span>).to(model.device)
+            <span class="kw">with</span> torch.no_grad():
+                model(**inp)
+            <span class="kw">for</span> layer, a <span class="kw">in</span> capture.activations.items():
+                acts[layer].append(a[<span class="nm">-1</span>])          <span class="cm"># last-token act</span>
+            capture.activations.clear()
+        <span class="kw">return</span> {l: torch.stack(v).mean(<span class="nm">0</span>) <span class="kw">for</span> l, v <span class="kw">in</span> acts.items()}
+
+    pos_acts = get_acts(pos_texts)
+    neg_acts = get_acts(neg_texts)
+    capture.remove()
+
+    <span class="cm"># steering_vec[layer] is a [d_model] vector</span>
+    steering_vecs = {
+        layer: (pos_acts[layer] - neg_acts[layer])
+        <span class="kw">for</span> layer <span class="kw">in</span> pos_acts
+    }
+    <span class="kw">return</span> steering_vecs</div>
+      </div>
+      <div class="tab-content" id="s1t1">
+        <div class="info-box">
+          <span class="hl">Layer selection matters enormously</span>:<br><br>
+          Early layers (0–30% of depth): surface features — punctuation, word frequency, syntax<br>
+          Middle layers (30–70%): semantic content — entities, facts, domain concepts<br>
+          Late layers (70–100%): task-specific — sentiment, output style, instruction-following<br><br>
+          For our medical assistant use case — steering toward "clinical tone": target <span class="hl2">middle layers</span> (layers 12–20 in a 32-layer model). For "formal vs casual style": target late layers (layers 24–30).<br><br>
+          Heuristic: find the layer where the <span class="hl4">cosine similarity of the steering vector is highest</span> with the concept's ground-truth probe. If you don't have a probe, use the layer that maximizes output consistency across 10 test prompts.
+        </div>
+      </div>
+      <div class="tab-content" id="s1t2">
+        <div class="info-box pink">
+          <span class="hl3">Normalisation strategies</span>:<br><br>
+          Raw: steering_vec = mean(pos) − mean(neg) — simplest, often works<br>
+          Unit norm: steering_vec /= ||steering_vec|| — controls magnitude separately via α<br>
+          PCA: take top principal component of (pos − neg) matrix — cleaner concept, less noise from paired examples<br>
+          Contrastive Fisher: steering_vec = Σ_within⁻¹ · (μ_pos − μ_neg) — maximises class separation<br><br>
+          In practice: <span class="hl">unit-normalise</span> and sweep α. For medical example: α=8–15 works well for clinical tone shift with minimal coherence degradation.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="conn">↓</div>
+
+<!-- ══════════════════ S2: LIVE INJECTION ══════════════════ -->
+<div class="step" id="s2">
+  <div class="step-top">
+    <div class="sh">
+      <span class="snum">02</span>
+      <span class="stitle">Live Injection at Runtime</span>
+      <span class="sbadge" style="background:rgba(244,114,182,.08);color:var(--accent3);border:1px solid rgba(244,114,182,.2)">runtime hook</span>
+    </div>
+    <div class="sdesc">
+      At inference time, you register a <span class="hl3">forward hook on the target layer</span>. After each layer computes its output, you intercept the residual stream and add α × steering_vec before it flows to the next layer. The model never knows — it processes the modified representation normally. This happens <span class="hl">every token of every generation</span> — steering is continuous, not one-shot.
+    </div>
+    <div style="margin-top:16px">
+      <div class="vlabel">Injection point — drag α to see the concept shift (simulated)</div>
+      <canvas id="injCanvas" width="720" height="170" style="width:100%;border-radius:10px"></canvas>
+      <div class="sl-row" style="margin-top:10px">
+        <label>Steering strength α:</label>
+        <input type="range" min="0" max="20" value="0" step="0.5" id="alphaSlider" oninput="updateInj()">
+        <span class="sl-val" id="alphaVal">α = 0</span>
+      </div>
+      <div id="injOutput" style="font-family:'DM Mono',monospace;font-size:11px;color:var(--muted);margin-top:8px;min-height:32px"></div>
+    </div>
+  </div>
+  <button class="expand-btn" onclick="tog(this)">
+    <span>▸ Production hook code, multi-layer injection, removal</span>
+    <span class="arr">▾</span>
+  </button>
+  <div class="expand-panel">
+    <div class="epanel-inner">
+      <div class="tabs">
+        <button class="tab active" onclick="swt(this,'s2t0')">Hook Code</button>
+        <button class="tab" onclick="swt(this,'s2t1')">Multi-layer Strategy</button>
+        <button class="tab" onclick="swt(this,'s2t2')">Per-token Steering</button>
+      </div>
+      <div class="tab-content active" id="s2t0">
+        <div class="code">
+<span class="kw">class</span> <span class="fn">SteeringHook</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, model, steering_vecs, layer_ids, alpha=<span class="nm">10.0</span>):
+        self.vecs = steering_vecs   <span class="cm"># {layer_id: [d_model] tensor}</span>
+        self.alpha = alpha
+        self.hooks = []
+        self._register(model, layer_ids)
+
+    <span class="kw">def</span> <span class="fn">_make_hook</span>(self, layer_id):
+        <span class="kw">def</span> <span class="fn">hook</span>(module, input, output):
+            hidden = output[<span class="nm">0</span>]  <span class="cm"># [batch, seq, d_model]</span>
+            vec = self.vecs[layer_id].to(hidden.device)
+            <span class="cm"># inject into ALL token positions (continuous steering)</span>
+            hidden = hidden + self.alpha * vec.unsqueeze(<span class="nm">0</span>).unsqueeze(<span class="nm">0</span>)
+            <span class="cm"># return modified output, keeping other outputs (attn weights, etc.) intact</span>
+            <span class="kw">return</span> (hidden,) + output[<span class="nm">1</span>:]
+        <span class="kw">return</span> hook
+
+    <span class="kw">def</span> <span class="fn">_register</span>(self, model, layer_ids):
+        <span class="kw">for</span> lid <span class="kw">in</span> layer_ids:
+            h = model.model.layers[lid].register_forward_hook(
+                self._make_hook(lid)
+            )
+            self.hooks.append(h)
+
+    <span class="kw">def</span> <span class="fn">set_alpha</span>(self, alpha):
+        self.alpha = alpha  <span class="cm"># change at runtime — immediate effect</span>
+
+    <span class="kw">def</span> <span class="fn">remove</span>(self):
+        [h.remove() <span class="kw">for</span> h <span class="kw">in</span> self.hooks]
+        self.hooks = []
+
+<span class="cm"># Usage</span>
+steer = SteeringHook(model, clinical_vecs, layer_ids=[<span class="nm">14</span>, <span class="nm">16</span>, <span class="nm">18</span>], alpha=<span class="nm">10.0</span>)
+
+<span class="kw">with</span> torch.no_grad():
+    output = model.generate(input_ids, max_new_tokens=<span class="nm">200</span>)  <span class="cm"># fully steered</span>
+
+steer.remove()  <span class="cm"># clean removal, model returns to baseline</span></div>
+      </div>
+      <div class="tab-content" id="s2t1">
+        <div class="info-box indigo">
+          <span class="hl2">Multi-layer injection</span>: injecting at 3–5 consecutive middle layers is more stable than a single large injection. Reason: the residual stream passes through LayerNorm at each layer, which re-scales it. A single strong injection gets partially suppressed by LayerNorm. Distributing the steering across layers maintains the direction more robustly.<br><br>
+          Formula: inject α/n at n consecutive layers starting from target_layer. For clinical tone: inject at layers 14, 16, 18 with α=4 each (equivalent effect to α=12 at one layer, but much more stable).
+        </div>
+      </div>
+      <div class="tab-content" id="s2t2">
+        <div class="info-box pink">
+          <span class="hl3">Per-token steering</span>: you can change α dynamically as tokens are generated. For example:<br><br>
+          • Amplify steering only when generating clinical terminology (detect via logit distribution)<br>
+          • Reduce steering near punctuation to preserve natural sentence rhythm<br>
+          • Ramp up steering at the start of response, taper toward end<br><br>
+          <div class="code" style="margin-top:8px">
+<span class="kw">def</span> <span class="fn">dynamic_alpha_hook</span>(module, input, output):
+    token_probs = get_last_token_probs()  <span class="cm"># peek at logits</span>
+    <span class="cm"># increase α if model is drifting away from target domain</span>
+    drift = cosine_dist(output[<span class="nm">0</span>][:,-<span class="nm">1</span>,:], target_centroid)
+    alpha = base_alpha * (<span class="nm">1</span> + drift * gain_factor)
+    <span class="kw">return</span> steer(output, alpha)</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="conn">↓</div>
+
+<!-- ══════════════════ S3: HEAD TARGETING ══════════════════ -->
+<div class="step" id="s3">
+  <div class="step-top">
+    <div class="sh">
+      <span class="snum">03</span>
+      <span class="stitle">Surgical Head-Level Targeting</span>
+      <span class="sbadge" style="background:rgba(251,191,36,.08);color:var(--accent4);border:1px solid rgba(251,191,36,.2)">precision</span>
+    </div>
+    <div class="sdesc">
+      Instead of steering the full residual stream, you can target <span class="hl4">specific attention heads</span>. Each head produces an output of dimension d_head that contributes to the residual. By zeroing or scaling specific head outputs, you can suppress behaviors associated with those heads — without affecting others.<br><br>
+      This requires a calibration step: identify which heads are "responsible" for the behavior you want to change. Click heads below to see their simulated contribution.
+    </div>
+    <div style="margin-top:16px">
+      <div class="vlabel">Head contribution map — click heads to ablate (zero out)</div>
+      <canvas id="headCanvas" width="720" height="200" style="width:100%;border-radius:10px"></canvas>
+      <div id="headStats" style="font-family:'DM Mono',monospace;font-size:10px;color:var(--muted);margin-top:8px"></div>
+    </div>
+  </div>
+  <button class="expand-btn" onclick="tog(this)">
+    <span>▸ Causal tracing, head importance scoring, DRESS-style style steering</span>
+    <span class="arr">▾</span>
+  </button>
+  <div class="expand-panel">
+    <div class="epanel-inner">
+      <div class="tabs">
+        <button class="tab active" onclick="swt(this,'s3t0')">Causal Tracing</button>
+        <button class="tab" onclick="swt(this,'s3t1')">DRESS (style editing)</button>
+        <button class="tab" onclick="swt(this,'s3t2')">Code</button>
+      </div>
+      <div class="tab-content active" id="s3t0">
+        <div class="info-box">
+          <span class="hl">Causal tracing</span> (Meng et al. 2022 — ROME): a two-step process to find which heads "cause" a behavior:<br><br>
+          1. <span class="hl2">Corrupt run</span>: add Gaussian noise to input embeddings → get corrupted output<br>
+          2. <span class="hl3">Restore run</span>: run the corrupted model but restore (patch) the clean activation at one specific site (head, layer) at a time<br><br>
+          If restoring head (l, h) recovers the correct output → that head is causally important for that behavior. Repeat for all heads. Build an importance map.<br><br>
+          For our medical assistant: run causal tracing on "clinical vs casual" pairs → identify the 5–8 heads that most strongly encode the formality distinction.
+        </div>
+      </div>
+      <div class="tab-content" id="s3t1">
+        <div class="info-box amber">
+          <span class="hl4">DRESS</span> (NeurIPS 2024): style editing via attention head subspace manipulation. Steps:<br><br>
+          1. Find style subspace: collect style-contrasting pairs → PCA on head output differences → top-k principal components define the "style subspace" for that head<br>
+          2. Project out: remove the style direction from each head's output: out_edited = out - (out · ŝ)ŝ + target_style · ŝ<br>
+          3. Adaptive scaling: scale the edit based on how much that head "contributed" to the style in calibration<br><br>
+          Result: zero-shot style transfer (formal↔casual, english↔chinese formality registers) with better semantic preservation than full activation steering.
+        </div>
+      </div>
+      <div class="tab-content" id="s3t2">
+        <div class="code">
+<span class="cm"># Head-level ablation / steering</span>
+<span class="kw">class</span> <span class="fn">HeadSteering</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, model, target_heads, mode=<span class="st">'ablate'</span>):
+        <span class="cm"># target_heads: list of (layer, head) tuples</span>
+        self.heads = target_heads
+        self.mode = mode   <span class="cm"># 'ablate' | 'scale' | 'steer'</span>
+        self.scale = <span class="nm">0.0</span>  <span class="cm"># 0 = full ablation</span>
+        self.hooks = []
+
+    <span class="kw">def</span> <span class="fn">_hook</span>(self, layer_idx, head_indices):
+        <span class="kw">def</span> <span class="fn">h</span>(module, inp, out):
+            <span class="cm"># out[0]: [batch, seq, n_heads * d_head]</span>
+            B, S, _ = out[<span class="nm">0</span>].shape
+            d_head = module.head_dim
+            n_heads = module.num_heads
+            attn = out[<span class="nm">0</span>].view(B, S, n_heads, d_head)
+            <span class="kw">for</span> hi <span class="kw">in</span> head_indices:
+                attn[:, :, hi, :] *= self.scale  <span class="cm"># ablate or scale</span>
+            <span class="kw">return</span> (attn.view(B, S, -<span class="nm">1</span>),) + out[<span class="nm">1</span>:]
+        <span class="kw">return</span> h
+
+    <span class="kw">def</span> <span class="fn">register</span>(self, model):
+        <span class="cm"># Group heads by layer</span>
+        by_layer = defaultdict(list)
+        <span class="kw">for</span> (l, h) <span class="kw">in</span> self.heads: by_layer[l].append(h)
+        <span class="kw">for</span> l, heads <span class="kw">in</span> by_layer.items():
+            hook = model.model.layers[l].self_attn.register_forward_hook(
+                self._hook(l, heads)
+            )
+            self.hooks.append(hook)</div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="conn">↓</div>
+
+<!-- ══════════════════ S4: WEIGHT UPDATES? ══════════════════ -->
+<div class="step" id="s4">
+  <div class="step-top">
+    <div class="sh">
+      <span class="snum">04</span>
+      <span class="stitle">Can Weights Actually Update at Runtime?</span>
+      <span class="sbadge" style="background:rgba(248,113,113,.08);color:var(--red);border:1px solid rgba(248,113,113,.2)">the hard question</span>
+    </div>
+    <div class="sdesc">
+      Yes — but with major constraints. Standard deployment freezes all weights. To update weights, you need: <span class="hl">(1) a forward pass</span> to compute outputs, <span class="hl2">(2) a loss signal</span> to measure error, <span class="hl3">(3) a backward pass</span> to compute gradients, and <span class="hl4">(4) an optimizer step</span> to update weights. All four are possible on edge devices — but memory and compute explode. The chart below shows what's actually feasible on real hardware.
+    </div>
+    <div style="margin-top:16px">
+      <div class="vlabel">Edge hardware capability vs what's needed</div>
+      <canvas id="hwCanvas" width="720" height="200" style="width:100%;border-radius:10px"></canvas>
+    </div>
+  </div>
+  <button class="expand-btn" onclick="tog(this)">
+    <span>▸ Memory math, gradient storage, what breaks on mobile</span>
+    <span class="arr">▾</span>
+  </button>
+  <div class="expand-panel">
+    <div class="epanel-inner">
+      <div class="tabs">
+        <button class="tab active" onclick="swt(this,'s4t0')">Memory Math</button>
+        <button class="tab" onclick="swt(this,'s4t1')">What Breaks</button>
+        <button class="tab" onclick="swt(this,'s4t2')">Forward-Only Learning</button>
+      </div>
+      <div class="tab-content active" id="s4t0">
+        <div class="cmp" style="grid-template-columns: 1fr 1fr 1fr 1fr">
+          <div class="cc hdr">Model</div><div class="cc hdr">Inference RAM</div><div class="cc hdr">+ Gradients</div><div class="cc hdr">Full Train RAM</div>
+          <div class="cc" style="color:var(--accent)">1B (INT4)</div><div class="cc">~0.5 GB</div><div class="cc" style="color:var(--accent4)">+2 GB</div><div class="cc" style="color:var(--accent3)">~6 GB</div>
+          <div class="cc">3B (INT4)</div><div class="cc">~1.5 GB</div><div class="cc" style="color:var(--accent4)">+6 GB</div><div class="cc" style="color:var(--red)">~18 GB</div>
+          <div class="cc">7B (INT4)</div><div class="cc">~3.5 GB</div><div class="cc" style="color:var(--red)">+14 GB</div><div class="cc" style="color:var(--red)">~42 GB</div>
+          <div class="cc">Phi-3 (3.8B)</div><div class="cc">~2 GB</div><div class="cc" style="color:var(--accent4)">+8 GB</div><div class="cc" style="color:var(--red)">~24 GB</div>
+        </div>
+        <div class="info-box" style="margin-top:12px">
+          Gradient memory = ~2× model memory (FP32 grads of FP16 weights). Optimizer state (Adam = 2 momentum terms) = another 2×. Total: ~6× inference memory for full training. A Raspberry Pi has 4–8GB RAM. An iPhone 15 Pro has 8GB. Conclusion: <span class="hl3">full backprop on any model >1B is borderline impossible on consumer edge devices without gradient checkpointing + partial layer training.</span>
+        </div>
+      </div>
+      <div class="tab-content" id="s4t1">
+        <div class="info-box red">
+          <span class="hlr">What breaks during runtime weight update</span>:<br><br>
+          1. <span class="hl">Catastrophic forgetting</span>: 1–10 gradient steps on new data can overwrite what the model knew. A medical assistant that learns 5 corrections could forget how to spell.<br><br>
+          2. <span class="hl2">Quantization incompatibility</span>: Edge models run INT4/INT8. Gradient math requires FP32. You must dequantize → update → requantize. Rounding error accumulates per step.<br><br>
+          3. <span class="hl3">Thermal throttling</span>: backward pass on a mobile NPU generates heat → device throttles → next forward pass is slower → user experience degrades<br><br>
+          4. <span class="hl4">No training infrastructure</span>: production inference runtimes (llama.cpp, TFLite, ONNX Runtime) don't expose gradient computation. You'd need PyTorch or MLX with autograd.
+        </div>
+      </div>
+      <div class="tab-content" id="s4t2">
+        <div class="info-box green">
+          <span class="hl">Forward-only learning (2024)</span>: Amazon researchers showed you can fine-tune vision-language models using only forward passes — no backprop. Uses perturbation theory: perturb weights slightly, measure output change, estimate gradient from finite differences.<br><br>
+          Cost: 2× forward passes per "gradient" estimate (one base, one perturbed). Memory: same as inference. No autograd needed.<br><br>
+          Viable for: models up to ~7B on devices with ≥4GB RAM. Quality: ~7% below standard backprop fine-tuning. But for 10 domain corrections — close enough.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="conn">↓</div>
+
+<!-- ══════════════════ S5: FAST WEIGHTS / TTT ══════════════════ -->
+<div class="step" id="s5">
+  <div class="step-top">
+    <div class="sh">
+      <span class="snum">05</span>
+      <span class="stitle">Fast Weights & Test-Time Training</span>
+      <span class="sbadge" style="background:rgba(110,231,183,.08);color:var(--accent);border:1px solid rgba(110,231,183,.2)">paradigm shift</span>
+    </div>
+    <div class="sdesc">
+      The cleanest solution: instead of fighting against frozen weights, <span class="hl">design the architecture to have two kinds of weights</span>. <em>Slow weights</em> — frozen, trained offline. <em>Fast weights</em> — a small subnetwork that updates during inference via a self-supervised loss on the current context. The fast weights are the model's "scratchpad memory" that adapts in real time.<br><br>
+      This is Test-Time Training (TTT). The fast weight update is lightweight enough to run during token generation.
+    </div>
+    <div style="margin-top:16px">
+      <div class="vlabel">Two-speed architecture — click to simulate one TTT step</div>
+      <canvas id="tttCanvas" width="720" height="210" style="width:100%;border-radius:10px"></canvas>
+      <div class="row-btns" style="margin-top:10px">
+        <button class="btn btn-g" onclick="tttStep()">▶ Run TTT Step</button>
+        <button class="btn btn-p" onclick="tttReset()">↺ Reset</button>
+        <span id="tttCount" style="font-family:'DM Mono',monospace;font-size:10px;color:var(--muted)">steps: 0</span>
+      </div>
+    </div>
+  </div>
+  <button class="expand-btn" onclick="tog(this)">
+    <span>▸ TTT-Linear, TTT-MLP, inner loop math, meta-learning prerequisite</span>
+    <span class="arr">▾</span>
+  </button>
+  <div class="expand-panel">
+    <div class="epanel-inner">
+      <div class="tabs">
+        <button class="tab active" onclick="swt(this,'s5t0')">TTT Inner Loop</button>
+        <button class="tab" onclick="swt(this,'s5t1')">TTT-E2E (2025)</button>
+        <button class="tab" onclick="swt(this,'s5t2')">Code Skeleton</button>
+      </div>
+      <div class="tab-content active" id="s5t0">
+        <div class="formula">
+          θ_fast_new = θ_fast − η · ∇_θ_fast L_self(x_t)<br>
+          where L_self = next-token prediction loss on context chunk
+        </div>
+        <div class="info-box">
+          At each token (or chunk of tokens), the TTT inner loop performs:<br><br>
+          1. <span class="hl">Self-supervised loss</span>: predict the next token from the current context using only the fast MLP weights as the memory.<br>
+          2. <span class="hl2">1–3 gradient steps</span>: update the fast weights to reduce this loss.<br>
+          3. <span class="hl3">Forward pass</span>: use the updated fast weights to produce the output for the current token.<br><br>
+          The slow Transformer weights handle syntax, world knowledge, instruction following. The fast MLP weights store the compressed "gist" of what the model has read so far — replacing the KV cache entirely.<br><br>
+          Key insight: for our medical assistant — as it reads the patient file, the fast weights compress and memorize it. No matter how long the file, the fast weights are always a fixed size (e.g., 512×512 matrix = 262K parameters).
+        </div>
+      </div>
+      <div class="tab-content" id="s5t1">
+        <div class="info-box amber">
+          <span class="hl4">TTT-E2E</span> (NVIDIA/Stanford, Dec 2025): the key improvement over earlier TTT is making the training loop <em>end-to-end</em> — the meta-learning at training time explicitly optimizes for fast adaptation at test time (MAML-style double loop).<br><br>
+          Result: 3B parameter TTT-E2E model matches full-attention Transformer quality at 128K context, while running at <span class="hl">constant latency regardless of context length</span> — 2.7× faster than full attention at 128K, 35× faster at 2M tokens.<br><br>
+          For edge: a 125M parameter TTT-E2E model could maintain a "memory" of everything it's processed on-device, in a fixed-size fast-weight state. The slow weights are frozen (inference-only). Only the fast weights update — they're tiny (~1M parameters).
+        </div>
+      </div>
+      <div class="tab-content" id="s5t2">
+        <div class="code">
+<span class="kw">class</span> <span class="fn">TTTLayer</span>(nn.Module):
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, d_model, fast_hidden=<span class="nm">256</span>):
+        super().__init__()
+        <span class="cm"># Slow weights — frozen at inference</span>
+        self.W_q = nn.Linear(d_model, d_model)  <span class="cm"># standard QKV projections</span>
+        self.W_k = nn.Linear(d_model, d_model)
+        self.W_v = nn.Linear(d_model, d_model)
+
+        <span class="cm"># Fast weights — the tiny updatable memory MLP</span>
+        self.fast_w1 = nn.Parameter(torch.randn(d_model, fast_hidden) * <span class="nm">0.01</span>)
+        self.fast_w2 = nn.Parameter(torch.randn(fast_hidden, d_model) * <span class="nm">0.01</span>)
+        self.eta = <span class="nm">0.01</span>  <span class="cm"># inner loop learning rate</span>
+
+    <span class="kw">def</span> <span class="fn">forward</span>(self, x):
+        <span class="cm"># self-supervised loss: predict x[t] from x[:t] via fast weights</span>
+        pred = torch.relu(x @ self.fast_w1) @ self.fast_w2
+        loss = F.mse_loss(pred[:, :-<span class="nm">1</span>], x[:, <span class="nm">1</span>:].detach())
+
+        <span class="cm"># update fast weights (1 gradient step in-place)</span>
+        grad_w1, grad_w2 = torch.autograd.grad(loss, [self.fast_w1, self.fast_w2])
+        self.fast_w1.data -= self.eta * grad_w1
+        self.fast_w2.data -= self.eta * grad_w2
+
+        <span class="cm"># produce output using updated fast weights + standard attention</span>
+        mem = torch.relu(x @ self.fast_w1) @ self.fast_w2
+        <span class="kw">return</span> x + mem  <span class="cm"># add to residual stream</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="conn">↓</div>
+
+<!-- ══════════════════ S6: LORA AS LIVE ADAPTER ══════════════════ -->
+<div class="step" id="s6">
+  <div class="step-top">
+    <div class="sh">
+      <span class="snum">06</span>
+      <span class="stitle">LoRA as a Live Adapter — Hot-Swap Weight Updates</span>
+      <span class="sbadge" style="background:rgba(129,140,248,.08);color:var(--accent2);border:1px solid rgba(129,140,248,.2)">production viable</span>
+    </div>
+    <div class="sdesc">
+      LoRA decomposes a weight update ΔW into two small matrices: <span class="hl">ΔW = A · B</span> where A ∈ ℝ^(d×r) and B ∈ ℝ^(r×d), rank r &lt;&lt; d. For a 4096×4096 weight matrix: full update = 16M parameters. LoRA r=8: 65K parameters — <span class="hl2">256× smaller</span>. These small matrices live on top of the frozen base model and can be <span class="hl3">updated, swapped, and loaded at runtime</span> with almost no memory overhead.
+    </div>
+    <div style="margin-top:16px">
+      <div class="vlabel">LoRA update — slide rank r to see parameter count</div>
+      <canvas id="loraCanvas" width="720" height="160" style="width:100%;border-radius:10px"></canvas>
+      <div class="sl-row" style="margin-top:10px">
+        <label>Rank r:</label>
+        <input type="range" min="1" max="64" value="8" id="rankSlider" oninput="updateLora()">
+        <span class="sl-val" id="rankVal">r = 8</span>
+      </div>
+    </div>
+  </div>
+  <button class="expand-btn" onclick="tog(this)">
+    <span>▸ On-device LoRA update loop, gradient checkpointing, QLoRA on-edge</span>
+    <span class="arr">▾</span>
+  </button>
+  <div class="expand-panel">
+    <div class="epanel-inner">
+      <div class="tabs">
+        <button class="tab active" onclick="swt(this,'s6t0')">On-Device Update Loop</button>
+        <button class="tab" onclick="swt(this,'s6t1')">Gradient Checkpointing</button>
+        <button class="tab" onclick="swt(this,'s6t2')">QLoRA on Edge</button>
+      </div>
+      <div class="tab-content active" id="s6t0">
+        <div class="code">
+<span class="cm"># On-device LoRA training loop — minimal memory footprint</span>
+<span class="kw">class</span> <span class="fn">EdgeLoRAAdapter</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, model, target_modules, rank=<span class="nm">4</span>, alpha=<span class="nm">8</span>):
+        self.adapters = {}
+        self.scale = alpha / rank
+
+        <span class="kw">for</span> name, module <span class="kw">in</span> model.named_modules():
+            <span class="kw">if</span> any(t <span class="kw">in</span> name <span class="kw">for</span> t <span class="kw">in</span> target_modules):
+                d_in, d_out = module.weight.shape
+                <span class="cm"># Freeze base weights</span>
+                module.weight.requires_grad = <span class="dc">False</span>
+                <span class="cm"># Add LoRA matrices (only these get gradients)</span>
+                A = nn.Parameter(torch.randn(d_in, rank) * <span class="nm">0.02</span>)
+                B = nn.Parameter(torch.zeros(rank, d_out))
+                self.adapters[name] = (A, B, module)
+
+    <span class="kw">def</span> <span class="fn">learn_from_correction</span>(self, input_text, target_text, steps=<span class="nm">3</span>):
+        <span class="cm"># Doctor corrects: "headache" → "cephalgia"</span>
+        optimizer = torch.optim.SGD(
+            [p <span class="kw">for</span> (A, B, _) <span class="kw">in</span> self.adapters.values() <span class="kw">for</span> p <span class="kw">in</span> [A, B]],
+            lr=<span class="nm">5e-4</span>
+        )
+        <span class="kw">for</span> _ <span class="kw">in</span> range(steps):  <span class="cm"># 3 steps = fast, low forgetting risk</span>
+            self._inject_adapters()
+            loss = cross_entropy_loss(model(input_text), target_text)
+            loss.backward()      <span class="cm"># only flows to A,B matrices (64K params, not 7B)</span>
+            optimizer.step()
+            optimizer.zero_grad()
+            self._detach_adapters()
+
+    <span class="kw">def</span> <span class="fn">save</span>(self, path):
+        <span class="cm"># Save ONLY adapter weights — ~250KB for rank=4, not 14GB</span>
+        torch.save({n: (A.data, B.data) <span class="kw">for</span> n,(A,B,_) <span class="kw">in</span> self.adapters.items()}, path)</div>
+      </div>
+      <div class="tab-content" id="s6t1">
+        <div class="info-box amber">
+          <span class="hl4">Gradient checkpointing</span>: during backprop, normally all activations are kept in memory (one per layer per token). For a 32-layer model at seq=512: 32 × 512 × 4096 × 4 bytes ≈ 256MB of activations <em>just for the forward pass</em>.<br><br>
+          Gradient checkpointing discards intermediate activations and recomputes them on demand during backprop. Memory reduction: ~8×. Cost: ~30% more compute (each activation recomputed once). Net result: training a 1B LoRA r=4 requires only ~800MB RAM peak — fits on an iPhone 15 Pro.
+        </div>
+        <div class="formula">Memory(checkpoint) ≈ O(√n) layers kept<br>vs Memory(standard) ≈ O(n) layers kept</div>
+      </div>
+      <div class="tab-content" id="s6t2">
+        <div class="info-box pink">
+          <span class="hl3">QLoRA on edge</span>: Dettmers et al. showed you can keep base model in INT4/INT8, and only the LoRA matrices A,B in FP16/FP32. Since A and B are tiny, this adds negligible memory. Gradient flows through the dequantize operation (straight-through estimator) into A,B only.<br><br>
+          For our medical assistant: 7B model in INT4 = 3.5GB. LoRA r=4 adapters = 50MB. Total RAM for on-device fine-tuning with gradient checkpointing: ~5GB peak. Just fits on a modern iPhone or high-end Android. Jetson Nano (4GB) can do 1B QLoRA updates in real-time.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="conn">↓</div>
+
+<!-- ══════════════════ S7: TTT-E2E ══════════════════ -->
+<div class="step" id="s7">
+  <div class="step-top">
+    <div class="sh">
+      <span class="snum">07</span>
+      <span class="stitle">Meta-Learning: Teaching the Model to Learn Fast</span>
+      <span class="sbadge" style="background:rgba(244,114,182,.08);color:var(--accent3);border:1px solid rgba(244,114,182,.2)">MAML + inner loop</span>
+    </div>
+    <div class="sdesc">
+      The problem with naive runtime weight updates: the model wasn't trained to update itself efficiently. 3 SGD steps may help on one thing and break 10 others. <span class="hl3">Meta-learning</span> solves this by training the model's initialization to be "fast-adaptable" — close to the optimal parameters for any task after just 1–3 gradient steps.<br><br>
+      <span class="hl">MAML</span> (Finn et al. 2017): train θ such that θ + 1 gradient step → task-optimal. The outer loop minimises the post-adaptation loss across all tasks. The model learns to be good at <em>learning</em>, not just good at tasks.
+    </div>
+    <div style="margin-top:16px">
+      <div class="vlabel">MAML two-loop training — outer loop (meta) + inner loop (task adaptation)</div>
+      <canvas id="mamlCanvas" width="720" height="200" style="width:100%;border-radius:10px"></canvas>
+    </div>
+  </div>
+  <button class="expand-btn" onclick="tog(this)">
+    <span>▸ MAML math, FOMAML (cheaper), Reptile, In-Place TTT</span>
+    <span class="arr">▾</span>
+  </button>
+  <div class="expand-panel">
+    <div class="epanel-inner">
+      <div class="tabs">
+        <button class="tab active" onclick="swt(this,'s7t0')">MAML</button>
+        <button class="tab" onclick="swt(this,'s7t1')">FOMAML / Reptile</button>
+        <button class="tab" onclick="swt(this,'s7t2')">In-Place TTT</button>
+      </div>
+      <div class="tab-content active" id="s7t0">
+        <div class="formula">
+          θ* = argmin_θ Σ_task E[ L(θ − α∇L(θ, D_support), D_query) ]<br>
+          outer loop: θ ← θ − β∇_θ [post-adaptation loss]
+        </div>
+        <div class="info-box">
+          MAML requires <span class="hl">second-order gradients</span>: gradients of gradients. This is expensive (2× memory, 2× compute for the backward pass). For LLMs, this means MAML pretraining is ~3× slower than standard pretraining.<br><br>
+          But once trained — at inference, you only need the inner loop: 1–3 gradient steps on a handful of examples. These steps are cheap, fast, and reliable because the model's initialization was specifically optimized to be in a fast-adaptation regime.
+        </div>
+      </div>
+      <div class="tab-content" id="s7t1">
+        <div class="info-box amber">
+          <span class="hl4">FOMAML</span> (First-Order MAML): ignore the second-order terms. Approximate the meta-gradient as just the first-order gradient at the adapted parameters. 2× cheaper. 90% of MAML quality.<br><br>
+          <span class="hl2">Reptile</span> (OpenAI 2018): even simpler — no explicit meta-gradient. Just take multiple SGD steps on each task and move θ toward the task-adapted parameters:
+          <div class="formula" style="margin-top:8px">θ ← θ + ε(θ_task_adapted − θ)</div>
+          No second-order computation at all. Reptile works well for adaptation tasks like domain shift — ideal for our edge medical assistant.
+        </div>
+      </div>
+      <div class="tab-content" id="s7t2">
+        <div class="info-box pink">
+          <span class="hl3">In-Place TTT</span> (OpenReview 2025): a plug-in that adds TTT ability to any existing LLM without retraining from scratch. Key innovation: treats the <span class="hl">final projection matrix of MLP blocks</span> as the fast weights. Only these matrices update during inference — everything else is frozen.<br><br>
+          Why the MLP output projection? FFN layers are "key-value memory" (Geva et al. 2021) — they store factual associations. The output projection maps the retrieved memory to the output space. Updating it at runtime allows the model to "add" new associations without touching the attention mechanism or embedding space.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="conn">↓</div>
+
+<!-- ══════════════════ S8: EDGE REALITY ══════════════════ -->
+<div class="step" id="s8">
+  <div class="step-top">
+    <div class="sh">
+      <span class="snum">08</span>
+      <span class="stitle">Edge Device Reality Check</span>
+      <span class="sbadge" style="background:rgba(251,191,36,.08);color:var(--accent4);border:1px solid rgba(251,191,36,.2)">hardware</span>
+    </div>
+    <div class="sdesc">
+      Each approach has hard constraints on real hardware. An iPhone 15 Pro Neural Engine can do 35 TOPS but has no gradient support in Core ML. A Jetson Orin has 275 TOPS and full CUDA+autograd. A Raspberry Pi 5 has 13.8 TOPS via the RP1 chip but needs software gradient emulation. <span class="hl">Your runtime framework choice determines which techniques are even possible.</span>
+    </div>
+    <div style="margin-top:16px">
+      <div class="vlabel">Technique feasibility by device — click a device row</div>
+      <div id="deviceTable"></div>
+    </div>
+  </div>
+  <button class="expand-btn" onclick="tog(this)">
+    <span>▸ Framework comparison: PyTorch Mobile, Core ML, ONNX, llama.cpp, MLX</span>
+    <span class="arr">▾</span>
+  </button>
+  <div class="expand-panel">
+    <div class="epanel-inner">
+      <div class="tabs">
+        <button class="tab active" onclick="swt(this,'s8t0')">Framework Support</button>
+        <button class="tab" onclick="swt(this,'s8t1')">Apple Silicon (MLX)</button>
+        <button class="tab" onclick="swt(this,'s8t2')">Jetson / Linux Edge</button>
+      </div>
+      <div class="tab-content active" id="s8t0">
+        <div class="cmp" style="grid-template-columns:130px 1fr 1fr 1fr 1fr">
+          <div class="cc hdr">Framework</div><div class="cc hdr">Inference</div><div class="cc hdr">Activation hooks</div><div class="cc hdr">Gradient</div><div class="cc hdr">Weight update</div>
+          <div class="cc">PyTorch Mobile</div><div class="cc" style="color:var(--accent)">✓</div><div class="cc" style="color:var(--accent)">✓</div><div class="cc" style="color:var(--accent4)">limited</div><div class="cc" style="color:var(--accent4)">limited</div>
+          <div class="cc">Apple MLX</div><div class="cc" style="color:var(--accent)">✓</div><div class="cc" style="color:var(--accent)">✓</div><div class="cc" style="color:var(--accent)">✓ full</div><div class="cc" style="color:var(--accent)">✓ full</div>
+          <div class="cc">Core ML</div><div class="cc" style="color:var(--accent)">✓</div><div class="cc" style="color:var(--red)">✗</div><div class="cc" style="color:var(--red)">✗</div><div class="cc" style="color:var(--red)">✗</div>
+          <div class="cc">llama.cpp</div><div class="cc" style="color:var(--accent)">✓</div><div class="cc" style="color:var(--red)">✗</div><div class="cc" style="color:var(--red)">✗</div><div class="cc" style="color:var(--red)">✗</div>
+          <div class="cc">ONNX Runtime</div><div class="cc" style="color:var(--accent)">✓</div><div class="cc" style="color:var(--red)">✗</div><div class="cc" style="color:var(--red)">✗</div><div class="cc" style="color:var(--red)">✗</div>
+          <div class="cc">TFLite</div><div class="cc" style="color:var(--accent)">✓</div><div class="cc" style="color:var(--red)">✗</div><div class="cc" style="color:var(--accent4)">experimental</div><div class="cc" style="color:var(--accent4)">experimental</div>
+        </div>
+        <div class="info-box" style="margin-top:12px">
+          <span class="hl">Conclusion</span>: If you want full runtime weight update control on edge, <span class="hl2">MLX on Apple Silicon</span> is the best production-ready option today. PyTorch Mobile works but is slower. For Android/Jetson, PyTorch Mobile or a custom C++ runtime with libtorch is the path.
+        </div>
+      </div>
+      <div class="tab-content" id="s8t1">
+        <div class="info-box amber">
+          <span class="hl4">Apple MLX</span> (Apple, 2023): ML framework for Apple Silicon that uses unified memory (CPU+GPU share the same physical RAM). Key advantages for runtime learning:<br><br>
+          • Lazy evaluation — no computation until result is needed. Build the update graph, then execute<br>
+          • Full autograd on Metal GPU<br>
+          • INT4 quantization with gradient support (QLoRA-style)<br>
+          • No CUDA required — runs on M1/M2/M3 Mac, A16/A17 iPhone<br><br>
+          For our medical assistant: 1B model + LoRA r=4 adapters, MLX on iPhone 15 Pro = ~1.2GB RAM, 3 gradient steps on a correction in &lt;500ms. Feasible in production.
+        </div>
+      </div>
+      <div class="tab-content" id="s8t2">
+        <div class="info-box pink">
+          <span class="hl3">Jetson Orin</span>: NVIDIA's edge GPU. Full CUDA support, 64GB unified memory on Orin AGX. Runs any standard PyTorch code with autograd. Can run 7B QLoRA fine-tuning in ~30 seconds per correction batch. The "server in a box" for edge AI.<br><br>
+          For less powerful Linux edge (Raspberry Pi, NXP i.MX): use forward-only learning (no autograd) or activation steering only. Steering vectors can be applied in pure C++ / numpy via matrix multiplication — no ML framework needed. Store vectors on disk (4096 floats = 16KB), load at startup.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="conn">↓</div>
+
+<!-- ══════════════════ S9: FULL STACK ══════════════════ -->
+<div class="step" id="s9">
+  <div class="step-top">
+    <div class="sh">
+      <span class="snum">09</span>
+      <span class="stitle">Full Controlled Runtime Architecture</span>
+      <span class="sbadge" style="background:rgba(110,231,183,.08);color:var(--accent);border:1px solid rgba(110,231,183,.2)">production blueprint</span>
+    </div>
+    <div class="sdesc">
+      Putting it all together: a complete runtime that supports activation steering (zero overhead), LoRA hot-swap updates (low overhead), and optional TTT fast-weight updates (medium overhead). All three can coexist in the same runtime. The key: <span class="hl">each layer is a pipeline</span> — base forward → hook interception → activation patch → adapter delta → output. Each stage can be enabled/disabled independently.
+    </div>
+    <div style="margin-top:16px">
+      <div class="vlabel">Full runtime pipeline — click any stage</div>
+      <div id="fullStack"></div>
+    </div>
+  </div>
+  <button class="expand-btn" onclick="tog(this)">
+    <span>▸ Complete reference code, safety guards, persistence</span>
+    <span class="arr">▾</span>
+  </button>
+  <div class="expand-panel">
+    <div class="epanel-inner">
+      <div class="tabs">
+        <button class="tab active" onclick="swt(this,'s9t0')">Master Controller</button>
+        <button class="tab" onclick="swt(this,'s9t1')">Safety Guards</button>
+        <button class="tab" onclick="swt(this,'s9t2')">Persistence</button>
+      </div>
+      <div class="tab-content active" id="s9t0">
+        <div class="code">
+<span class="kw">class</span> <span class="fn">EdgeRuntimeController</span>:
+    <span class="st">"""
+    Full runtime that combines:
+    1. Activation steering (zero overhead — just vector addition)
+    2. LoRA adapters (hot-swappable, ~50KB overhead)
+    3. TTT fast weights (optional, small gradient at each step)
+    """</span>
+
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, model, config):
+        self.model = model
+        self.steering = SteeringHook(model, {}, [], alpha=<span class="nm">0</span>)
+        self.lora = EdgeLoRAAdapter(model, config.lora_modules, rank=config.rank)
+        self.ttt = TTTLayer(config.d_model) <span class="kw">if</span> config.use_ttt <span class="kw">else</span> <span class="dc">None</span>
+        self.memory_guard = MemoryGuard(max_mb=config.max_memory_mb)
+
+    <span class="kw">def</span> <span class="fn">set_concept</span>(self, steering_vecs, alpha=<span class="nm">10.0</span>, layers=<span class="dc">None</span>):
+        <span class="cm"># Zero-overhead steering — just replace hook vectors</span>
+        self.steering.remove()
+        self.steering = SteeringHook(self.model, steering_vecs,
+                                     layers <span class="kw">or</span> [<span class="nm">14</span>,<span class="nm">16</span>,<span class="nm">18</span>], alpha)
+
+    <span class="kw">def</span> <span class="fn">learn</span>(self, input_text, target_text):
+        <span class="cm"># LoRA weight update from a correction</span>
+        <span class="kw">if</span> self.memory_guard.safe():
+            self.lora.learn_from_correction(input_text, target_text, steps=<span class="nm">3</span>)
+        <span class="kw">else</span>:
+            <span class="cm"># Fall back to steering-only if memory is low</span>
+            self.update_steering_from_example(input_text, target_text)
+
+    <span class="kw">def</span> <span class="fn">generate</span>(self, prompt, **kwargs):
+        <span class="kw">with</span> self.memory_guard:
+            <span class="kw">return</span> self.model.generate(
+                prompt, hooks=self.steering, adapters=self.lora, **kwargs
+            )
+
+    <span class="kw">def</span> <span class="fn">save_state</span>(self, path):
+        <span class="cm"># Save ONLY deltas — steering vecs (~64KB), LoRA (~250KB), TTT (~1MB)</span>
+        <span class="cm"># Never re-save the 7GB base model</span>
+        torch.save({
+            <span class="st">'steering_vecs'</span>: self.steering.vecs,
+            <span class="st">'lora_adapters'</span>: self.lora.get_state_dict(),
+            <span class="st">'ttt_weights'</span>: self.ttt.state_dict() <span class="kw">if</span> self.ttt <span class="kw">else</span> <span class="dc">None</span>
+        }, path)  <span class="cm"># total: ~1.3MB vs 14GB full checkpoint</span></div>
+      </div>
+      <div class="tab-content" id="s9t1">
+        <div class="info-box red">
+          <span class="hlr">Critical safety guards you MUST implement</span>:<br><br>
+          1. <span class="hl">Forgetting detector</span>: evaluate on a held-out set after each LoRA update. If perplexity on base tasks rises >5%, roll back the update.<br>
+          2. <span class="hl2">Steering coherence check</span>: after steering, run a 20-token sample. If entropy is very low (model collapsed to one token) or very high (incoherence), reduce α by half.<br>
+          3. <span class="hl3">Memory watchdog</span>: monitor RSS memory every 10 tokens. If approaching device limit, disable gradient-based updates and fall back to steering-only.<br>
+          4. <span class="hl4">Update rate limiter</span>: cap LoRA updates at N per hour to prevent adversarial inputs from steering the model in harmful directions through repeated corrections.<br>
+          5. <span class="hlr">Ephemeral mode</span>: for privacy-sensitive domains, run all weight updates in a session-scoped RAM buffer. On session end, discard all deltas — base model untouched.
+        </div>
+      </div>
+      <div class="tab-content" id="s9t2">
+        <div class="info-box green">
+          <span class="hl">Persistence strategy</span> — what to save vs discard:<br><br>
+          Steering vectors: 32 layers × 4096 dims × 4 bytes = <span class="hl2">512KB per concept</span>. Store dozens on-device.<br>
+          LoRA adapters: 2 matrices × 4096 × r=8 × 4 bytes × 32 layers ≈ <span class="hl2">8MB per fine-tuned persona</span>. Store multiple user profiles.<br>
+          TTT fast weights: 512×512 per TTT layer × ~8 TTT layers ≈ <span class="hl2">16MB per context session</span>.<br><br>
+          Total personalisation state for our medical assistant: steering vecs (5 concepts) + LoRA adapters (doctor's style) + session TTT = <span class="hl3">~30MB</span>. The base model stays as a single shared 7GB file. Multiple users can have different 30MB personalisation packs on the same device.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</div><!-- /wrap -->
+
+<script>
+// ═══════════════ UTILS ═══════════════
+function tog(btn){btn.classList.toggle('open');btn.nextElementSibling.classList.toggle('open');}
+function swt(el,id){const p=el.closest('.epanel-inner');p.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));p.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));el.classList.add('active');document.getElementById(id).classList.add('active');}
+const obs=new IntersectionObserver(es=>es.forEach(e=>{if(e.isIntersecting)e.target.classList.add('vis');}),{threshold:.04});
+document.querySelectorAll('.step').forEach(s=>obs.observe(s));
+const navObs=new IntersectionObserver(es=>es.forEach(e=>{if(e.isIntersecting)document.querySelectorAll('.snav a').forEach(a=>a.classList.toggle('on',a.getAttribute('href')==='#'+e.target.id));}),{threshold:.25});
+document.querySelectorAll('.step[id]').forEach(s=>navObs.observe(s));
+
+// ═══════════════ S0: RESIDUAL STREAM ═══════════════
+function drawStream(){
+  const c=document.getElementById('streamCanvas');if(!c)return;
+  const ctx=c.getContext('2d'),W=c.width,H=c.height;
+  ctx.clearRect(0,0,W,H);ctx.fillStyle='#0d0d12';ctx.fillRect(0,0,W,H);
+  const layers=['Embed','Layer 0','Layer 1','...','Layer L-1','Output'];
+  const nx=layers.length,cellW=W/nx;
+  const streamY=H/2;
+  // stream line
+  ctx.strokeStyle='rgba(110,231,183,.25)';ctx.lineWidth=2;
+  ctx.beginPath();ctx.moveTo(0,streamY);ctx.lineTo(W,streamY);ctx.stroke();
+  layers.forEach((l,i)=>{
+    const x=i*cellW+cellW/2;
+    // residual add node
+    ctx.beginPath();ctx.arc(x,streamY,18,0,Math.PI*2);
+    ctx.fillStyle='rgba(129,140,248,.15)';ctx.fill();
+    ctx.strokeStyle='rgba(129,140,248,.5)';ctx.lineWidth=1.5;ctx.stroke();
+    ctx.fillStyle='#818cf8';ctx.font='bold 13px Syne,sans-serif';ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillText('+',x,streamY);
+    // label
+    ctx.fillStyle='rgba(90,100,120,.8)';ctx.font='9px DM Mono,monospace';
+    ctx.fillText(l,x,H-10);
+    // attn + ffn arrow
+    if(i>0&&i<layers.length-1){
+      ctx.strokeStyle='rgba(244,114,182,.4)';ctx.lineWidth=1;ctx.setLineDash([3,3]);
+      ctx.beginPath();ctx.moveTo(x,streamY-18);ctx.lineTo(x,22);ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle='rgba(244,114,182,.7)';ctx.font='8px DM Mono,monospace';
+      ctx.fillText('Attn+FFN',x,14);
+    }
+    // steering injection arrow (at layer 2)
+    if(i===2){
+      ctx.strokeStyle='rgba(251,191,36,.8)';ctx.lineWidth=2;
+      ctx.beginPath();ctx.moveTo(x+30,streamY+50);ctx.lineTo(x+5,streamY+22);ctx.stroke();
+      ctx.fillStyle='#fbbf24';ctx.font='9px DM Mono,monospace';ctx.textAlign='left';
+      ctx.fillText('← inject α·v here',x+32,streamY+55);
+    }
+  });
+  ctx.fillStyle='rgba(110,231,183,.6)';ctx.font='9px DM Mono,monospace';ctx.textAlign='left';
+  ctx.fillText('residual stream h',6,streamY-24);
+}
+drawStream();
+
+// ═══════════════ S1: EXTRACTION STEPS ═══════════════
+const EXTRACT_STEPS=[
+  {title:'Step 1 — Build Contrastive Pairs',color:'var(--accent)',
+   body:`Positive (clinical): "Patient presents with acute cephalgia, photophobia, and nuchal rigidity"<br>Negative (casual): "The patient has a really bad headache, they hate light and their neck hurts"<br><br>You need ~20–50 pairs for robust vector extraction. Minimum viable: 5 pairs.`},
+  {title:'Step 2 — Register Forward Hooks',color:'var(--accent2)',
+   body:`Attach a hook to every transformer layer. On each forward pass, the hook captures the residual stream activation at the LAST token position. Shape: [1, d_model] per layer.`},
+  {title:'Step 3 — Run Both Sets',color:'var(--accent3)',
+   body:`Run all positive texts → collect activations[layer] per text. Run all negative texts → same. Result: two sets of [n_texts, d_model] matrices, one per layer.`},
+  {title:'Step 4 — Compute Mean Difference',color:'var(--accent4)',
+   body:`steering_vec[layer] = mean(positive_acts[layer]) − mean(negative_acts[layer])<br>This is now a [d_model] vector pointing FROM casual language TOWARD clinical language in the residual stream space at that layer.`},
+  {title:'Step 5 — Normalise & Select Layer',color:'var(--accent)',
+   body:`Normalise: steering_vec /= ||steering_vec||<br>Select the best layer: test injection at layers 8, 12, 16, 20, 24. Pick the layer where steering produces the most consistent clinical output with fewest artifacts. For this example: layer 16 works best.`},
+];
+let extractIdx=0;
+function renderExtract(){
+  const el=document.getElementById('extractSteps');
+  if(extractIdx===0){el.innerHTML=`<div style="font-family:'DM Mono',monospace;font-size:11px;color:var(--muted);padding:8px">Press NEXT to begin the extraction pipeline →</div>`;return;}
+  const steps=EXTRACT_STEPS.slice(0,extractIdx);
+  el.innerHTML=steps.map((s,i)=>`
+    <div style="padding:8px 12px;border-left:2px solid ${s.color};margin:6px 0;animation:fUp .3s ease">
+      <div style="font-family:'DM Mono',monospace;font-size:11px;color:${s.color};margin-bottom:4px">${s.title}</div>
+      <div style="font-family:'DM Mono',monospace;font-size:10px;color:var(--muted);line-height:1.75">${s.body}</div>
+    </div>
+  `).join('');
+  document.getElementById('extractNum').textContent=`${extractIdx} / 5`;
+}
+function extractNext(){if(extractIdx<5){extractIdx++;renderExtract();}}
+function extractReset(){extractIdx=0;renderExtract();}
+renderExtract();
+
+// ═══════════════ S2: INJECTION CANVAS ═══════════════
+const CONCEPTS=[
+  {name:'Generic clinical',alpha_thresh:0},
+  {name:'Formal register',alpha_thresh:3},
+  {name:'Clinical domain vocab',alpha_thresh:7},
+  {name:'Latin/Greek terms',alpha_thresh:11},
+  {name:'Full medical register',alpha_thresh:16},
+];
+const OUTPUTS=[
+  'The patient has a headache, some light sensitivity, and neck pain.',
+  'The patient is experiencing headache, photosensitivity, and neck stiffness.',
+  'The patient presents with headache, photophobia, and cervical rigidity.',
+  'The patient exhibits cephalgia, photophobia, and nuchal rigidity.',
+  'Patient presents with acute cephalgia, photophobia, and nuchal rigidity. Differential: meningitis, migraine with aura.',
+];
+function updateInj(){
+  const alpha=parseFloat(document.getElementById('alphaSlider').value);
+  document.getElementById('alphaVal').textContent=`α = ${alpha.toFixed(1)}`;
+  drawInjCanvas(alpha);
+  const idx=Math.min(4,Math.floor(alpha/4));
+  document.getElementById('injOutput').innerHTML=`<span style="color:var(--muted)">Output: </span><span style="color:var(--accent)">${OUTPUTS[idx]}</span>`;
+}
+function drawInjCanvas(alpha){
+  const c=document.getElementById('injCanvas');if(!c)return;
+  const ctx=c.getContext('2d'),W=c.width,H=c.height;
+  ctx.clearRect(0,0,W,H);ctx.fillStyle='#0d0d12';ctx.fillRect(0,0,W,H);
+  const nLayers=32,layerW=(W-40)/nLayers,mid=H/2;
+  // Draw per-layer activations as bar chart
+  for(let i=0;i<nLayers;i++){
+    const x=20+i*layerW;
+    // baseline residual stream height
+    const base=40+Math.sin(i*0.5)*12+Math.cos(i*0.3)*8;
+    // steering effect peaks at layers 14–18
+    const steerEffect=alpha*Math.exp(-0.08*(i-16)**2);
+    const total=base+steerEffect;
+    // Base
+    ctx.fillStyle='rgba(90,100,120,0.4)';
+    ctx.fillRect(x,mid-base/2,layerW-2,base);
+    // Steering delta
+    if(steerEffect>0.5){
+      ctx.fillStyle=`rgba(110,231,183,${Math.min(.8,steerEffect/20)})`;
+      ctx.fillRect(x,mid-base/2-steerEffect,layerW-2,steerEffect);
+    }
+    // Injection marker
+    if(i===14||i===16||i===18){
+      ctx.strokeStyle='rgba(244,114,182,.8)';ctx.lineWidth=1;
+      ctx.beginPath();ctx.moveTo(x+layerW/2,mid-total/2-5);ctx.lineTo(x+layerW/2,mid-total/2-18);ctx.stroke();
+      ctx.fillStyle='rgba(244,114,182,.8)';ctx.font='8px DM Mono,monospace';ctx.textAlign='center';
+      ctx.fillText('↑',x+layerW/2,mid-total/2-20);
+    }
+  }
+  ctx.fillStyle='rgba(90,100,120,.6)';ctx.font='9px DM Mono,monospace';ctx.textAlign='left';
+  ctx.fillText('residual stream magnitude across 32 layers',22,14);
+  ctx.fillStyle='rgba(110,231,183,.6)';ctx.textAlign='right';
+  ctx.fillText('green = steering delta',W-8,14);
+  ctx.fillStyle='rgba(244,114,182,.6)';ctx.textAlign='center';
+  ctx.fillText('injection points (L14, L16, L18)',W/2,H-6);
+}
+updateInj();
+
+// ═══════════════ S3: HEAD CANVAS ═══════════════
+const ablatedHeads=new Set();
+const headData=Array.from({length:32},()=>Array.from({length:8},()=>({
+  importance:Math.random(),
+  type:['syntax','semantic','position','copy','name-recall','style','domain','none'][Math.floor(Math.random()*8)]
+})));
+function drawHeadCanvas(){
+  const c=document.getElementById('headCanvas');if(!c)return;
+  const ctx=c.getContext('2d'),W=c.width,H=c.height;
+  ctx.clearRect(0,0,W,H);ctx.fillStyle='#0d0d12';ctx.fillRect(0,0,W,H);
+  const nL=16,nH=8,cW=(W-20)/(nH+1),cH=(H-20)/nL;
+  ctx.fillStyle='rgba(90,100,120,.6)';ctx.font='9px DM Mono,monospace';ctx.textAlign='center';
+  for(let h=0;h<nH;h++) ctx.fillText(`H${h}`,20+(h+0.5)*cW,14);
+  for(let l=0;l<nL;l++){
+    ctx.fillStyle='rgba(90,100,120,.5)';ctx.textAlign='right';
+    ctx.fillText(`L${l}`,16,20+(l+0.5)*cH+4);
+    for(let h=0;h<nH;h++){
+      const x=20+(h+0.5)*cW,y=20+(l+0.5)*cH;
+      const key=`${l}-${h}`;
+      const isAblated=ablatedHeads.has(key);
+      const imp=headData[l][h].importance;
+      ctx.fillStyle=isAblated?'rgba(248,113,113,.15)':`rgba(129,140,248,${imp*0.7+0.1})`;
+      ctx.strokeStyle=isAblated?'rgba(248,113,113,.8)':'rgba(129,140,248,.3)';
+      ctx.lineWidth=isAblated?2:0.5;
+      ctx.beginPath();ctx.roundRect(x-cW/2+2,y-cH/2+2,cW-4,cH-4,3);ctx.fill();ctx.stroke();
+      if(isAblated){ctx.fillStyle='rgba(248,113,113,.8)';ctx.font='9px DM Mono,monospace';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText('✗',x,y);}
+    }
+  }
+  const aCount=ablatedHeads.size;
+  document.getElementById('headStats').textContent=aCount===0?'No heads ablated — click heads in the grid above to ablate them':`${aCount} heads ablated. Estimated behavior change: ${(aCount*4.2).toFixed(0)}% shift in output distribution`;
+}
+document.getElementById('headCanvas').addEventListener('click',e=>{
+  const c=document.getElementById('headCanvas');
+  const rect=c.getBoundingClientRect();
+  const scaleX=c.width/rect.width,scaleY=c.height/rect.height;
+  const mx=(e.clientX-rect.left)*scaleX,my=(e.clientY-rect.top)*scaleY;
+  const nL=16,nH=8,cW=(c.width-20)/(nH+1),cH=(c.height-20)/nL;
+  const h=Math.floor((mx-20)/cW)-0,l=Math.floor((my-20)/cH);
+  if(h>=0&&h<nH&&l>=0&&l<nL){
+    const key=`${l}-${h}`;
+    ablatedHeads.has(key)?ablatedHeads.delete(key):ablatedHeads.add(key);
+    drawHeadCanvas();
+  }
+});
+drawHeadCanvas();
+
+// ═══════════════ S4: HARDWARE CANVAS ═══════════════
+function drawHWCanvas(){
+  const c=document.getElementById('hwCanvas');if(!c)return;
+  const ctx=c.getContext('2d'),W=c.width,H=c.height;
+  ctx.clearRect(0,0,W,H);ctx.fillStyle='#0d0d12';ctx.fillRect(0,0,W,H);
+  const devices=[
+    {name:'iPhone 15 Pro',ram:8,compute:35,grad:false,color:'#818cf8'},
+    {name:'M2 MacBook',ram:16,compute:110,grad:true,color:'#6ee7b7'},
+    {name:'Jetson Orin',ram:64,compute:275,grad:true,color:'#6ee7b7'},
+    {name:'Raspberry Pi 5',ram:8,compute:13.8,grad:false,color:'#fbbf24'},
+    {name:'Galaxy S24',ram:12,compute:34.4,grad:false,color:'#f472b6'},
+  ];
+  const needs=[
+    {name:'Activation Steering',ram:0,compute:0.1,label:'just vector add'},
+    {name:'LoRA Inference',ram:0.05,compute:0.5,label:'tiny overhead'},
+    {name:'LoRA Update (r=4)',ram:0.8,compute:2,label:'feasible on most'},
+    {name:'Full Backprop 1B',ram:6,compute:10,label:'need 8GB+'},
+  ];
+  const maxRAM=70,maxCompute=300;
+  const pad=60,chartW=W-120,chartH=H-40;
+  // axes
+  ctx.strokeStyle='rgba(90,100,120,.4)';ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(pad,10);ctx.lineTo(pad,H-30);ctx.lineTo(W-20,H-30);ctx.stroke();
+  // grid
+  [10,20,50,100,200].forEach(v=>{
+    const x=pad+v/maxCompute*chartW;
+    ctx.strokeStyle='rgba(90,100,120,.15)';ctx.beginPath();ctx.moveTo(x,10);ctx.lineTo(x,H-30);ctx.stroke();
+    ctx.fillStyle='rgba(90,100,120,.5)';ctx.font='8px DM Mono,monospace';ctx.textAlign='center';
+    ctx.fillText(`${v}T`,x,H-18);
+  });
+  ctx.fillStyle='rgba(90,100,120,.6)';ctx.font='9px DM Mono,monospace';ctx.textAlign='center';
+  ctx.fillText('compute (TOPS)',W/2,H-4);
+  ctx.save();ctx.translate(12,H/2);ctx.rotate(-Math.PI/2);ctx.fillText('RAM (GB)',0,0);ctx.restore();
+  // devices
+  devices.forEach(d=>{
+    const x=pad+Math.min(d.compute/maxCompute,0.98)*chartW;
+    const y=H-30-d.ram/maxRAM*(H-50);
+    ctx.beginPath();ctx.arc(x,y,10,0,Math.PI*2);
+    ctx.fillStyle=d.color+'33';ctx.fill();
+    ctx.strokeStyle=d.color+'bb';ctx.lineWidth=2;ctx.stroke();
+    ctx.fillStyle=d.color;ctx.font='9px DM Mono,monospace';ctx.textAlign='center';
+    ctx.fillText(d.name,x,y-14);
+    if(!d.grad){ctx.fillStyle='rgba(248,113,113,.7)';ctx.fillText('no grad',x,y+22);}
+    else{ctx.fillStyle='rgba(110,231,183,.7)';ctx.fillText('full grad',x,y+22);}
+  });
+  // "what's needed" lines
+  ctx.strokeStyle='rgba(251,191,36,.3)';ctx.setLineDash([4,4]);ctx.lineWidth=1;
+  needs.forEach((n,i)=>{
+    const x=pad+n.compute/maxCompute*chartW;
+    const y=H-30-n.ram/maxRAM*(H-50);
+    ctx.beginPath();ctx.moveTo(pad,y);ctx.lineTo(W-20,y);ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle='rgba(251,191,36,.5)';ctx.font='8px DM Mono,monospace';ctx.textAlign='right';
+    ctx.fillText(`← ${n.name}`,W-22,y-3);
+    ctx.setLineDash([4,4]);
+  });
+  ctx.setLineDash([]);
+}
+drawHWCanvas();
+
+// ═══════════════ S5: TTT CANVAS ═══════════════
+let tttSteps=0;
+const tttLoss=[2.4,2.1,1.82,1.63,1.5,1.41,1.35,1.3,1.27,1.25];
+function tttStep(){if(tttSteps<9){tttSteps++;drawTTT();document.getElementById('tttCount').textContent=`steps: ${tttSteps}`;}}
+function tttReset(){tttSteps=0;drawTTT();document.getElementById('tttCount').textContent='steps: 0';}
+function drawTTT(){
+  const c=document.getElementById('tttCanvas');if(!c)return;
+  const ctx=c.getContext('2d'),W=c.width,H=c.height;
+  ctx.clearRect(0,0,W,H);ctx.fillStyle='#0d0d12';ctx.fillRect(0,0,W,H);
+  // Left: architecture diagram
+  const lW=W*0.45,rX=W*0.5;
+  // Slow weights box
+  ctx.fillStyle='rgba(90,100,120,.1)';ctx.strokeStyle='rgba(90,100,120,.4)';ctx.lineWidth=1;
+  ctx.beginPath();ctx.roundRect(20,20,lW-20,H-50,10);ctx.fill();ctx.stroke();
+  ctx.fillStyle='rgba(90,100,120,.7)';ctx.font='10px DM Mono,monospace';ctx.textAlign='center';
+  ctx.fillText('SLOW WEIGHTS — Frozen',lW/2,38);
+  const layers2=['Attention (L0)','FFN (L0)','Attention (L1)','FFN (L1)','...'];
+  layers2.forEach((l,i)=>{
+    const y=55+i*28;
+    ctx.fillStyle='rgba(129,140,248,.1)';ctx.strokeStyle='rgba(129,140,248,.3)';
+    ctx.beginPath();ctx.roundRect(30,y,lW-50,22,5);ctx.fill();ctx.stroke();
+    ctx.fillStyle='rgba(129,140,248,.7)';ctx.font='9px DM Mono,monospace';ctx.textAlign='center';
+    ctx.fillText(l,lW/2,y+14);
+  });
+  // Fast weight box
+  const fY=55+5*28+8;
+  const fColor=tttSteps>0?'#6ee7b7':'#5a6478';
+  ctx.fillStyle=tttSteps>0?'rgba(110,231,183,.12)':'rgba(50,50,70,.1)';
+  ctx.strokeStyle=tttSteps>0?'rgba(110,231,183,.5)':'rgba(90,100,120,.3)';
+  ctx.beginPath();ctx.roundRect(30,fY,lW-50,28,5);ctx.fill();ctx.stroke();
+  ctx.fillStyle=fColor;ctx.font='9px DM Mono,monospace';ctx.textAlign='center';
+  ctx.fillText(`FAST MLP (updating — step ${tttSteps})`,lW/2,fY+17);
+  // Right: loss curve
+  ctx.fillStyle='rgba(90,100,120,.6)';ctx.font='9px DM Mono,monospace';ctx.textAlign='left';
+  ctx.fillText('Fast weight loss curve:',rX+10,20);
+  const chartPad=40,cW=W-rX-chartPad-10,cH=H-60;
+  ctx.strokeStyle='rgba(90,100,120,.3)';ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(rX+chartPad,30);ctx.lineTo(rX+chartPad,H-30);ctx.lineTo(W-10,H-30);ctx.stroke();
+  if(tttSteps>0){
+    ctx.strokeStyle='rgba(110,231,183,.8)';ctx.lineWidth=2;
+    ctx.beginPath();
+    for(let i=0;i<=tttSteps;i++){
+      const x=rX+chartPad+i/9*cW;
+      const y=30+(tttLoss[i]-1.2)/(2.4-1.2)*cH;
+      i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+    const lx=rX+chartPad+tttSteps/9*cW;
+    const ly=30+(tttLoss[tttSteps]-1.2)/(2.4-1.2)*cH;
+    ctx.beginPath();ctx.arc(lx,ly,5,0,Math.PI*2);ctx.fillStyle='#6ee7b7';ctx.fill();
+    ctx.fillStyle='#6ee7b7';ctx.font='10px DM Mono,monospace';ctx.textAlign='left';
+    ctx.fillText(`loss: ${tttLoss[tttSteps].toFixed(2)}`,lx+8,ly+4);
+  }
+  ctx.fillStyle='rgba(90,100,120,.5)';ctx.font='8px DM Mono,monospace';ctx.textAlign='center';
+  ctx.fillText('TTT steps',rX+chartPad+cW/2,H-14);
+}
+drawTTT();
+
+// ═══════════════ S6: LORA CANVAS ═══════════════
+function updateLora(){
+  const r=parseInt(document.getElementById('rankSlider').value);
+  document.getElementById('rankVal').textContent=`r = ${r}`;
+  drawLoraCanvas(r);
+}
+function drawLoraCanvas(r=8){
+  const c=document.getElementById('loraCanvas');if(!c)return;
+  const ctx=c.getContext('2d'),W=c.width,H=c.height;
+  ctx.clearRect(0,0,W,H);ctx.fillStyle='#0d0d12';ctx.fillRect(0,0,W,H);
+  const d=4096,totalFull=d*d,totalLora=2*d*r;
+  const pct=totalLora/totalFull;
+  // Left: matrix diagram
+  const mX=20,mY=20,mW=Math.min(180,W*0.22),mH=H-40;
+  ctx.fillStyle='rgba(244,114,182,.07)';ctx.strokeStyle='rgba(244,114,182,.3)';ctx.lineWidth=1;
+  ctx.beginPath();ctx.roundRect(mX,mY,mW,mH,5);ctx.fill();ctx.stroke();
+  ctx.fillStyle='rgba(244,114,182,.6)';ctx.font='9px DM Mono,monospace';ctx.textAlign='center';
+  ctx.fillText(`W (${d}×${d})`,mX+mW/2,mY+mH/2);
+  ctx.fillText('frozen',mX+mW/2,mY+mH/2+14);
+  // Arrow
+  const ax=mX+mW+10;
+  ctx.strokeStyle='rgba(90,100,120,.5)';ctx.lineWidth=1.5;
+  ctx.beginPath();ctx.moveTo(ax,H/2);ctx.lineTo(ax+20,H/2);ctx.stroke();
+  ctx.fillStyle='rgba(110,231,183,.7)';ctx.font='9px DM Mono,monospace';ctx.textAlign='center';
+  ctx.fillText('+',ax+10,H/2-5);
+  // A matrix
+  const bx=ax+30,bW=Math.max(12,Math.min(60,r*2)),bH=H-40;
+  ctx.fillStyle='rgba(110,231,183,.1)';ctx.strokeStyle='rgba(110,231,183,.5)';
+  ctx.beginPath();ctx.roundRect(bx,mY,bW,bH,5);ctx.fill();ctx.stroke();
+  ctx.fillStyle='rgba(110,231,183,.7)';ctx.font='9px DM Mono,monospace';ctx.textAlign='center';
+  ctx.fillText(`A`,bx+bW/2,mY+bH/2-6);
+  ctx.fillText(`${d}×${r}`,bx+bW/2,mY+bH/2+8);
+  // B matrix
+  const cx2=bx+bW+6,cW2=Math.min(120,H-40),cH2=Math.max(8,Math.min(30,r*1.5));
+  ctx.fillStyle='rgba(129,140,248,.1)';ctx.strokeStyle='rgba(129,140,248,.5)';
+  ctx.beginPath();ctx.roundRect(cx2,H/2-cH2/2,cW2,cH2,5);ctx.fill();ctx.stroke();
+  ctx.fillStyle='rgba(129,140,248,.7)';ctx.font='9px DM Mono,monospace';ctx.textAlign='center';
+  ctx.fillText(`B (${r}×${d})`,cx2+cW2/2,H/2+4);
+  // Stats
+  const sx=cx2+cW2+30;
+  const labels=[
+    {t:'ΔW params:',v:`${(totalLora/1e3).toFixed(1)}K`,c:'var(--accent)'},
+    {t:'vs full W:',v:`${(totalFull/1e6).toFixed(1)}M`,c:'var(--red)'},
+    {t:'reduction:',v:`${(1/pct).toFixed(0)}×`,c:'var(--accent4)'},
+    {t:'RAM (FP16):',v:`${(totalLora*2/1024).toFixed(0)} KB`,c:'var(--accent2)'},
+  ];
+  labels.forEach(({t,v,c},i)=>{
+    ctx.fillStyle='rgba(90,100,120,.7)';ctx.font='9px DM Mono,monospace';ctx.textAlign='left';
+    ctx.fillText(t,sx,40+i*32);
+    ctx.fillStyle=c;ctx.font='bold 12px Syne,sans-serif';
+    ctx.fillText(v,sx,56+i*32);
+  });
+  // Bar chart
+  const barX=sx,barY=H-35,barW=W-sx-10;
+  ctx.fillStyle='rgba(248,113,113,.3)';ctx.fillRect(barX,barY,barW,14);
+  ctx.fillStyle='rgba(110,231,183,.7)';ctx.fillRect(barX,barY,barW*pct,14);
+  ctx.fillStyle='rgba(90,100,120,.6)';ctx.font='8px DM Mono,monospace';ctx.textAlign='center';
+  ctx.fillText(`LoRA = ${(pct*100).toFixed(2)}% of full W`,barX+barW/2,barY+27);
+}
+updateLora();
+
+// ═══════════════ S7: MAML CANVAS ═══════════════
+function drawMAML(){
+  const c=document.getElementById('mamlCanvas');if(!c)return;
+  const ctx=c.getContext('2d'),W=c.width,H=c.height;
+  ctx.clearRect(0,0,W,H);ctx.fillStyle='#0d0d12';ctx.fillRect(0,0,W,H);
+  // Outer loop
+  const oX=20,oY=20,oW=W-40,oH=H-40;
+  ctx.fillStyle='rgba(129,140,248,.05)';ctx.strokeStyle='rgba(129,140,248,.2)';ctx.lineWidth=1;ctx.setLineDash([5,5]);
+  ctx.beginPath();ctx.roundRect(oX,oY,oW,oH,12);ctx.fill();ctx.stroke();ctx.setLineDash([]);
+  ctx.fillStyle='rgba(129,140,248,.5)';ctx.font='9px DM Mono,monospace';ctx.textAlign='left';
+  ctx.fillText('OUTER LOOP — Meta gradient (updates θ to be fast-adaptable)',oX+10,oY+16);
+  // Tasks
+  const tasks=['Task A\n(cardiology)','Task B\n(neurology)','Task C\n(pharmacy)'];
+  const tW=140,tH=65;
+  tasks.forEach((t,i)=>{
+    const tx=oX+20+i*(tW+16),ty=oY+26;
+    ctx.fillStyle='rgba(244,114,182,.08)';ctx.strokeStyle='rgba(244,114,182,.3)';ctx.lineWidth=1;
+    ctx.beginPath();ctx.roundRect(tx,ty,tW,tH,8);ctx.fill();ctx.stroke();
+    ctx.fillStyle='rgba(244,114,182,.7)';ctx.font='9px DM Mono,monospace';ctx.textAlign='center';
+    t.split('\n').forEach((l,j)=>ctx.fillText(l,tx+tW/2,ty+24+j*14));
+    // inner loop arrow
+    ctx.strokeStyle='rgba(251,191,36,.6)';ctx.lineWidth=1.5;
+    ctx.beginPath();ctx.moveTo(tx+tW/2,ty+tH);ctx.lineTo(tx+tW/2,ty+tH+18);ctx.stroke();
+    // adapted params
+    ctx.fillStyle='rgba(110,231,183,.1)';ctx.strokeStyle='rgba(110,231,183,.4)';
+    ctx.beginPath();ctx.roundRect(tx+10,ty+tH+18,tW-20,25,6);ctx.fill();ctx.stroke();
+    ctx.fillStyle='rgba(110,231,183,.7)';ctx.font='9px DM Mono,monospace';ctx.textAlign='center';
+    ctx.fillText('φᵢ = θ − α∇L',tx+tW/2,ty+tH+34);
+    // query loss
+    ctx.strokeStyle='rgba(251,191,36,.4)';ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(tx+tW/2,ty+tH+43);ctx.lineTo(tx+tW/2,ty+tH+55);ctx.stroke();
+    ctx.fillStyle='rgba(251,191,36,.7)';ctx.font='8px DM Mono,monospace';ctx.textAlign='center';
+    ctx.fillText('query loss →',tx+tW/2,ty+tH+66);
+  });
+  // Meta gradient summation
+  const sumX=W/2,sumY=oY+oH-20;
+  ctx.fillStyle='rgba(251,191,36,.6)';ctx.font='10px Syne,sans-serif';ctx.textAlign='center';
+  ctx.fillText('Σ L(φᵢ, D_query) → ∇θ meta-update',sumX,sumY);
+}
+drawMAML();
+
+// ═══════════════ S8: DEVICE TABLE ═══════════════
+function buildDeviceTable(){
+  const el=document.getElementById('deviceTable');
+  const devices=[
+    {name:'iPhone 15 Pro (A17)',ram:'8GB',compute:'35 TOPS',framework:'MLX / CoreML',steering:'✓ Full',lora_inf:'✓ Full',lora_upd:'⚡ Via MLX',ttt:'⚡ Slow',full_bp:'✗ OOM'},
+    {name:'M2 MacBook Air',ram:'16GB',compute:'110 TOPS',framework:'MLX / PyTorch',steering:'✓ Full',lora_inf:'✓ Full',lora_upd:'✓ Full',ttt:'✓ Full',full_bp:'✓ 1B model'},
+    {name:'Jetson Orin AGX',ram:'64GB',compute:'275 TOPS',framework:'PyTorch / TensorRT',steering:'✓ Full',lora_inf:'✓ Full',lora_upd:'✓ Full',ttt:'✓ Full',full_bp:'✓ 7B model'},
+    {name:'Raspberry Pi 5',ram:'8GB',compute:'13.8 TOPS',framework:'PyTorch CPU',steering:'✓ Slow',lora_inf:'✓ Slow',lora_upd:'⚡ Very slow',ttt:'✗ Too slow',full_bp:'✗ Impractical'},
+    {name:'Galaxy S24 (Snapd)',ram:'12GB',compute:'34.4 TOPS',framework:'TFLite / ExecuTorch',steering:'✓ Full',lora_inf:'✓ Full',lora_upd:'⚡ Experimental',ttt:'✗ No grad',full_bp:'✗ OOM'},
+  ];
+  const headers=['Device','RAM','Compute','Best Framework','Steer','LoRA Infer','LoRA Update','TTT','Full BP'];
+  const getColor=v=>{
+    if(v.startsWith('✓'))return'var(--accent)';
+    if(v.startsWith('⚡'))return'var(--accent4)';
+    return'var(--red)';
+  };
+  el.innerHTML=`<div class="cmp" style="grid-template-columns:180px 60px 80px 140px 60px 70px 80px 60px 60px;font-size:9px">
+    ${headers.map(h=>`<div class="cc hdr">${h}</div>`).join('')}
+    ${devices.map(d=>`
+      <div class="cc" style="color:var(--accent2)">${d.name}</div>
+      <div class="cc">${d.ram}</div>
+      <div class="cc">${d.compute}</div>
+      <div class="cc" style="color:var(--muted)">${d.framework}</div>
+      ${[d.steering,d.lora_inf,d.lora_upd,d.ttt,d.full_bp].map(v=>`<div class="cc" style="color:${getColor(v)}">${v}</div>`).join('')}
+    `).join('')}
+  </div>`;
+}
+buildDeviceTable();
+
+// ═══════════════ S9: FULL STACK ═══════════════
+function buildFullStack(){
+  const el=document.getElementById('fullStack');
+  const stages=[
+    {n:'①',label:'Input Token',sub:'prompt / user text',c:'var(--muted)',bg:'rgba(90,100,120,.06)',detail:'Standard tokenization. The controller attaches all hooks before generate() is called.'},
+    {n:'②',label:'Base Forward (frozen)',sub:'attention + FFN, no grad',c:'var(--accent2)',bg:'rgba(129,140,248,.05)',detail:'The 7B frozen base model runs as normal inference. No memory overhead from gradients.'},
+    {n:'③',label:'Activation Steering Hook',sub:'α · steering_vec added to residual stream',c:'var(--accent)',bg:'rgba(110,231,183,.06)',detail:'Zero training needed. Just vector addition at 3 layers. Cost: ~3 matrix-vector multiplications per layer ≈ microseconds.'},
+    {n:'④',label:'LoRA Adapter Delta',sub:'output += scale · B(A(x))',c:'var(--accent3)',bg:'rgba(244,114,182,.05)',detail:'The tiny A,B matrices add their delta W·x to each attention/FFN output. Cost: 2 small matmuls per target layer. If no correction has been learned yet, A·B = 0 (B initialized to zero).'},
+    {n:'⑤',label:'TTT Fast Weight (optional)',sub:'fast MLP output added to residual',c:'var(--accent4)',bg:'rgba(251,191,36,.05)',detail:'Only active if TTT mode is enabled. Fast weights compress the current context. Adds 1 small matmul per TTT layer. Can be disabled on low-memory devices.'},
+    {n:'⑥',label:'Output Token',sub:'logits → sample → next token',c:'var(--muted)',bg:'rgba(90,100,120,.06)',detail:'Normal sampling from the modified residual stream. All steering/adapter effects are "baked in" to the token distribution.'},
+    {n:'⑦',label:'Correction Signal (async)',sub:'user feedback → LoRA gradient step',c:'var(--accent)',bg:'rgba(110,231,183,.06)',detail:'When a doctor corrects an output: this triggers 3 gradient steps updating only A,B matrices (64K params). Happens asynchronously — doesn\'t block next generation.'},
+  ];
+  el.innerHTML=stages.map((s,i)=>`
+    ${i>0?'<div style="text-align:center;font-family:DM Mono,monospace;font-size:12px;color:var(--muted2);padding:1px 0">↓</div>':''}
+    <div style="background:${s.bg};border:1px solid var(--border2);border-radius:10px;padding:11px 16px;cursor:pointer" onclick="toggleDetail(this)">
+      <div style="display:flex;align-items:center;gap:10px">
+        <span style="font-family:'DM Mono',monospace;font-size:13px;color:${s.c}">${s.n}</span>
+        <span style="font-family:'DM Mono',monospace;font-size:11px;color:${s.c};font-weight:600">${s.label}</span>
+        <span style="font-family:'DM Mono',monospace;font-size:9px;color:var(--muted);margin-left:auto">${s.sub}</span>
+      </div>
+      <div class="detail-panel" style="display:none;font-family:'DM Mono',monospace;font-size:10px;color:var(--muted);line-height:1.75;margin-top:8px;padding-top:8px;border-top:1px solid var(--border)">${s.detail}</div>
+    </div>
+  `).join('');
+}
+function toggleDetail(el){const d=el.querySelector('.detail-panel');d.style.display=d.style.display==='none'?'block':'none';}
+buildFullStack();
+
+// resize
+window.addEventListener('resize',()=>{drawStream();drawInjCanvas(parseFloat(document.getElementById('alphaSlider').value));drawHeadCanvas();drawHWCanvas();drawTTT();drawLoraCanvas(parseInt(document.getElementById('rankSlider').value));drawMAML();});
+
+// trigger draws on scroll reveal
+const draws={s0:drawStream,s2:()=>updateInj(),s3:drawHeadCanvas,s4:drawHWCanvas,s5:drawTTT,s6:()=>updateLora(),s7:drawMAML};
+const dObs=new IntersectionObserver(es=>es.forEach(e=>{if(e.isIntersecting&&draws[e.target.id])draws[e.target.id]();}),{threshold:.1});
+Object.keys(draws).forEach(id=>{const el=document.getElementById(id);if(el)dObs.observe(el);});
+setTimeout(()=>Object.keys(draws).forEach(id=>{const el=document.getElementById(id);if(el){const r=el.getBoundingClientRect();if(r.top<window.innerHeight)draws[id]();}}),500);
+</script>
+</body>
+</html>

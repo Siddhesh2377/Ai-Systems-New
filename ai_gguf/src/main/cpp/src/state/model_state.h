@@ -81,6 +81,7 @@ enum class GrammarMode {
  * Cached sampler parameters for multi-turn rebuilds
  */
 struct SamplerParams {
+    // Base sampling
     int topK = 40;
     float topP = 0.9f;
     float temp = 0.7f;
@@ -89,6 +90,22 @@ struct SamplerParams {
     float mirostatTau = 5.0f;
     float mirostatEta = 0.1f;
     int seed = -1;
+
+    // Repetition penalties
+    float repeatPenalty = 1.0f;      // 1.0 = disabled
+    float frequencyPenalty = 0.0f;   // 0.0 = disabled
+    float presencePenalty = 0.0f;    // 0.0 = disabled
+    int penaltyLastN = 64;           // tokens to look back
+
+    // DRY sampler — kills repetitive n-gram patterns ("As an AI...", "I understand that...")
+    float dryMultiplier = 0.0f;      // 0.0 = disabled
+    float dryBase = 1.75f;
+    int dryAllowedLength = 2;
+    int dryPenaltyLastN = -1;        // -1 = use context size
+
+    // XTC sampler — forces creative word choices, breaks clichés
+    float xtcProbability = 0.0f;     // 0.0 = disabled
+    float xtcThreshold = 0.1f;
 };
 
 /**
@@ -126,6 +143,9 @@ public:
     // Cached sampler params for multi-turn rebuilds
     SamplerParams cached_sampler_params;
 
+    // Per-token logit biases (e.g., suppress "certainly", "delve", "Moreover")
+    std::vector<llama_logit_bias> logit_biases;
+
     // UTF-8 carry buffer for incomplete sequences (legacy)
     std::string utf8_carry_buffer;
 
@@ -137,6 +157,18 @@ public:
 
     // Prompt cache for incremental KV reuse in multi-turn
     PromptCache prompt_cache;
+
+    // Speculative decoding configuration
+    struct {
+        bool enabled = false;
+        int32_t exit_layer = -1;    // early exit layer for draft model
+        int32_t num_draft = 5;      // draft tokens per iteration
+    } speculative;
+
+    // Local sparse mask cache — mirrors the masks stored in llama_context.
+    // We keep a copy here so we can read old mask values for momentum smoothing
+    // in nativeUpdateSparseMasks without needing direct llama_context access.
+    std::vector<std::vector<float>> sparse_mask_cache;  // [n_layer][n_ff]
 
     // Memory tracking
     MemoryMetrics memory_metrics;
@@ -163,8 +195,13 @@ public:
     void prepare_for_generation();
 
     /**
-     * Rebuild sampler with new parameters
+     * Rebuild sampler with new parameters.
+     * Accepts the full SamplerParams struct for all sampling controls.
+     * Backward-compatible overload also available.
      */
+    void rebuild_sampler(const SamplerParams& params);
+
+    // Backward-compatible overload (base params only, new params use defaults)
     void rebuild_sampler(
             int topK,
             float topP,

@@ -4,6 +4,7 @@
     <mapping directory="" vcs="Git" />
     <mapping directory="$PROJECT_DIR$" vcs="Git" />
     <mapping directory="$USER_HOME$/CLionProjects/llama.cpp-android" vcs="Git" />
+    <mapping directory="$USER_HOME$/dev" vcs="Git" />
     <mapping directory="$USER_HOME$/dev/android/MNN" vcs="Git" />
   </component>
 </project>

@@ -30,6 +30,7 @@ ModelState g_state;
 // Updated sampler chain API
 // ============================================================================
 
+// Backward-compatible overload: packs base params into SamplerParams struct
 void ModelState::rebuild_sampler(
         int topK,
         float topP,
@@ -40,8 +41,22 @@ void ModelState::rebuild_sampler(
         float mirostatEta,
         int seed)
 {
+    SamplerParams params;
+    params.topK = topK;
+    params.topP = topP;
+    params.temp = temp;
+    params.minP = minP;
+    params.mirostat = mirostat;
+    params.mirostatTau = mirostatTau;
+    params.mirostatEta = mirostatEta;
+    params.seed = seed;
+    rebuild_sampler(params);
+}
+
+void ModelState::rebuild_sampler(const SamplerParams& params)
+{
     // Cache params for multi-turn rebuilds
-    cached_sampler_params = {topK, topP, temp, minP, mirostat, mirostatTau, mirostatEta, seed};
+    cached_sampler_params = params;
 
     // Free existing sampler chain (this frees all samplers added to the chain,
     // but NOT our master grammar_sampler since we clone it before adding)
@@ -60,9 +75,7 @@ void ModelState::rebuild_sampler(
     auto sparams = llama_sampler_chain_default_params();
     llama_sampler* chain = llama_sampler_chain_init(sparams);
 
-    // Add a CLONE of grammar sampler first if tools are enabled.
-    // The master grammar_sampler is owned by ModelState for reuse across turns.
-    // The chain takes ownership of the clone and frees it when the chain is freed.
+    // ── 1. Grammar (existing) ──
     if (tools_enabled && grammar_sampler) {
         llama_sampler* grammar_clone = llama_sampler_clone(grammar_sampler);
         if (grammar_clone) {
@@ -72,40 +85,83 @@ void ModelState::rebuild_sampler(
         }
     }
 
+    // ── 2. Logit bias — suppress specific tokens ("certainly", "delve", etc.) ──
+    if (!logit_biases.empty()) {
+        llama_sampler_chain_add(chain,
+            llama_sampler_init_logit_bias(
+                llama_vocab_n_tokens(vocab),
+                static_cast<int32_t>(logit_biases.size()),
+                logit_biases.data()));
+    }
+
+    // ── 3. Penalties (repeat/frequency/presence) ──
+    if (params.repeatPenalty != 1.0f || params.frequencyPenalty != 0.0f || params.presencePenalty != 0.0f) {
+        llama_sampler_chain_add(chain,
+            llama_sampler_init_penalties(
+                params.penaltyLastN,
+                params.repeatPenalty,
+                params.frequencyPenalty,
+                params.presencePenalty));
+    }
+
+    // ── 4. DRY — kills repetitive n-gram patterns ──
+    if (params.dryMultiplier > 0.0f) {
+        const char* seq_breakers[] = { "\n", ":", "\"", "*" };
+        llama_sampler_chain_add(chain,
+            llama_sampler_init_dry(
+                vocab,
+                llama_model_n_ctx_train(model),
+                params.dryMultiplier,
+                params.dryBase,
+                params.dryAllowedLength,
+                params.dryPenaltyLastN,
+                seq_breakers,
+                4));
+    }
+
     // Mirostat sampling branch
-    if (mirostat > 0) {
+    if (params.mirostat > 0) {
         auto* mirostatSampler = llama_sampler_init_mirostat(
                 llama_vocab_n_tokens(vocab),
-                seed,
-                mirostatTau,
-                mirostatEta,
+                params.seed,
+                params.mirostatTau,
+                params.mirostatEta,
                 100 // m window
         );
         llama_sampler_chain_add(chain, mirostatSampler);
     }
     // Standard sampling branch
     else {
-        // 1. TEMPERATURE FIRST - must scale logits before filtering
-        if (temp > 0.0f && std::abs(temp - 1.0f) > 1e-3f) {
-            llama_sampler_chain_add(chain, llama_sampler_init_temp(temp));
+        // 5. TEMPERATURE — scale logits before filtering
+        if (params.temp > 0.0f && std::abs(params.temp - 1.0f) > 1e-3f) {
+            llama_sampler_chain_add(chain, llama_sampler_init_temp(params.temp));
         }
 
-        // 2. FILTERING - order: top-k, top-p, min-p
-        llama_sampler_chain_add(chain, llama_sampler_init_top_k(topK));
+        // 6. FILTERING — top-k → top-p → min-p
+        llama_sampler_chain_add(chain, llama_sampler_init_top_k(params.topK));
 
-        if (topP < 1.0f) {
-            llama_sampler_chain_add(chain, llama_sampler_init_top_p(topP, 1));
+        if (params.topP < 1.0f) {
+            llama_sampler_chain_add(chain, llama_sampler_init_top_p(params.topP, 1));
         }
 
-        if (minP > 0.0f) {
-            llama_sampler_chain_add(chain, llama_sampler_init_min_p(minP, 1));
+        if (params.minP > 0.0f) {
+            llama_sampler_chain_add(chain, llama_sampler_init_min_p(params.minP, 1));
         }
 
-        // 3. DISTRIBUTION SAMPLING LAST - picks final token
-        if (temp > 0.0f) {
-            llama_sampler_chain_add(chain, llama_sampler_init_dist(seed));
+        // 7. XTC — forces creative word choices, breaks clichés
+        if (params.xtcProbability > 0.0f) {
+            llama_sampler_chain_add(chain,
+                llama_sampler_init_xtc(
+                    params.xtcProbability,
+                    params.xtcThreshold,
+                    1,  // min_keep
+                    params.seed));
+        }
+
+        // 8. DISTRIBUTION SAMPLING — picks final token
+        if (params.temp > 0.0f) {
+            llama_sampler_chain_add(chain, llama_sampler_init_dist(params.seed));
         } else {
-            // Greedy sampling when temp=0
             llama_sampler_chain_add(chain, llama_sampler_init_greedy());
         }
     }
@@ -114,15 +170,17 @@ void ModelState::rebuild_sampler(
     llama_sampler_reset(sampler);
 
     LOG_INFO("Sampler rebuilt: topK=%d, topP=%.2f, temp=%.2f, minP=%.2f, "
-             "mirostat=%d, tau=%.2f, eta=%.2f, seed=%d",
-             topK, topP, temp, minP,
-             mirostat, mirostatTau, mirostatEta, seed);
+             "mirostat=%d, tau=%.2f, eta=%.2f, seed=%d, "
+             "repeatPen=%.2f, freqPen=%.2f, presPen=%.2f, "
+             "dry=%.2f, xtc=%.2f",
+             params.topK, params.topP, params.temp, params.minP,
+             params.mirostat, params.mirostatTau, params.mirostatEta, params.seed,
+             params.repeatPenalty, params.frequencyPenalty, params.presencePenalty,
+             params.dryMultiplier, params.xtcProbability);
 }
 
 void ModelState::rebuild_sampler_cached() {
-    const auto& p = cached_sampler_params;
-    rebuild_sampler(p.topK, p.topP, p.temp, p.minP,
-                    p.mirostat, p.mirostatTau, p.mirostatEta, p.seed);
+    rebuild_sampler(cached_sampler_params);
 }
 
 void ModelState::reset_grammar_sampler() {
