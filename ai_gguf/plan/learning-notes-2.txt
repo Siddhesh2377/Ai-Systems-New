@@ -1,0 +1,809 @@
+
+● Here's what the research found — and how it maps to our engine:
+
+  The Landscape
+
+  ┌───────────────┬──────────────────┬─────────────────────────────┬───────────────┐
+  │     Model     │ Size (Q4+vision) │           Quality           │   Fits 4GB?   │
+  ├───────────────┼──────────────────┼─────────────────────────────┼───────────────┤
+  │ SmolVLM-256M  │ 315 MB           │ Basic captioning            │ Easily        │
+  ├───────────────┼──────────────────┼─────────────────────────────┼───────────────┤
+  │ SmolVLM-500M  │ 450 MB           │ DocVQA 70.5%, TextVQA 60.2% │ Easily        │
+  ├───────────────┼──────────────────┼─────────────────────────────┼───────────────┤
+  │ LFM2-VL-450M  │ 219 MB           │ Smallest, state-space model │ Easily        │
+  ├───────────────┼──────────────────┼─────────────────────────────┼───────────────┤
+  │ InternVL3-1B  │ 700 MB           │ Strong quality              │ Yes           │
+  ├───────────────┼──────────────────┼─────────────────────────────┼───────────────┤
+  │ SmolVLM2-2.2B │ 1.5 GB           │ Best sub-3B quality + video │ Tight but yes │
+  ├───────────────┼──────────────────┼─────────────────────────────┼───────────────┤
+  │ Qwen3-VL-2B   │ 1.6 GB           │ Thinking mode + vision      │ Tight         │
+  └───────────────┴──────────────────┴─────────────────────────────┴───────────────┘
+
+  How VLMs Actually Work
+
+                      Same ggml ops we already use
+                      ─────────────────────────────
+  Image [3,384,384]
+      │
+      ▼
+  ┌──────────────────────┐
+  │  Vision Encoder       │  ← SigLIP (93M params)
+  │  conv_2d → ViT layers │  ← flash_attn, mul_mat, norm — SAME OPS
+  │  → visual tokens       │  ← [n_embd, ~81 tokens]
+  └──────────────────────┘
+      │
+      ▼
+  ┌──────────────────────┐
+  │  MLP Projector        │  ← 2x mul_mat + gelu — trivial
+  │  vision_dim → llm_dim │
+  └──────────────────────┘
+      │
+      ▼  concat with text tokens
+  ┌──────────────────────────────────────────┐
+  │  [BOS, vis1, vis2, ..., vis81, "Describe │  ← our existing build_graph()
+  │   this image", im_end, assistant]         │     with ALL interventions active
+  │                                           │
+  │  LLM Decoder (SmolLM2 / Qwen3)          │  ← SAME weights, SAME code path
+  └──────────────────────────────────────────┘
+      │
+      ▼
+    "A cat sitting on a laptop keyboard"
+
+  The key insight: visual tokens are just prefix tokens. The LLM decoder doesn't know or care they came from an image. Our build_graph() already handles prefill — we just need to
+  produce the visual token embeddings.
+
+  What We'd Build (Mobile-Optimized)
+
+  For a highly mobile-optimized VLM with GPU:
+
+  Vision encoder: Build a build_vision_graph() using pure ggml ops:
+  - ggml_conv_2d — patch embedding (image → patches)
+  - ggml_flash_attn_ext — ViT self-attention (same as our text attn)
+  - ggml_mul_mat + ggml_silu/ggml_gelu — ViT FFN
+  - ggml_norm — LayerNorm (not RMSNorm)
+  - Total: ~12 ViT layers for SigLIP-base
+
+  GPU dispatch: Vision encoder is compute-heavy (not bandwidth-bound like text decode) — perfect for GPU offload:
+  - Image encoding on Adreno GPU via OpenCL — conv2d + attention = GPU-friendly
+  - Text decode stays on CPU (bandwidth-bound, GPU doesn't help)
+  - Result: image processed in parallel while CPU handles text
+
+  Memory budget (SmolVLM-500M Q4):
+  Vision encoder (mmproj F16):    199 MB
+  LLM decoder (Q4_K_M):          250 MB
+  KV cache (2048 ctx, F16):       56 MB
+  Vision compute buffer:           20 MB
+  Text compute buffer:             38 MB
+  ─────────────────────────────────────
+  Total:                         ~563 MB  ← fits easily in 4GB
+
+  Performance estimate:
+  - Image encode: ~200-400ms on GPU (93M params, single pass, no KV cache)
+  - Prefill visual tokens: ~81 tokens × 13ms = ~1s
+  - Text decode: ~30-40ms/tok (360M decoder is smaller than Qwen3-0.6B)
+  - Total image→first-token: ~1.5-2s
+
+  The Full Stack: VLM + Tools + Character
+
+  User sends image + "What tools are on the table?"
+      │
+      ▼
+  ┌─ Vision Encoder (GPU) ──────────────────┐
+  │  Image → 81 visual tokens (~300ms)       │
+  └──────────────────────────────────────────┘
+      │
+      ▼
+  ┌─ LLM Decode (CPU) with Character Engine ─┐
+  │  [system + tools + visual_tokens + query]  │
+  │  Interventions: temp profile, gated res    │
+  │  Grammar: ready for <tool_call> detection  │
+  │                                            │
+  │  "I can see a screwdriver and pliers.      │
+  │   Let me look up their prices.             │
+  │   <tool_call>                              │
+  │   {"name":"search","args":{"q":"pliers"}}  │
+  │   </tool_call>"                            │
+  └────────────────────────────────────────────┘
+      │
+      ▼  execute tool → prefill result → continue decode
+      │
+      ▼
+  │  "The pliers cost $12.99 at Home Depot!"  │
+
+  Everything stacks: VLM + tool calling + character personality + thinking mode — all in one forward pass, all controlled by our engine.
+
+  Recommended Target: SmolVLM-500M
+
+  - Apache 2.0 — no license issues
+  - 450 MB total — leaves room for everything else
+  - SigLIP base (93M) — small enough for GPU encode
+  - SmolLM2-360M decoder — faster than our current Qwen3-0.6B
+  - DocVQA 70.5% — actually useful for reading documents/screenshots
+  - 2 GGUF files: model.gguf + mmproj.gguf
+
+  Want me to start planning the implementation? The approach would be: build build_vision_graph() in pure ggml ops (same pattern as our text build_graph()), load the mmproj GGUF
+  weights, and dispatch the vision encoder to GPU while text stays on CPU.
+
+✻ Cooked for 7m 37s
+
+❯ See We have to Implement a System in our engine ( if the engine is doing a GPU heavy task like VLM then llm should generate a 5-8 token message or more that saying [based on the
+  charater] i am processing the image please wait, means it should be very human like, after image is processed, ahhhh so this is that or what every the input prompt was, at the
+  end everything should be very very human okay
+
+● That's a brilliant UX idea. Here's why it works technically:
+
+  The Parallel Trick
+
+  GPU and CPU run on different hardware but share the same LPDDR5 bus. Vision encoding is compute-bound (conv2d + attention on fixed-size patches). Text decode is bandwidth-bound
+  (reading weights). They barely compete:
+
+  Timeline:
+  ─────────────────────────────────────────────────────────
+  GPU:  ████████ Vision encode (300ms) ████████
+  CPU:  ██ "Ooh let me see..." (5 tok × 40ms = 200ms) ██
+  ─────────────────────────────────────────────────────────
+        0ms              200ms              300ms
+                                             │
+                                             ▼ visual tokens ready
+  CPU:  ████ prefill visual + query ████ decode real response ████
+  ─────────────────────────────────────────────────────────
+        300ms           400ms                              2000ms+
+
+  Zero dead time. The user sees Aria responding instantly.
+
+  What It Looks Like
+
+  User: [sends photo of a messy desk] "What do you think of my setup?"
+
+  Aria: "Ooh hold on, lemme take a look at this... 👀"     ← instant (CPU, 200ms)
+
+        [brief pause — GPU finishing image encode]
+
+  Aria: "Haha okay so — you've got like three coffee cups,  ← real response (with image)
+         a keyboard buried under papers, and is that a
+         rubber duck? Please tell me that's for debugging
+         and not just vibes 😂"
+
+  Both messages come from the same character, with the same personality interventions active. Aria's warmth, humor, and casual tone carry through both the stall and the real answer.
+
+  The Engine Architecture
+
+  ┌─────────────────────────────────────────────────────────┐
+  │                    User sends image + text                │
+  └─────────────────┬───────────────────────┬───────────────┘
+                    │                       │
+           ┌────────▼────────┐    ┌─────────▼─────────┐
+           │  CPU Thread      │    │  GPU Thread         │
+           │                  │    │                     │
+           │  Stall Prompt:   │    │  build_vision_graph │
+           │  "<|im_start|>   │    │  conv2d → ViT layers│
+           │   system          │    │  → MLP projector    │
+           │   [Aria persona]  │    │  → visual_tokens[]  │
+           │   User sent an   │    │                     │
+           │   image, react   │    │  93M SigLIP params  │
+           │   briefly"        │    │  ~300ms on Adreno   │
+           │                  │    │                     │
+           │  Decode 5-8 tok  │    └─────────┬───────────┘
+           │  with character  │              │
+           │  interventions   │              │
+           │  (~200ms)        │              │
+           └────────┬─────────┘              │
+                    │                        │
+                    ▼                        ▼
+           Stream stall msg          visual tokens ready
+           to user                          │
+                    │                        │
+                    └────────┬───────────────┘
+                             │
+                    ┌────────▼────────────────────────┐
+                    │  Phase 2: Real Response (CPU)     │
+                    │                                   │
+                    │  1. Reset KV cache                │
+                    │  2. Prefill:                      │
+                    │     [system + visual_tokens +      │
+                    │      user_query]                   │
+                    │  3. Decode with interventions      │
+                    │     + grammar (tool calling ready) │
+                    │  4. Stream real response           │
+                    └───────────────────────────────────┘
+
+  The Stall System
+
+  The stall isn't random — it's character-aware. We generate it from a special mini-prompt:
+
+  <|im_start|>system
+  You are Aria... [full persona]
+  The user just sent you an image. React naturally in 1 sentence —
+  you're about to look at it. Stay in character.<|im_end|>
+  <|im_start|>assistant
+
+  With Aria's interventions active (temp=0.8, warm personality), this produces things like:
+  - "Ooh let me see what we got here..."
+  - "Hold on, checking this out real quick!"
+  - "One sec, taking a look... 👀"
+
+  Different characters would stall differently:
+  - Professional assistant: "Processing your image now."
+  - Sarcastic friend: "Oh great, another picture to judge..."
+  - Excited kid: "OHHH WHAT IS IT WHAT IS IT!!"
+
+  The personality interventions make this automatic — same character engine, just a different prompt.
+
+  What We Need to Build
+
+  1. build_vision_graph()          ← pure ggml ops (conv2d + ViT + projector)
+     - Load mmproj.gguf weights
+     - Image preprocessing (resize, normalize)
+     - Dispatch to GPU backend
+
+  2. Parallel stall generation     ← std::thread + our existing decode
+     - Stall prompt template per character
+     - Generate 5-8 tokens on CPU while GPU encodes
+
+  3. Visual token injection        ← concat visual + text embeddings
+     - Replace ggml_get_rows for image positions
+     - Prefill combined sequence into KV cache
+
+  4. Transition handling           ← natural "Okay so..." continuation
+     - The real response prompt includes a transition hint
+     - Character interventions ensure tone matches stall message
+
+  5. The full pipeline             ← ties everything together
+     - stall() || encode_image()  → join → prefill → decode
+
+  Personality JSON Extension
+
+  {
+      "name": "Aria",
+      "system_prompt": "You are Aria...",
+      "stall_prompt": "The user just sent you an image. React naturally in 1 sentence.",
+      "stall_tokens": 8,
+      "transition_hint": "Now describe what you see, starting with a natural reaction.",
+      "thinking": 0,
+      ...
+  }
+
+  This is something nobody else is doing — parallel personality-aware stalling during VLM processing. The user never sees a loading spinner. They see their character reacting in
+  real-time.
+
+  Want me to start implementing? The order would be:
+  1. build_vision_graph() + mmproj GGUF loading (the core VLM engine)
+  2. Parallel stall + encode pipeline
+  3. Visual token injection into our existing build_graph()
+  4. Test with SmolVLM-500M on device
+
+✻ Sautéed for 1m 9s
+
+❯ see it should not be only for image, it should be for tool-calling too how will u do for that?
+
+● You're right — this is bigger than just VLM. It's a general async boundary system. Anything that makes the model "wait" should trigger human-like filler.
+
+  The Universal Pattern
+
+  Model is generating → hits something that takes time → stall naturally → result arrives → continue
+
+  This applies to:
+    • Image encoding (300ms GPU)
+    • Tool execution (100ms-5000ms network)
+    • RAG search (50-500ms)
+    • File read/write
+    • Any future async operation
+
+  The Key Insight: Stall is a UX Layer
+
+  The stall tokens get streamed to the user but NOT written to the model's KV cache. The model never sees its own filler. Clean separation:
+
+  What the USER sees:                     What the MODEL sees (KV cache):
+  ─────────────────────                   ────────────────────────────────
+  "Let me check the weather!              "Let me check the weather!
+   <tool_call>get_weather(Tokyo)           <tool_call>get_weather(Tokyo)
+                                           </tool_call>"
+   Hmm pulling that up real quick...
+                                           [tool result: {"temp":22}]
+   Oh nice! 22°C and sunny — perfect
+   day to skip class and get coffee ☀️"    "Oh nice! 22°C and sunny..."
+
+  The stall is invisible to the model. Zero format pollution. The model's context stays clean for reasoning.
+
+  How It Works
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │                   Async Boundary System                      │
+  │                                                              │
+  │  Triggers:                                                   │
+  │    TOOL_CALL    → tool takes >150ms                          │
+  │    IMAGE_ENCODE → always (300ms+ GPU)                        │
+  │    RAG_SEARCH   → search takes >100ms                        │
+  │    THINKING     → model enters <think> (optional)            │
+  │                                                              │
+  │  For each trigger:                                           │
+  │    1. Save kv_pos checkpoint                                 │
+  │    2. Start async operation (thread/future)                  │
+  │    3. Try fast path: wait 150ms                              │
+  │       - If done → skip stall, inject result immediately      │
+  │    4. Slow path: generate stall on CPU                       │
+  │       - Separate mini KV context (doesn't touch main KV)     │
+  │       - Stream to user                                       │
+  │    5. Async completes → inject result at checkpoint_pos      │
+  │    6. Continue main generation                               │
+  └─────────────────────────────────────────────────────────────┘
+
+  Concrete Example: Multi-Step Tool Calling
+
+  User: "What's the weather in Tokyo? And find me a good ramen place nearby"
+
+  Aria: "Ooh Tokyo trip? Let me look into that for you!"
+        <tool_call>{"name":"get_weather","args":{"city":"Tokyo"}}</tool_call>
+        ──── ASYNC BOUNDARY ────
+        │
+        │ Async: execute get_weather() [~800ms API call]
+        │
+        │ 150ms passes... not done yet → stall kicks in
+        │
+        │ Stall (separate KV, streamed to user):
+        │ "Checking the forecast real quick..."
+        │
+        │ 800ms: result arrives → {"temp": 22, "rain": false}
+        ──── RESUME ────
+
+  Aria: "Nice, 22°C and no rain! Now lemme find some ramen spots..."
+        <tool_call>{"name":"search","args":{"q":"best ramen Tokyo"}}</tool_call>
+        ──── ASYNC BOUNDARY ────
+        │
+        │ Async: execute search() [~1200ms]
+        │
+        │ Stall: "I know some good places actually, let me double check..."
+        │
+        │ 1200ms: result arrives → [{name: "Fuunji", rating: 4.8}, ...]
+        ──── RESUME ────
+
+  Aria: "Okay SO — Fuunji in Shinjuku is apparently incredible,
+         4.8 stars! And with 22°C weather you could totally walk
+         there. Want me to look up directions?"
+
+  Every stall is in character. Every transition is natural.
+
+  The Stall Generator
+
+  The stall runs on a separate mini-context — tiny KV cache, just enough for ~10 tokens:
+
+  struct StallContext {
+      // Lightweight — separate from main model KV
+      ggml_tensor * kv_k[MAX_LAYERS];  // tiny: 10 tokens max
+      ggml_tensor * kv_v[MAX_LAYERS];
+      int kv_pos;
+  };
+
+  // Stall prompts are context-aware:
+  const char * stall_prompts[] = {
+      // TOOL_CALL
+      "You just called %s. React in 1 sentence while waiting for the result.",
+      // IMAGE_ENCODE
+      "User sent an image. React briefly — you're about to see it.",
+      // RAG_SEARCH
+      "You're searching your memory. Think out loud briefly.",
+      // THINKING
+      "You're thinking about this. Mumble naturally.",
+  };
+
+  The same character interventions (temp profile, gated residuals) apply to stall generation — Aria stalls like Aria, a professional bot stalls like a professional.
+
+  The Implementation: AsyncBoundary
+
+  enum BoundaryType {
+      BOUNDARY_TOOL_CALL,
+      BOUNDARY_IMAGE_ENCODE,
+      BOUNDARY_RAG_SEARCH,
+  };
+
+  struct AsyncBoundary {
+      BoundaryType type;
+      int fast_path_ms;        // wait this long before stalling (150ms default)
+      int max_stall_tokens;    // cap stall length (8 default)
+      std::string context;     // "get_weather(Tokyo)" — for stall prompt
+  };
+
+  // The core function:
+  // Returns the async result, streams stall tokens to callback while waiting
+  template<typename T>
+  T await_with_stall(
+      std::future<T> && operation,        // the async thing
+      AsyncBoundary boundary,              // config
+      ModelState & state,                  // for stall generation
+      InterventionConfig & iv,             // character personality
+      std::function<void(const char*)> on_token  // stream callback
+  );
+
+  The Full Picture
+
+  ┌──────────────────────────────────────────────────────────┐
+  │                    Our Engine Stack                        │
+  │                                                           │
+  │  ┌─────────────────────────────────────────────────────┐  │
+  │  │  Character Engine (personality interventions)        │  │
+  │  │  temp_profile + gated_residual + logit_bias          │  │
+  │  │  Applies to ALL generation: main + stall             │  │
+  │  └─────────────────────────────────────────────────────┘  │
+  │                          │                                 │
+  │  ┌──────────┐  ┌─────────▼──────────┐  ┌──────────────┐  │
+  │  │  VLM      │  │  Async Boundary     │  │  Grammar     │  │
+  │  │  Encoder  │  │  System             │  │  Constraint  │  │
+  │  │  (GPU)    │  │                     │  │  (JSON)      │  │
+  │  │           │  │  • Detect boundary  │  │              │  │
+  │  │  conv2d   │  │  • Fast path check  │  │  • State     │  │
+  │  │  ViT      │  │  • Stall generation │  │    machine   │  │
+  │  │  project  │  │  • Result injection │  │  • Dynamic   │  │
+  │  │           │  │  • Resume decode    │  │    logit     │  │
+  │  │           │  │                     │  │    bias      │  │
+  │  └──────────┘  └─────────────────────┘  └──────────────┘  │
+  │                          │                                 │
+  │  ┌─────────────────────────────────────────────────────┐  │
+  │  │  build_graph() — forward pass with interventions     │  │
+  │  │  Prefill + Decode + KV cache management              │  │
+  │  └─────────────────────────────────────────────────────┘  │
+  │                          │                                 │
+  │  ┌─────────────────────────────────────────────────────┐  │
+  │  │  ggml backend: CPU (decode) + GPU (vision/compute)   │  │
+  │  └─────────────────────────────────────────────────────┘  │
+  └──────────────────────────────────────────────────────────┘
+
+  What Nobody Else Has
+
+  ┌───────────────────────┬──────────────┬─────────┬───────────────────────────────┐
+  │        Feature        │  llama.cpp   │ Ollama  │          Our Engine           │
+  ├───────────────────────┼──────────────┼─────────┼───────────────────────────────┤
+  │ Tool calling          │ Basic        │ Basic   │ Grammar-forced + async stall  │
+  ├───────────────────────┼──────────────┼─────────┼───────────────────────────────┤
+  │ VLM                   │ Via mtmd lib │ Via API │ Native ggml + GPU parallel    │
+  ├───────────────────────┼──────────────┼─────────┼───────────────────────────────┤
+  │ Character personality │ No           │ No      │ 8 intervention surfaces       │
+  ├───────────────────────┼──────────────┼─────────┼───────────────────────────────┤
+  │ Async stalling        │ No           │ No      │ Character-aware, per-boundary │
+  ├───────────────────────┼──────────────┼─────────┼───────────────────────────────┤
+  │ Thinking control      │ No           │ No      │ Logit bias toggle             │
+  ├───────────────────────┼──────────────┼─────────┼───────────────────────────────┤
+  │ Human-like flow       │ No           │ No      │ Stall → transition → response │
+  └───────────────────────┴──────────────┴─────────┴───────────────────────────────┘
+
+  The stall system is what makes it feel alive. Every other inference engine shows a loading spinner. Ours shows the character reacting in real-time.
+
+  Want me to start implementing? I'd go: grammar constraint engine (tool calling) first → async boundary system → VLM encoder — since tool calling is usable immediately with our current
+   text model, while VLM needs the vision encoder built.
+
+✻ Churned for 1m 43s
+
+❯ one more thing to add, most of the user inject custom system prompt, but if we let them add it then the UI & UX which is dependet on our own system prompt will be effected right
+  ? so how we will tackle that, also u said ' Future Async Ops ' what do u mean, can we add more and how many ?, also is there a technique that we can brain strom to by pass this
+  system prompt thing, like a state maintainence or profile mentaince what every idk
+
+● These are three really important questions. Let me go deep on each.
+
+  Question 1: System Prompt Conflict
+
+  The core problem:
+
+  Our engine needs:                    User wants:
+  ─────────────────                    ───────────
+  "You are Aria, warm..."              "You are a pirate captain..."
+  "Use <tool_call> format..."          "Always respond in JSON..."
+  "React to images naturally..."       "Be concise, no fluff..."
+  "Keep responses casual..."           (could conflict with everything)
+
+  If user overwrites → our UX breaks
+  If we lock it → user has no control
+
+  The answer: Move behavior OUT of the prompt and INTO the engine.
+
+  This is where our architecture is unique. We don't NEED the system prompt for most of our features:
+
+  ┌──────────────────┬──────────────────────────────┬─────────────────────────────────────────────────────┐
+  │     Feature      │        Other engines         │                     Our engine                      │
+  ├──────────────────┼──────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ Personality tone │ Prompt: "be warm and funny"  │ Control vectors + temp profile (tensor-level)       │
+  ├──────────────────┼──────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ Tool call format │ Prompt: "use JSON format"    │ Grammar constraints (logit bias, forces valid JSON) │
+  ├──────────────────┼──────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ Response style   │ Prompt: "be concise"         │ Gated residuals + attention temp (layer-level)      │
+  ├──────────────────┼──────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ Stall behavior   │ Prompt: "say hold on..."     │ Async boundary system (engine-level)                │
+  ├──────────────────┼──────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ Token control    │ Prompt: "don't say X"        │ Logit bias (suppress/boost tokens directly)         │
+  ├──────────────────┼──────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ Thinking mode    │ Prompt: "think step by step" │ Think token logit bias (toggle on/off)              │
+  └──────────────────┴──────────────────────────────┴─────────────────────────────────────────────────────┘
+
+  The system prompt becomes JUST flavor text. The user can write whatever they want — the engine enforces behavior at the tensor level regardless.
+
+  ┌──────────────────────────────────────────────────────┐
+  │  What the user controls (System Prompt):              │
+  │  "You are Captain Blackbeard, a fearsome pirate..."   │
+  │  ← Pure flavor. Can't break anything.                 │
+  ├──────────────────────────────────────────────────────┤
+  │  What the ENGINE controls (Tensor-level):             │
+  │  • Personality warmth/humor/energy → control vectors  │
+  │  • Tool format → grammar state machine                │
+  │  • Response length → gated residuals                  │
+  │  • Forbidden tokens → logit bias                      │
+  │  • Stall behavior → async boundary                    │
+  │  • Thinking → think token suppression                 │
+  │  ← Can't be overridden by any prompt                  │
+  └──────────────────────────────────────────────────────┘
+
+  Question 2: Future Async Operations — How Many?
+
+  Every I/O or compute operation that takes >100ms is a candidate. Here's the full list:
+
+  Category: PERCEPTION (input processing)
+  ──────────────────────────────────────
+    • IMAGE_ENCODE      — VLM vision encoder (300ms GPU)
+    • AUDIO_TRANSCRIBE  — Speech-to-text / whisper (500ms-2s)
+    • DOCUMENT_PARSE    — PDF/document OCR + chunking (1-5s)
+    • VIDEO_FRAME       — Extract + encode video frames (500ms/frame)
+
+  Category: ACTION (external operations)
+  ──────────────────────────────────────
+    • TOOL_CALL         — API/function execution (100ms-10s)
+    • WEB_FETCH         — HTTP request (200ms-5s)
+    • CODE_EXECUTE      — Run user code in sandbox (100ms-30s)
+    • FILE_IO           — Read/write files (50ms-2s)
+    • DB_QUERY          — Database operations (50ms-5s)
+    • SEND_MESSAGE      — Email/notification (200ms-2s)
+
+  Category: GENERATION (heavy compute)
+  ──────────────────────────────────────
+    • IMAGE_GENERATE    — Stable Diffusion (5-30s on GPU)
+    • TTS_GENERATE      — Text-to-speech audio (500ms-3s)
+    • EMBEDDING_COMPUTE — Batch embeddings for RAG (1-10s)
+
+  Category: MEMORY (background processing)
+  ──────────────────────────────────────
+    • RAG_SEARCH        — Vector similarity search (50-500ms)
+    • MEMORY_CONSOLIDATE — Background summarization (2-10s)
+    • KG_UPDATE         — Knowledge graph builder (1-5s)
+    • CONTEXT_SWITCH    — Loading different model/LoRA (1-5s)
+
+  That's 17 async boundary types. And they all use the same pattern:
+
+  enum BoundaryType : uint32_t {
+      // Perception
+      ASYNC_IMAGE_ENCODE       = 1 << 0,
+      ASYNC_AUDIO_TRANSCRIBE   = 1 << 1,
+      ASYNC_DOCUMENT_PARSE     = 1 << 2,
+      ASYNC_VIDEO_FRAME        = 1 << 3,
+      // Action
+      ASYNC_TOOL_CALL          = 1 << 4,
+      ASYNC_WEB_FETCH          = 1 << 5,
+      ASYNC_CODE_EXECUTE       = 1 << 6,
+      ASYNC_FILE_IO            = 1 << 7,
+      ASYNC_DB_QUERY           = 1 << 8,
+      ASYNC_SEND_MESSAGE       = 1 << 9,
+      // Generation
+      ASYNC_IMAGE_GENERATE     = 1 << 10,
+      ASYNC_TTS_GENERATE       = 1 << 11,
+      ASYNC_EMBEDDING_COMPUTE  = 1 << 12,
+      // Memory
+      ASYNC_RAG_SEARCH         = 1 << 13,
+      ASYNC_MEMORY_CONSOLIDATE = 1 << 14,
+      ASYNC_KG_UPDATE          = 1 << 15,
+      ASYNC_CONTEXT_SWITCH     = 1 << 16,
+  };
+
+  Adding more is trivial — just add a new enum value and register a stall template. The await_with_stall() function handles everything generically.
+
+  Some of these can even chain:
+
+  User: "Draw me a cat based on this photo" [sends image]
+
+  1. ASYNC_IMAGE_ENCODE (300ms)
+     Stall: "Ooh let me see this first..."
+
+  2. Model decides what to draw based on image
+     "Cute cat! Let me sketch something similar..."
+
+  3. ASYNC_IMAGE_GENERATE (15s on GPU!)
+     Stall: "Working on it... this is gonna be good 😤"
+     (can generate multiple stall phrases over 15 seconds)
+
+  4. ASYNC_TTS_GENERATE (1s)
+     "Here's your cat! I made it extra fluffy"
+     (voice plays while user views image)
+
+  Question 3: Profile State System (The Real Answer)
+
+  This is the key to solving the system prompt problem permanently. Instead of a prompt, we maintain a Profile State that lives at the engine level:
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │                    Character Profile                         │
+  │                 (Engine State, NOT Prompt)                    │
+  │                                                              │
+  │  ┌──────────────────────────────────────────────────────┐   │
+  │  │  Identity Layer                                       │   │
+  │  │  name: "Aria"                                         │   │
+  │  │  role_token: replaces "assistant" in ChatML            │   │
+  │  │  voice_id: "aria_v2" (for TTS)                         │   │
+  │  └──────────────────────────────────────────────────────┘   │
+  │                                                              │
+  │  ┌──────────────────────────────────────────────────────┐   │
+  │  │  Personality Layer (Tensor-Level Enforcement)          │   │
+  │  │                                                        │   │
+  │  │  control_vectors[28 layers] ← warmth, humor, energy    │   │
+  │  │  attn_temp[28] ← creativity/focus profile              │   │
+  │  │  attn_gate[28] ← which layers matter most              │   │
+  │  │  ffn_gate[28]  ← output style shaping                  │   │
+  │  │  head_scale[28] ← attention head importance             │   │
+  │  │  logit_bias[vocab] ← token-level control                │   │
+  │  │                                                        │   │
+  │  │  These CANNOT be overridden by any prompt.              │   │
+  │  │  The model physically produces different activations.   │   │
+  │  └──────────────────────────────────────────────────────┘   │
+  │                                                              │
+  │  ┌──────────────────────────────────────────────────────┐   │
+  │  │  Behavior Layer (Engine-Level Rules)                   │   │
+  │  │                                                        │   │
+  │  │  grammar_mode: HERMES_TOOL_CALL                        │   │
+  │  │  thinking: disabled                                     │   │
+  │  │  max_response_tokens: 256                               │   │
+  │  │  stall_threshold_ms: 150                                │   │
+  │  │  forbidden_tokens: [slurs, competitor_names, ...]       │   │
+  │  │  boost_tokens: [emoji_tokens, casual_words, ...]        │   │
+  │  │  stop_sequences: ["<|im_end|>", "</tool_call>"]         │   │
+  │  │                                                        │   │
+  │  │  Enforced by grammar + logit bias. Prompt-proof.        │   │
+  │  └──────────────────────────────────────────────────────┘   │
+  │                                                              │
+  │  ┌──────────────────────────────────────────────────────┐   │
+  │  │  Memory Layer (Persistent State)                       │   │
+  │  │                                                        │   │
+  │  │  conversation_kv: KV cache (current session)           │   │
+  │  │  facts[]: extracted from past conversations             │   │
+  │  │  embeddings[]: for RAG retrieval                        │   │
+  │  │  knowledge_graph: entities + relations                  │   │
+  │  │  user_preferences: learned over time                    │   │
+  │  │                                                        │   │
+  │  │  Injected via prefill, not system prompt.               │   │
+  │  └──────────────────────────────────────────────────────┘   │
+  │                                                              │
+  │  ┌──────────────────────────────────────────────────────┐   │
+  │  │  User Prompt Layer (ONLY thing user controls)          │   │
+  │  │                                                        │   │
+  │  │  system_prompt: "You are a helpful coding assistant"   │   │
+  │  │                                                        │   │
+  │  │  This is flavor text. It provides CONTEXT but           │   │
+  │  │  cannot override engine-level behavior.                  │   │
+  │  │  User can write ANYTHING here safely.                   │   │
+  │  └──────────────────────────────────────────────────────┘   │
+  └─────────────────────────────────────────────────────────────┘
+
+  Why This Works: Prompt vs Tensor
+
+  Traditional approach (everyone else):
+    System prompt says "be warm" → model MIGHT listen → model MIGHT ignore
+    System prompt says "use JSON" → model MIGHT format correctly → 38% error rate
+    User overwrites prompt → everything breaks
+
+  Our approach:
+    Control vectors say "be warm" → activations PHYSICALLY shift → model HAS to be warm
+    Grammar says "use JSON" → invalid tokens get -inf bias → 0% error rate
+    User writes anything → engine behavior unchanged, prompt is just context
+
+  The model can't "choose" to ignore our interventions. They operate on the tensor math itself. It's like the difference between asking someone to speak French vs physically rewiring
+  their brain to produce French.
+
+  The Profile JSON (What Gets Saved Per Character)
+
+  {
+      "identity": {
+          "name": "Aria",
+          "role_token": "Aria"
+      },
+      "personality": {
+          "warmth": 0.8,
+          "humor": 0.6,
+          "energy": 0.7,
+          "formality": 0.3,
+          "verbosity": 0.5
+      },
+      "interventions": {
+          "temp_early": 1.25,
+          "temp_mid": 1.0,
+          "temp_late": 0.82,
+          "attn_gate_mid": 0.92,
+          "ffn_gate_mid": 0.95
+      },
+      "behavior": {
+          "thinking": 0,
+          "grammar": "hermes_tool_call",
+          "max_response": 256,
+          "stall_threshold_ms": 150,
+          "stall_max_tokens": 8
+      },
+      "token_control": {
+          "boost": ["casual_words"],
+          "suppress": ["profanity", "eos_early"],
+          "eos_bias": -3.0
+      },
+      "async_stalls": {
+          "tool_call": "React briefly while waiting for the result.",
+          "image": "React briefly — you're about to see the image.",
+          "search": "You're searching your memory. Think out loud.",
+          "generate": "You're creating something. Build anticipation."
+      },
+      "user_system_prompt": "<<< USER CAN PUT ANYTHING HERE >>>"
+  }
+
+  Personality axes (warmth, humor, etc.) get computed into control vectors on first load, cached per model. Everything else maps directly to our existing intervention config.
+
+  The Bottom Line
+
+  What the user can break:     NOTHING
+  What the user can customize: flavor text, context, instructions
+  What the engine guarantees:  personality, tool format, stall behavior, safety
+
+  The system prompt becomes a SUGGESTION.
+  The intervention surfaces are the LAW.
+
+  This is the architecture. Want me to start implementing? I'd suggest this order:
+
+  1. Grammar constraint engine (tool calling works TODAY) ( This should be Dynamic and flexible as claude-code but highly optimized for mobile )
+  2. Async boundary system (stall generation)
+  3. Profile state system (replaces prompt-dependent behavior)
+  4. VLM encoder (build_vision_graph with GPU dispatch)
+
+
+
+------------------------------
+
+
+1. Context Length Impact on Tool Calling
+
+  Short answer: Grammar masking is context-independent. The model forward pass scales linearly.
+
+  Here's the breakdown for Qwen3-0.6B at different context lengths:
+
+  ┌───────────────────────────────┬─────────┬──────────┬──────────┐
+  │           Component           │ 298 ctx │ 2048 ctx │ 8192 ctx │
+  ├───────────────────────────────┼─────────┼──────────┼──────────┤
+  │ Weight GEMV (bandwidth-bound) │ ~47ms   │ ~47ms    │ ~47ms    │
+  ├───────────────────────────────┼─────────┼──────────┼──────────┤
+  │ KV attention O(seq_len)       │ ~0.5ms  │ ~3ms     │ ~12ms    │
+  ├───────────────────────────────┼─────────┼──────────┼──────────┤
+  │ Grammar mask (vocab-only)     │ ~0.8ms  │ ~0.8ms   │ ~0.8ms   │
+  ├───────────────────────────────┼─────────┼──────────┼──────────┤
+  │ Total decode                  │ ~50ms   │ ~52ms    │ ~60ms    │
+  └───────────────────────────────┴─────────┴──────────┴──────────┘
+
+  The grammar engine operates on logits (151936 floats) — it doesn't touch KV cache or context at all. So tool calling overhead stays constant at 0.8ms regardless of context.
+
+  Could we pipeline or GPU-offload grammar? We could run grammar masking on a separate thread while the next forward pass computes, but 0.8ms out of 50ms (1.6%) isn't worth the
+  complexity. GPU would actually be slower — grammar is branch-heavy (state machine switches), which GPUs hate.
+
+  The real context cost is the multi-step prefill. When we inject 32 tool-result tokens mid-conversation, those are prefilled at ~80 tok/s — same as initial prompt. At long context this
+   stays efficient because prefill is parallelized across the sequence.
+
+  2. Plugin Compute Graph — How it works today
+
+  The graph is NOT JIT in the traditional sense. It's a declarative dataflow graph rebuilt every forward pass:
+
+  build_graph() called →
+    ggml_context created →
+      ops added: get_rows, rms_norm, mul_mat, rope, flash_attn, etc. →
+        ggml_cgraph returned →
+          gallocr allocates intermediates →
+            backend executes ops in dependency order
+
+  It's rebuilt each call because the shape changes (seq_len=298 for prefill, seq_len=1 for decode, different kv_pos). But the compute kernels are pre-compiled in the backend .so files
+  (ggml-cpu.so, ggml-opencl.so). Think of it like a SQL query plan — you describe WHAT to compute, the backend decides HOW.
+
+  Currently build_graph() is hardcoded for Qwen3. To support Llama/Mistral/Gemma/Phi/etc., we need architecture plugins.
+
+  3. Native RAG — Very doable
+
+  Embedding models are just transformers that output vectors instead of token logits. We already have the forward pass code. The full RAG pipeline would be:
+
+  File → Parse → Chunk → Embed → Index → Query → Retrieve → Inject into prompt
+
+  All native C++, no Python dependency.
+
+  ---
+  Let me enter plan mode to design these two features. They're deeply connected — the plugin graph system is needed for RAG (embedding models have different architectures than chat
+  models).

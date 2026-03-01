@@ -46,6 +46,11 @@ fun extractTarXzWithCommonsCompress(tarXzFile: File, targetDir: File) {
 
             val outputFile = File(targetDir, relativePath)
 
+            // Path traversal protection: ensure extracted file stays within target directory
+            if (!outputFile.canonicalPath.startsWith(targetDir.canonicalPath + File.separator)) {
+                throw SecurityException("Path traversal detected: ${entry!!.name}")
+            }
+
             if (entry.isDirectory) {
                 outputFile.mkdirs()
             } else {

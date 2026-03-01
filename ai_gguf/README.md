@@ -107,7 +107,7 @@ Model-agnostic tool calling with GBNF grammar constraints. Works with any model 
 ```kotlin
 val toolManager = ToolCallManager(GGUFNativeLib)
 
-// Define tools with DSL
+// Define model with DSL
 toolManager.registerTools(
     tool("get_weather", "Get current weather") {
         stringParam("location", "City name", required = true)

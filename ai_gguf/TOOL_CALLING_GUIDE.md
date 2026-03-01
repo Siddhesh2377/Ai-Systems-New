@@ -35,7 +35,7 @@ val weatherTool = tool("get_weather", "Get current weather") {
     )
 }
 
-// Register tools
+// Register model
 toolCallManager.registerTools(
     weatherTool,
     tool("get_time", "Get current time") {
@@ -199,7 +199,7 @@ if (toolCallManager.isModelCompatible()) {
 ## Common Tools Example
 
 ```kotlin
-// Use pre-configured common tools
+// Use pre-configured common model
 val toolCallManager = ToolCallManager.withCommonTools(gguf)
 
 // Includes:
@@ -295,7 +295,7 @@ if (toolCall == null) {
 val gguf = GGUFNativeLib()
 val toolCallManager = ToolCallManager(gguf)
 
-// 2. Register tools
+// 2. Register model
 toolCallManager.registerTools(
     tool("get_weather", "Get weather for a location") {
         stringParam("city", "City name", required = true)
@@ -377,7 +377,7 @@ if (!toolCallManager.isModelCompatible()) {
 
 // 2. Tools registered
 if (toolCallManager.getRegisteredTools().isEmpty()) {
-    println("No tools registered!")
+    println("No model registered!")
 }
 
 // 3. Enabled successfully

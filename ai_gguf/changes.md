@@ -112,7 +112,7 @@ external fun nativeSetTypedGrammar(enabled: Boolean)
 val ggufLib = GGUFNativeLib()
 val toolManager = ToolCallManager(ggufLib)
 
-// Register tools
+// Register model
 toolManager.registerTool(
     tool("get_weather", "Get current weather for a location") {
         stringParam("location", "City name", required = true)
@@ -182,7 +182,7 @@ toolManager.enable(ToolCallingConfig(grammarMode = GrammarMode.STRICT))
 
 // LAZY: Model can freely output text OR a tool call.
 // Grammar only activates if the model starts outputting "{".
-// Use for general chat where tools are optional.
+// Use for general chat where model are optional.
 toolManager.enable(ToolCallingConfig(grammarMode = GrammarMode.LAZY))
 ```
 

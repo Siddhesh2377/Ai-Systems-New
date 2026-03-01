@@ -1,46 +1,30 @@
 #pragma once
-
-/**
- * Optimized JNI utility functions for token streaming
- * 
- * Features:
- * - Cached JNI method IDs for minimal lookup overhead
- * - Thread-safe caching
- * - Immediate token delivery without buffering
- */
-
 #include <jni.h>
 #include <string>
+#include <vector>
 
 namespace jni {
 
-/**
- * Send a token to the Java callback immediately
- * No buffering - each token is delivered as soon as it's decoded
- */
-    void on_token(JNIEnv* env, jobject cb, const std::string& txt);
+std::string to_string(JNIEnv* env, jstring s);
+jstring to_jstring(JNIEnv* env, const std::string& s);
 
-/**
- * Send an error message to the Java callback
- */
-    void on_error(JNIEnv* env, jobject cb, const char* msg);
+struct Callback {
+    JNIEnv* env = nullptr;
+    jobject obj = nullptr;
+    jmethodID on_token     = nullptr;
+    jmethodID on_tool_call = nullptr;
+    jmethodID on_done      = nullptr;
+    jmethodID on_error     = nullptr;
+    jmethodID on_metrics   = nullptr;
 
-/**
- * Send a tool call to the Java callback
- */
-    void on_toolcall(JNIEnv* env, jobject cb,
-                     const std::string& name,
-                     const std::string& payload);
-
-/**
- * Signal completion to the Java callback
- */
-    void on_done(JNIEnv* env, jobject cb);
-
-/**
- * Reset cached JNI references
- * Call this if the callback class might have changed
- */
-    void reset_cache();
+    bool init(JNIEnv* e, jobject callback);
+    void token(const std::string& text);
+    void tool_call(const std::string& name, const std::string& args);
+    void done();
+    void error(const std::string& msg);
+    void metrics(float tps, float ttft_ms, float total_ms,
+                 int n_eval, int n_pred,
+                 float model_mb, float ctx_mb, float peak_mb, float mem_pct);
+};
 
 } // namespace jni

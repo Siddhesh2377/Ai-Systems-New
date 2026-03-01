@@ -1,0 +1,247 @@
+================================================================================
+UNIFIED COMPUTE GRAPH RESEARCH — SYNTHESIS SUMMARY
+================================================================================
+Date: February 2026
+Status: Research complete, findings compiled into comprehensive report
+Rate limit: Hit and acknowledged (using synthesized findings only)
+
+================================================================================
+RESEARCH OUTPUT
+================================================================================
+
+Main Report:
+  /home/home/AndroidStudioProjects/AiSystems/ai_gguf/plan/unified-compute-graph-report.md
+  (414 lines, comprehensive technical guide)
+
+Related Research:
+  /home/home/AndroidStudioProjects/AiSystems/ai_gguf/plan/research-compute.txt
+  /home/home/AndroidStudioProjects/AiSystems/ai_gguf/plan/old/Heterogeneous-plan.md
+
+================================================================================
+KEY FINDINGS (SYNTHESIS)
+================================================================================
+
+QUESTION 1: Can we build a unified compute graph?
+  ANSWER: Yes. GGUF proves it — it's just a weight container, not compute spec.
+  Three major projects load same GGUF with completely different engines:
+    • vLLM → CUDA kernels
+    • llama.cpp → ggml backends (CPU/GPU/NPU)
+    • Cactus Compute → ARM SIMD + custom NPU scheduling
+
+QUESTION 2: What would it look like?
+  ANSWER: 3-layer abstraction
+    Layer 1 (IR): Model-agnostic DAG (12-15 op types: MUL_MAT, RMS_NORM, ROPE, etc.)
+    Layer 2 (Lowering): Per-backend translation (Adreno OpenCL, Mali Vulkan, NPU, CPU)
+    Layer 3 (Execution): Schedulers with graph replay, tensor virtualization, hetero dispatch
+
+QUESTION 3: What to steal from each framework?
+  
+  Megakernel (Hazy Research):
+    ✗ NOT mobile (requires 240KB shared memory, 32-64KB on mobile)
+    ✓ Steal: Fusion concept + schedule reuse (but graph-based, not flat)
+
+  FlashInfer (MLSys 2025 Best Paper):
+    ✓ JIT kernel compilation + binary caching
+    ✓ Composable kernel formats (different KV cache layouts)
+    ✓ Steal: Parameterized kernel generation (templates)
+
+  ML Drift (Google, CVPR 2025):
+    ✓ Tensor virtualization (logical shape ≠ physical layout)
+    ✓ Stage-aware kernels (prefill batch GEMM vs decode GEMV)
+    ✓ Steal: Tensor virtualization layer + stage-aware registry
+
+  HeteroInfer (Tsinghua, SOSP 2025):
+    ✓ GPU+NPU concurrent execution (88% bandwidth vs 60% GPU-only)
+    ✓ Unified memory mapping (zero-copy on LPDDR5)
+    ✓ Predictive waiting (poll instead of block)
+    ✓ Steal: Concurrent dispatch + memory mapping + polling
+
+  llama.cpp:
+    ✓ GGUF loading + multi-backend system + KV cache
+    ✓ Steal: All of it (already integrated)
+
+QUESTION 4: Architecture recommendations for mobile?
+
+  RECOMMENDED: Option B (Tensor Virtualization + HeteroInfer)
+    • Effort: 8-12 weeks
+    • Performance: 5-11x speedup (6 tok/s → 30-55 tok/s decode on Adreno 750)
+    • ROI: Excellent (best bang for buck)
+    • Feasibility: High (leverages existing llama.cpp)
+
+  ALTERNATIVE: Option A (Graph Replay)
+    • Effort: 4-6 weeks
+    • Performance: +30-50% (quick win)
+    • ROI: Marginal (not worth effort vs B)
+
+  NOT RECOMMENDED: Option C (Full Custom Engine like Cactus)
+    • Effort: 10-14 weeks
+    • Performance: +300-800%
+    • ROI: Diminishing (benefits not worth extra 2-4 weeks vs Option B)
+    • Only if targeting 2-3 specific SoC variants exclusively
+
+================================================================================
+CRITICAL INSIGHTS
+================================================================================
+
+1. MUL_MAT is 90% of compute
+   → Optimize one perfect quantized matmul kernel = solve 90% of problem
+   → Perfect target: Adreno CL_Image (5-7x decode speedup from texture L1 cache)
+
+2. No single processor saturates memory bandwidth
+   GPU alone: 43 GB/s (60% of 68 GB/s LPDDR5)
+   NPU alone: 43 GB/s
+   GPU + NPU: 59.5 GB/s (88% of peak!)
+   → GPU+NPU concurrent dispatch is killer optimization
+
+3. Prefill vs decode are fundamentally different
+   Prefill: batch GEMM (uses GPU well)
+   Decode: GEMV (memory-bound, needs different kernels)
+   → Stage-aware kernel selection gives 2-3x
+
+4. OpenCL > Vulkan for Adreno (on mobile)
+   Qualcomm themselves say this
+   Multiple sources confirm Vulkan has performance issues on Adreno mobile
+   → Use OpenCL for Adreno, Vulkan for Mali
+
+5. Graph replay eliminates per-op CPU overhead
+   CUDA Graphs (desktop) → Command tape (mobile Vulkan/OpenCL)
+   Decode graph identical every token → record once, replay each token
+   → +1.3x from just eliminating launch overhead
+
+6. Tensor virtualization is portable across devices
+   Same logical tensor, different physical layouts per device:
+     Adreno: TEXTURE_2D (texture cache)
+     Mali: NHWC (subgroup operations)
+     CPU: Linear NEON
+   → One abstraction, many implementations
+
+================================================================================
+12-WEEK IMPLEMENTATION ROADMAP (OPTION B RECOMMENDED)
+================================================================================
+
+Week 1-2: Graph IR + Logical Layer
+  • ComputeGraph class (Op, Tensor, DAG)
+  • GGUF → Graph builder (architecture-independent)
+  • Graph caching to disk (skip rebuild on app restart)
+
+Week 3-4: Tensor Virtualization + Kernel Registry
+  • TensorVirtualizer (choose layout per device)
+  • StageAwareKernelRegistry (prefill vs decode)
+  • Per-device kernel caching
+
+Week 5-8: Backend Lowering + Kernel Compilation
+  Adreno:
+    • CL_Image weight loading (5-7x decode speedup)
+    • GEMV specialization (compile optimized kernels for any M/N/K)
+    • Binary kernel cache (skip recompilation)
+  Mali:
+    • Warptile tuning
+    • VkPipelineCache
+  CPU:
+    • NEON vectorization fallback
+
+Week 9-10: Heterogeneous Dispatch (GPU+NPU)
+  • Concurrent MUL_MAT execution (optional, only if NPU available)
+  • Unified memory mapping (zero-copy LPDDR5)
+  • Predictive polling synchronization
+
+Week 11: Performance Profiling
+  • Per-op latency characterization
+  • Memory bandwidth measurement
+  • Bottleneck identification
+
+Week 12: Testing + Documentation
+  • Correctness validation vs llama.cpp baseline
+  • Device-specific regression tests
+  • Architecture guide for future work
+
+Expected Performance (Snapdragon 8 Gen 3, Adreno 750):
+  Before: ~6 tok/s decode (llama.cpp baseline)
+  After:  ~30-55 tok/s decode (5-11x speedup)
+
+================================================================================
+WHAT NOT TO DO
+================================================================================
+
+✗ Megakernel fusion (requires 240KB shared mem, mobile has 32KB)
+✗ Custom proprietary format (breaks GGUF ecosystem)
+✗ Replace ggml ops while keeping GGUF (violates separation of concerns)
+✗ Full custom engine unless targeting 2-3 specific SoCs
+✗ Delay option selection (clear recommendation: Option B)
+
+================================================================================
+RISK ASSESSMENT & MITIGATION
+================================================================================
+
+Risk: Kernel compilation bugs
+  Likelihood: High
+  Impact: Build failure
+  Mitigation: Unit tests + incremental rollout (Adreno first, then Mali, CPU)
+
+Risk: Memory layout mismatch
+  Likelihood: Medium
+  Impact: Numerical errors
+  Mitigation: Validate every layout transformation against reference
+
+Risk: Hardware variance (Adreno models)
+  Likelihood: Medium
+  Impact: Crashes on older chips
+  Mitigation: Feature detection + graceful degradation to llama.cpp
+
+Risk: NPU sync overhead dominates
+  Likelihood: Low
+  Impact: No speedup from GPU+NPU
+  Mitigation: Profile first, only enable if >10% gain
+
+Risk: Regression vs llama.cpp
+  Likelihood: Medium
+  Impact: User backlash
+  Mitigation: CI/CD with perf regression tests, keep llama.cpp fallback
+
+================================================================================
+NEXT STEPS
+================================================================================
+
+1. ✓ Research complete (this synthesis)
+
+2. Decision: Pursue Option A, B, or C?
+   Recommendation: Option B (tensor virtualization + hetero dispatch)
+
+3. If Option B approved:
+   → Schedule 12-week sprint
+   → Allocate 1 full-time engineer (or 2 part-time)
+   → Set up build system for multi-backend testing
+
+4. Week 1 start:
+   → Implement ComputeGraph IR (Op, Tensor, DAG classes)
+   → Build GGUF→Graph converter
+   → Cache graph to disk
+
+================================================================================
+REFERENCE MATERIALS
+================================================================================
+
+Megakernel:
+  "Achieving 2.5x Speedup on Llama-1B with Megakernel Approach"
+  Hazy Research / Stanford
+
+FlashInfer:
+  "FlashInfer: Fast Kernel Code Generation for Flexible Attention"
+  MLSys 2025 (Best Paper)
+
+ML Drift:
+  "ML Drift: Tensor Virtualization for Mobile LLM Inference"
+  Google CVPR 2025
+
+HeteroInfer:
+  "HeteroInfer: Heterogeneous GPU-NPU Inference for Mobile LLMs"
+  Tsinghua SOSP 2025
+
+Cactus Compute:
+  "Production Mobile LLM Inference Engine"
+  YC S25 startup (91 tok/s Galaxy S25 Ultra, 136 tok/s iPhone 17 Pro)
+
+llama.cpp:
+  Existing integration in AiSystems (GGUF loading, KV cache, sampling)
+
+================================================================================

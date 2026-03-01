@@ -1,10 +1,5 @@
-import org.gradle.kotlin.dsl.withType
-import org.jetbrains.kotlin.gradle.dsl.JvmTarget
-import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
-
 plugins {
     alias(libs.plugins.android.library)
-    alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.serialization)
 }
 
@@ -21,22 +16,26 @@ android {
         consumerProguardFiles("consumer-rules.pro")
 
         ndk {
-            abiFilters += listOf("arm64-v8a", "x86_64")
+            abiFilters += listOf("arm64-v8a") // Android-only: ARM64 only, x86_64 emulator support removed
         }
 
         externalNativeBuild {
             cmake {
-                arguments += "-DGGML_USE_BLAS=ON"
-                arguments += "-DLLAMA_CURL=OFF"
+                // Mobile-optimized build: CPU + OpenCL only
+                arguments += "-DLLAMA_MOBILE=ON"
                 arguments += "-DLLAMA_BUILD_COMMON=ON"
-                arguments += "-DGGML_LLAMAFILE=OFF"
                 arguments += "-DGGML_PAGE_SIZE=16384"
                 arguments += "-DGGML_OPENMP=OFF"
 
-                // ARM CPU variant optimizations (dotprod, i8mm, sve) with runtime selection
+                // ARM CPU: single build targeting dotprod (ARMv8.2+), KleidiAI disabled (SIGILL crash)
                 arguments += "-DGGML_NATIVE=OFF"
-                arguments += "-DGGML_CPU_ALL_VARIANTS=ON"
-                arguments += "-DGGML_BACKEND_DL=ON"
+                arguments += "-DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16"
+                arguments += "-DGGML_CPU_KLEIDIAI=OFF"
+
+                // GPU: OpenCL disabled for GGUF (CPU-only text gen)
+                // OpenCL is only used by ai_sd (diffusion). Having it here
+                // adds ~5-10s to model load due to Adreno kernel compilation.
+                arguments += "-DGGML_OPENCL=OFF"
 
                 arguments += "-DCMAKE_BUILD_TYPE=Release"
                 cppFlags += listOf(
@@ -68,17 +67,12 @@ android {
     externalNativeBuild {
         cmake {
             path("src/main/cpp/CMakeLists.txt")
-            version = "3.22.1"
+            version = "3.31.4"
         }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
-    }
-    tasks.withType<KotlinJvmCompile>().configureEach {
-        compilerOptions {
-            jvmTarget.set(JvmTarget.JVM_17)
-        }
     }
     packaging {
         jniLibs {

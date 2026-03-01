@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3 — How llama.cpp Works: Hardware & Software</title>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@300;400;500&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0a0a11;--surface:#111119;--card:#16162a;--card2:#1c1c35;--border:#252545;--border2:#2e2e50;--accent:#7c8cf5;--accent2:#6ee7b7;--accent3:#f0abfc;--accent4:#fbbf24;--text:#d4dae6;--muted:#6b7280;--dim:#3d3d5c;--cpu:#60a5fa;--gpu:#34d399;--npu:#fb923c;--mem:#f87171;--radius:16px;--radius-sm:10px}*{margin:0;padding:0;box-sizing:border-box}html{scroll-behavior:smooth}body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;font-size:15px;line-height:1.7;-webkit-font-smoothing:antialiased}::selection{background:var(--accent);color:var(--bg)}.nav{position:sticky;top:0;z-index:100;background:rgba(10,10,17,.85);backdrop-filter:blur(16px);border-bottom:1px solid var(--border);padding:10px 20px;display:flex;gap:8px;flex-wrap:wrap;justify-content:center}.nav a{font-family:'DM Mono',monospace;font-size:11px;color:var(--muted);text-decoration:none;padding:5px 14px;border-radius:20px;border:1px solid transparent;transition:all .25s}.nav a:hover,.nav a.active{color:var(--accent);border-color:var(--accent);background:rgba(124,140,245,.08)}.hero{text-align:center;padding:80px 20px 50px;position:relative}.hero::before{content:'';position:absolute;top:-120px;left:50%;transform:translateX(-50%);width:600px;height:600px;background:radial-gradient(circle,rgba(240,171,252,.08) 0%,transparent 70%);pointer-events:none}.hero-badge{font-family:'DM Mono',monospace;font-size:11px;color:var(--accent3);background:rgba(240,171,252,.1);border:1px solid rgba(240,171,252,.2);padding:4px 14px;border-radius:20px;display:inline-block;margin-bottom:20px}.hero h1{font-family:'Syne',sans-serif;font-weight:800;font-size:clamp(32px,5vw,56px);line-height:1.1;margin-bottom:16px;background:linear-gradient(135deg,var(--text) 0%,var(--accent3) 50%,var(--accent) 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent}.hero p{font-family:'DM Mono',monospace;font-size:13px;color:var(--muted);max-width:600px;margin:0 auto}.container{max-width:900px;margin:0 auto;padding:0 20px 80px}.arrow{text-align:center;color:var(--dim);font-size:20px;padding:16px 0;opacity:.5}.step{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;opacity:0;transform:translateY(30px);transition:opacity .5s,transform .5s;margin-bottom:8px}.step.visible{opacity:1;transform:translateY(0)}.step-top{padding:32px}.step-num{font-family:'DM Mono',monospace;font-size:10px;font-weight:500;padding:3px 10px;border-radius:12px;display:inline-block;margin-bottom:14px}.step-num.blue{color:var(--cpu);background:rgba(96,165,250,.1)}.step-num.green{color:var(--gpu);background:rgba(52,211,153,.1)}.step-num.orange{color:var(--npu);background:rgba(251,146,60,.1)}.step-num.red{color:var(--mem);background:rgba(248,113,113,.1)}.step-num.purple{color:var(--accent);background:rgba(124,140,245,.1)}.step-num.pink{color:var(--accent3);background:rgba(240,171,252,.1)}.step h2{font-family:'Syne',sans-serif;font-weight:700;font-size:22px;margin-bottom:10px;color:#fff}.step .desc{font-family:'DM Mono',monospace;font-size:12px;line-height:1.75;color:var(--muted);max-width:700px}.step .desc strong{color:var(--text)}.step .desc .hl{color:var(--accent)}.step .desc .hl2{color:var(--accent2)}.step .desc .hl3{color:var(--accent3)}.step .desc .hl4{color:var(--accent4)}.vis{margin-top:24px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);padding:24px;overflow-x:auto}.vis-title{font-family:'DM Mono',monospace;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:12px}.d-box{font-family:'DM Mono',monospace;font-size:11px;padding:8px 14px;border-radius:8px;border:1px solid var(--border);background:var(--card2);color:var(--text);text-align:center;transition:all .2s;cursor:default}.d-box:hover{border-color:var(--accent);transform:translateY(-2px)}.d-box small{display:block;font-size:9px;color:var(--muted);margin-top:2px}.d-arrow{color:var(--dim);font-size:16px;text-align:center}.expand-btn{display:block;width:100%;padding:14px 32px;background:none;border:none;border-top:1px solid var(--border);color:var(--muted);font-family:'DM Mono',monospace;font-size:11px;cursor:pointer;text-align:left;transition:all .2s}.expand-btn:hover{color:var(--accent);background:rgba(124,140,245,.03)}.expand-btn .chevron{display:inline-block;transition:transform .25s;margin-right:8px}.expand-btn.open .chevron{transform:rotate(90deg)}.expand-panel{max-height:0;overflow:hidden;transition:max-height .4s}.expand-panel.open{max-height:12000px}.expand-inner{padding:24px 32px}.tabs{display:flex;gap:4px;margin-bottom:16px;flex-wrap:wrap}.tab{font-family:'DM Mono',monospace;font-size:11px;padding:5px 14px;border-radius:8px;border:1px solid var(--border);background:none;color:var(--muted);cursor:pointer;transition:all .2s}.tab:hover{color:var(--text)}.tab.active{color:var(--accent);border-color:var(--accent);background:rgba(124,140,245,.08)}.tab-content{display:none}.tab-content.active{display:block}.code{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'DM Mono',monospace;font-size:11px;line-height:1.7;color:var(--text);overflow-x:auto;margin:12px 0;white-space:pre}.code .cm{color:var(--muted)}.code .kw{color:var(--accent)}.code .fn{color:var(--accent2)}.code .str{color:var(--accent3)}.code .num{color:var(--accent4)}.dtable{width:100%;border-collapse:collapse;font-family:'DM Mono',monospace;font-size:11px;margin:12px 0}.dtable th{text-align:left;padding:8px 12px;border-bottom:1px solid var(--border2);color:var(--muted);font-weight:400;text-transform:uppercase;font-size:10px;letter-spacing:.5px}.dtable td{padding:8px 12px;border-bottom:1px solid var(--border);color:var(--text)}.dtable tr:hover td{background:rgba(124,140,245,.03)}.formula{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:16px 20px;font-family:'DM Mono',monospace;font-size:13px;color:var(--accent);text-align:center;margin:12px 0}.pc-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:12px 0}.pc-box{background:var(--card);border:1px solid var(--border);border-radius:var(--radius-sm);padding:16px}.pc-box h4{font-family:'DM Mono',monospace;font-size:11px;margin-bottom:8px;text-transform:uppercase;letter-spacing:.5px}.pc-box.pro h4{color:var(--accent2)}.pc-box.con h4{color:var(--mem)}.pc-box ul{list-style:none}.pc-box li{font-family:'DM Mono',monospace;font-size:11px;color:var(--muted);padding:3px 0;padding-left:14px;position:relative}.pc-box.pro li::before{content:'+';position:absolute;left:0;color:var(--accent2)}.pc-box.con li::before{content:'−';position:absolute;left:0;color:var(--mem)}
+.warn{background:rgba(248,113,113,.06);border:1px solid rgba(248,113,113,.2);border-radius:8px;padding:14px 18px;font-family:'DM Mono',monospace;font-size:11px;color:var(--mem);margin:12px 0}
+@media(max-width:640px){.pc-grid{grid-template-columns:1fr}.step-top{padding:20px}.expand-inner{padding:16px 20px}}
+</style>
+</head>
+<body>
+
+<nav class="nav">
+  <a href="#s1">Architecture</a>
+  <a href="#s2">GGML Graph</a>
+  <a href="#s3">Backend Dispatch</a>
+  <a href="#s4">Vulkan Backend</a>
+  <a href="#s5">OpenCL Backend</a>
+  <a href="#s6">CPU Backend</a>
+  <a href="#s7">Mobile Bottlenecks</a>
+  <a href="#s8">Pros & Cons</a>
+</nav>
+
+<header class="hero">
+  <div class="hero-badge">PAGE 3 OF 6</div>
+  <h1>How llama.cpp Works<br>Hardware & Software</h1>
+  <p>The complete architecture from ggml tensor ops to Vulkan shader dispatch. Based on your actual codebase at llama.cpp-android.</p>
+</header>
+
+<div class="container">
+
+<!-- S1: SOFTWARE ARCHITECTURE -->
+<div class="step" id="s1">
+  <div class="step-top">
+    <span class="step-num purple">01 SOFTWARE ARCHITECTURE</span>
+    <h2>The Three Layers</h2>
+    <div class="desc">
+      llama.cpp is three distinct systems: <strong>ggml</strong> (tensor library + graph engine),
+      <strong>llama.cpp</strong> (model loader + architecture-specific graph builder),
+      and <strong>backends</strong> (CPU/Vulkan/OpenCL/Metal — execute the graph on hardware).
+    </div>
+
+    <div class="vis">
+      <div class="vis-title">Software Stack</div>
+      <div style="display:flex;flex-direction:column;align-items:center;gap:4px;">
+        <div class="d-box" style="width:100%;max-width:700px;border-color:var(--accent);padding:14px;">
+          <strong>llama.cpp</strong> — Model Layer<small>Load GGUF → read architecture → build compute graph per token → manage KV cache</small>
+        </div>
+        <div class="d-arrow">↓ creates ggml_cgraph</div>
+        <div class="d-box" style="width:100%;max-width:700px;border-color:var(--accent2);padding:14px;">
+          <strong>ggml</strong> — Tensor Library<small>ggml_tensor (shape+type+op), ggml_cgraph (DAG of ops), ggml_backend_sched (multi-backend scheduler)</small>
+        </div>
+        <div class="d-arrow">↓ dispatches to backends</div>
+        <div style="display:flex;gap:8px;width:100%;max-width:700px;">
+          <div class="d-box" style="flex:1;border-color:var(--cpu);"><span style="color:var(--cpu)">CPU</span><small>NEON / DOTPROD / I8MM / SVE</small></div>
+          <div class="d-box" style="flex:1;border-color:var(--gpu);"><span style="color:var(--gpu)">Vulkan</span><small>SPIR-V shaders, cmd buffers</small></div>
+          <div class="d-box" style="flex:1;border-color:var(--gpu);"><span style="color:var(--gpu)">OpenCL</span><small>Adreno kernels, CL buffers</small></div>
+          <div class="d-box" style="flex:1;border-color:var(--npu);"><span style="color:var(--npu)">Hexagon</span><small>ACCEL device type</small></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="arrow">↓</div>
+
+<!-- S2: GGML GRAPH -->
+<div class="step" id="s2">
+  <div class="step-top">
+    <span class="step-num green">02 GGML COMPUTE GRAPH</span>
+    <h2>Building the Op DAG Every Token</h2>
+    <div class="desc">
+      For every token, llama.cpp constructs a <strong>new compute graph</strong> — a directed acyclic graph
+      of ~460 ggml operations. Each node is a <span class="hl">ggml_tensor</span> with an op type, shape,
+      and source pointers. The graph is topologically sorted and handed to the backend scheduler.
+      <span class="hl3">This is rebuilt from scratch every single token</span>.
+    </div>
+
+    <div class="vis">
+      <div class="vis-title">ggml_cgraph — The Core Data Structure</div>
+      <div class="code">
+<span class="kw">struct</span> <span class="fn">ggml_cgraph</span> {
+    size_t size;                     <span class="cm">// allocated capacity</span>
+    size_t n_nodes;                  <span class="cm">// ~460 for Qwen2-1.5B decode</span>
+    size_t n_leafs;                  <span class="cm">// input/weight tensors</span>
+    <span class="kw">struct</span> ggml_tensor ** nodes;     <span class="cm">// topologically sorted ops</span>
+    <span class="kw">struct</span> ggml_tensor ** leafs;     <span class="cm">// leaf tensors (inputs/params)</span>
+    <span class="kw">struct</span> ggml_tensor ** grads;     <span class="cm">// gradient tensors (training only)</span>
+};
+
+<span class="kw">struct</span> <span class="fn">ggml_tensor</span> {
+    <span class="kw">enum</span> ggml_type type;             <span class="cm">// Q4_K, Q8_0, F16, F32...</span>
+    <span class="kw">struct</span> ggml_backend_buffer * buffer;
+    int64_t ne[<span class="num">4</span>];                   <span class="cm">// shape: [d0, d1, d2, d3]</span>
+    size_t  nb[<span class="num">4</span>];                   <span class="cm">// strides in bytes</span>
+    <span class="kw">enum</span> ggml_op op;                 <span class="cm">// MUL_MAT, ADD, ROPE, FLASH_ATTN_EXT...</span>
+    int32_t op_params[<span class="num">64</span>];           <span class="cm">// op-specific parameters</span>
+    <span class="kw">struct</span> ggml_tensor * src[<span class="num">10</span>];    <span class="cm">// source tensors</span>
+};
+</div>
+    </div>
+  </div>
+
+  <button class="expand-btn" onclick="toggleExpand(this)">
+    <span class="chevron">▸</span> Deep Dive: Graph Building Per Architecture
+  </button>
+  <div class="expand-panel">
+    <div class="expand-inner">
+      <div class="code">
+<span class="cm">// llama-graph.cpp — one decode token for Qwen2-1.5B</span>
+<span class="cm">// Total: ~460 nodes = 28 layers × ~16 ops/layer + embedding + output</span>
+
+<span class="fn">GET_ROWS</span>(token_embd, input_ids)         <span class="cm">// 1 op: embedding lookup</span>
+
+<span class="kw">for</span> layer = <span class="num">0</span>..<span class="num">28</span>:
+  <span class="fn">RMS_NORM</span>(x, attn_norm)                 <span class="cm">// 1 op</span>
+  q = <span class="fn">MUL_MAT</span>(attn_q, norm_x)            <span class="cm">// 1 op — biggest cost</span>
+  k = <span class="fn">MUL_MAT</span>(attn_k, norm_x)            <span class="cm">// 1 op</span>
+  v = <span class="fn">MUL_MAT</span>(attn_v, norm_x)            <span class="cm">// 1 op</span>
+  q = <span class="fn">RESHAPE</span>(q, [128, 12, 1])            <span class="cm">// 1 op — reshape to heads</span>
+  k = <span class="fn">RESHAPE</span>(k, [128, 2, 1])             <span class="cm">// 1 op</span>
+  q = <span class="fn">ROPE</span>(q, positions)                  <span class="cm">// 1 op — rotary embeddings</span>
+  k = <span class="fn">ROPE</span>(k, positions)                  <span class="cm">// 1 op</span>
+  <span class="fn">CPY</span>(k, kv_cache_k[layer])               <span class="cm">// 1 op — write to KV cache</span>
+  <span class="fn">CPY</span>(v, kv_cache_v[layer])               <span class="cm">// 1 op</span>
+  attn = <span class="fn">FLASH_ATTN_EXT</span>(q, K, V, mask)   <span class="cm">// 1 op — fused attention</span>
+  o = <span class="fn">MUL_MAT</span>(attn_output, attn)          <span class="cm">// 1 op</span>
+  x = <span class="fn">ADD</span>(x, o)                           <span class="cm">// 1 op — residual</span>
+  <span class="fn">RMS_NORM</span>(x, ffn_norm)                  <span class="cm">// 1 op</span>
+  gate = <span class="fn">MUL_MAT</span>(ffn_gate, norm_x)       <span class="cm">// 1 op — 7.7 MB weight read</span>
+  up   = <span class="fn">MUL_MAT</span>(ffn_up, norm_x)         <span class="cm">// 1 op — 7.7 MB weight read</span>
+  <span class="fn">SILU</span>(gate)                              <span class="cm">// 1 op</span>
+  <span class="fn">MUL</span>(gate, up)                           <span class="cm">// 1 op</span>
+  down = <span class="fn">MUL_MAT</span>(ffn_down, gated)        <span class="cm">// 1 op — 7.7 MB weight read</span>
+  x = <span class="fn">ADD</span>(x, down)                        <span class="cm">// 1 op — residual</span>
+
+<span class="fn">RMS_NORM</span>(x, output_norm)                  <span class="cm">// 1 op: final norm</span>
+logits = <span class="fn">MUL_MAT</span>(output, x)              <span class="cm">// 1 op: lm_head projection</span>
+</div>
+      <div class="warn">
+        CRITICAL: This graph is rebuilt every token. That's ~460 ggml_tensor allocations,
+        topology sort, and backend scheduling — all on the CPU hot path.
+        XNet-DNN's "command tape" eliminates this by recording once and replaying.
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="arrow">↓</div>
+
+<!-- S3: BACKEND DISPATCH -->
+<div class="step" id="s3">
+  <div class="step-top">
+    <span class="step-num blue">03 BACKEND DISPATCH</span>
+    <h2>The ggml_backend_i Interface</h2>
+    <div class="desc">
+      Every backend implements a <strong>vtable of function pointers</strong>. The scheduler
+      splits the graph across backends, copies tensors between them, and calls
+      <span class="hl">graph_compute()</span> on each. This is where the desktop-vs-mobile performance
+      gap begins — the scheduler was designed for discrete GPUs with separate VRAM.
+    </div>
+
+    <div class="vis">
+      <div class="code">
+<span class="kw">struct</span> <span class="fn">ggml_backend_i</span> {
+    <span class="cm">// Identity</span>
+    <span class="kw">const char *</span> (*<span class="fn">get_name</span>)(ggml_backend_t backend);
+    <span class="kw">void</span> (*<span class="fn">free</span>)(ggml_backend_t backend);
+
+    <span class="cm">// Tensor I/O (async versions for overlapping)</span>
+    <span class="kw">void</span> (*<span class="fn">set_tensor_async</span>)(backend, tensor, data, offset, size);
+    <span class="kw">void</span> (*<span class="fn">get_tensor_async</span>)(backend, tensor, data, offset, size);
+    <span class="kw">bool</span> (*<span class="fn">cpy_tensor_async</span>)(backend_src, backend_dst, src, dst);
+
+    <span class="cm">// Synchronization</span>
+    <span class="kw">void</span> (*<span class="fn">synchronize</span>)(ggml_backend_t backend);
+
+    <span class="cm">// Graph execution</span>
+    <span class="kw">enum</span> ggml_status (*<span class="fn">graph_compute</span>)(backend, cgraph);
+    <span class="kw">enum</span> ggml_status (*<span class="fn">graph_compute_async</span>)(backend, cgraph);
+
+    <span class="cm">// Pre-compiled plans (key for replay optimization)</span>
+    ggml_backend_graph_plan_t (*<span class="fn">graph_plan_create</span>)(backend, cgraph);
+    <span class="kw">void</span> (*<span class="fn">graph_plan_free</span>)(backend, plan);
+    <span class="kw">enum</span> ggml_status (*<span class="fn">graph_plan_compute</span>)(backend, plan);
+
+    <span class="cm">// Events for multi-stream synchronization</span>
+    <span class="kw">void</span> (*<span class="fn">event_record</span>)(backend, event);
+    <span class="kw">void</span> (*<span class="fn">event_wait</span>)(backend, event);
+
+    <span class="cm">// Graph optimization (your addition)</span>
+    <span class="kw">void</span> (*<span class="fn">graph_optimize</span>)(backend, cgraph);
+};
+</div>
+    </div>
+  </div>
+
+  <button class="expand-btn" onclick="toggleExpand(this)">
+    <span class="chevron">▸</span> Deep Dive: Scheduler 5-Pass Algorithm & Its Problems
+  </button>
+  <div class="expand-panel">
+    <div class="expand-inner">
+      <div class="code">
+<span class="cm">// ggml_backend_sched_split_graph() — the 5-pass algorithm</span>
+<span class="cm">// Location: ggml-backend.cpp:923-1283</span>
+
+<span class="cm">// Pass 1: Assign backends to each op based on support + priority</span>
+<span class="cm">// Pass 2: Expand partitions (merge adjacent ops on same backend)</span>
+<span class="cm">// Pass 3: Create graph splits at backend boundaries</span>
+<span class="cm">// Pass 4: Allocate tensor copies for cross-backend transfers</span>
+<span class="cm">// Pass 5: Execute splits in order</span>
+
+<span class="cm">// THE PROBLEM (ggml-backend.cpp:1443-1620):</span>
+<span class="cm">// ggml_backend_sched_compute_splits() does:</span>
+<span class="kw">for</span> each split:
+  <span class="kw">for</span> each input tensor crossing backend boundary:
+    <span class="fn">ggml_backend_tensor_copy</span>(input, input_cpy)  <span class="cm">// ← EVERY TOKEN!</span>
+    <span class="cm">// This is SYNCHRONOUS, blocks thread, malloc fallback</span>
+    <span class="cm">// On UMA (mobile): this copies data that's ALREADY accessible!</span>
+
+  backend->graph_compute(split_graph)  <span class="cm">// execute this split</span>
+</div>
+      <div class="warn">
+        On desktop (discrete GPU): copies go over PCIe, this is necessary.<br>
+        On mobile (UMA/shared memory): GPU and CPU share LPDDR5X. These copies are WASTE.
+        This is the "2.3 t/s killer" identified in your llama.cpp audit.
+        GGML_SCHED_MAX_COPIES=4 means 4 copies of weights = 2GB on mobile!
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="arrow">↓</div>
+
+<!-- S4: VULKAN -->
+<div class="step" id="s4">
+  <div class="step-top">
+    <span class="step-num green">04 VULKAN BACKEND</span>
+    <h2>Command Buffers, Descriptors, & Barriers</h2>
+    <div class="desc">
+      The Vulkan backend records GPU commands into <strong>command buffers</strong>.
+      For each op: allocate descriptor set, bind pipeline, set push constants, dispatch.
+      <span class="hl3">~200 descriptor set updates per token</span>, each requiring CPU validation.
+      On Adreno 750 (2-4 shader cores), pipeline switches are catastrophic.
+    </div>
+
+    <div class="vis">
+      <div class="vis-title">Per-Op Vulkan Dispatch Sequence</div>
+      <div class="code">
+<span class="cm">// For EACH of ~100 GPU ops per token:</span>
+
+<span class="cm">// 1. Allocate descriptor set from pool</span>
+<span class="fn">vkAllocateDescriptorSets</span>(device, &allocInfo, &descSet);
+<span class="cm">// Pool size: 256 sets. New pool created when exhausted.</span>
+
+<span class="cm">// 2. Update descriptor set (bind buffers to shader params)</span>
+<span class="fn">vkUpdateDescriptorSets</span>(device, writeCount, writes, <span class="num">0</span>, <span class="kw">nullptr</span>);
+<span class="cm">// Up to 12 buffer bindings per kernel (parameter_count max = 12)</span>
+
+<span class="cm">// 3. Record into command buffer</span>
+cmd.<span class="fn">pushConstants</span>(layout, COMPUTE, <span class="num">0</span>, size, data);
+cmd.<span class="fn">bindPipeline</span>(COMPUTE, pipeline);       <span class="cm">// ← pipeline switch!</span>
+cmd.<span class="fn">bindDescriptorSets</span>(COMPUTE, layout, <span class="num">0</span>, {descSet}, {});
+cmd.<span class="fn">dispatch</span>(wg0, wg1, wg2);               <span class="cm">// launch compute shader</span>
+
+<span class="cm">// 4. Memory barrier between ops</span>
+cmd.<span class="fn">pipelineBarrier</span>(
+    COMPUTE, COMPUTE,                       <span class="cm">// src → dst stage</span>
+    {}, {},
+    {bufferBarrier(SHADER_WRITE, SHADER_READ)} <span class="cm">// ← FULL FLUSH</span>
+);
+<span class="cm">// On tile-based GPUs (Adreno/Mali): this flushes L1 tile cache!</span>
+</div>
+    </div>
+  </div>
+
+  <button class="expand-btn" onclick="toggleExpand(this)">
+    <span class="chevron">▸</span> Deep Dive: Pipeline Structs & Why It's Slow on Mobile
+  </button>
+  <div class="expand-panel">
+    <div class="expand-inner">
+      <div class="tabs">
+        <button class="tab active" onclick="switchTab(event,'vk-pipe')">Pipelines</button>
+        <button class="tab" onclick="switchTab(event,'vk-cost')">Cost Breakdown</button>
+        <button class="tab" onclick="switchTab(event,'vk-flash')">Flash Attention</button>
+      </div>
+
+      <div class="tab-content active" id="vk-pipe">
+        <div class="code">
+<span class="kw">struct</span> <span class="fn">vk_pipeline_struct</span> {
+    std::string name;
+    vk::ShaderModule shader_module;  <span class="cm">// compiled SPIR-V</span>
+    vk::PipelineLayout layout;
+    vk::Pipeline pipeline;
+    uint32_t push_constant_size;
+    uint32_t parameter_count;        <span class="cm">// max 12 buffer bindings</span>
+    std::array<uint32_t, <span class="num">3</span>> wg_denoms; <span class="cm">// workgroup size divisors</span>
+    uint32_t align;
+    std::atomic<bool> needed;
+    std::atomic<bool> compiled;      <span class="cm">// lazy compilation</span>
+};
+
+<span class="cm">// Total compiled pipelines: 1000+ variants</span>
+<span class="cm">// (mul_mat × quant_type × dims × precision × aligned/unaligned)</span>
+<span class="cm">// Pipeline cache stored via VkPipelineCache</span>
+</div>
+      </div>
+
+      <div class="tab-content" id="vk-cost">
+        <div class="desc">CPU-side cost per token on Snapdragon 8 Gen 3:</div>
+        <table class="dtable">
+          <tr><th>Operation</th><th>Count/Token</th><th>Cost Each</th><th>Total</th></tr>
+          <tr><td style="color:var(--mem)">Descriptor set alloc+update</td><td>~200</td><td>~5 μs</td><td>~1.0 ms</td></tr>
+          <tr><td style="color:var(--mem)">Pipeline bind (switch)</td><td>~100</td><td>~10 μs</td><td>~1.0 ms</td></tr>
+          <tr><td style="color:var(--accent4)">Push constants</td><td>~100</td><td>~1 μs</td><td>~0.1 ms</td></tr>
+          <tr><td style="color:var(--mem)">Memory barriers</td><td>~100</td><td>~15 μs</td><td>~1.5 ms</td></tr>
+          <tr><td style="color:var(--accent4)">Dispatch commands</td><td>~100</td><td>~2 μs</td><td>~0.2 ms</td></tr>
+          <tr><td style="color:var(--accent4)">Command buffer submit</td><td>2-3</td><td>~50 μs</td><td>~0.15 ms</td></tr>
+          <tr><td colspan="3"><strong>Total CPU overhead per token</strong></td><td style="color:var(--mem)"><strong>~4.0 ms</strong></td></tr>
+          <tr><td colspan="3">Actual GPU compute time</td><td style="color:var(--gpu)">~7.0 ms</td></tr>
+          <tr><td colspan="3"><strong>Total = 11 ms → 90 tok/s achievable, getting ~40 tok/s</strong></td><td></td></tr>
+        </table>
+        <div class="warn">
+          CPU overhead is 36% of total time! On desktop with 80+ GPU cores, this is hidden
+          behind GPU execution. On mobile with 2-4 ALU pipes, the GPU finishes each op
+          before the CPU can set up the next one → pipeline bubble.
+        </div>
+      </div>
+
+      <div class="tab-content" id="vk-flash">
+        <div class="code">
+<span class="cm">// Flash Attention in Vulkan — FLASH_ATTN_EXT op</span>
+<span class="cm">// Separate pipelines per configuration:</span>
+<span class="cm">// (head_size_k, head_size_v, precision, small_rows, small_cache)</span>
+
+<span class="cm">// Variants:</span>
+<span class="cm">// - F32 accumulation (more precise, slower)</span>
+<span class="cm">// - F16 accumulation (faster, slight precision loss)</span>
+<span class="cm">// - Scalar path (all devices)</span>
+<span class="cm">// - Cooperative matrix (VK_KHR_cooperative_matrix, A77+ GPUs)</span>
+<span class="cm">//   FA_COOPMAT0 and FA_COOPMAT1 variants</span>
+
+<span class="cm">// Shared memory layout:</span>
+<span class="cm">// - Q tile: [tile_rows × head_dim] in shared memory</span>
+<span class="cm">// - K/V tiles streamed from global memory</span>
+<span class="cm">// - Partial sums maintained for online softmax</span>
+
+<span class="cm">// Push constants: head_dims, seq_len, scale, mask_type</span>
+</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="arrow">↓</div>
+
+<!-- S5: OPENCL -->
+<div class="step" id="s5">
+  <div class="step-top">
+    <span class="step-num green">05 OPENCL BACKEND</span>
+    <h2>Kernel Compilation & Adreno Optimization</h2>
+    <div class="desc">
+      OpenCL on Adreno has <strong>less overhead than Vulkan</strong> (no descriptor sets, simpler dispatch).
+      Your llama.cpp-android has 80+ specialized kernels. Binary caching keyed on device fingerprint.
+      <span class="hl3">But: no CL_Image usage</span> — weights stored as plain cl_mem buffers,
+      missing the Adreno texture engine optimization that MNN-LLM uses for 7x speedup.
+    </div>
+
+    <div class="vis">
+      <div class="code">
+<span class="cm">// Kernel cache: hash(device_name + driver_version + compile_opts + source)</span>
+<span class="cm">// Cache dir set via nativeSetGPUCacheDir() or GGML_OPENCL_CACHE_DIR</span>
+<span class="cm">// Format: ggml_cl_{hash}.bin</span>
+
+<span class="cm">// Dispatch is simpler than Vulkan:</span>
+<span class="fn">clSetKernelArg</span>(kernel, <span class="num">0</span>, <span class="kw">sizeof</span>(cl_mem), &buf_a);
+<span class="fn">clSetKernelArg</span>(kernel, <span class="num">1</span>, <span class="kw">sizeof</span>(cl_mem), &buf_b);
+<span class="fn">clSetKernelArg</span>(kernel, <span class="num">2</span>, <span class="kw">sizeof</span>(cl_mem), &buf_out);
+<span class="fn">clSetKernelArg</span>(kernel, <span class="num">3</span>, <span class="kw">sizeof</span>(<span class="kw">int</span>), &M);
+<span class="fn">clEnqueueNDRangeKernel</span>(queue, kernel, <span class="num">2</span>, NULL, global, local, <span class="num">0</span>, NULL, NULL);
+<span class="cm">// No descriptor sets, no pipeline binding, no barriers needed</span>
+<span class="cm">// OpenCL driver handles dependencies via in-order queue</span>
+
+<span class="cm">// UMA optimization (your code):</span>
+<span class="fn">clCreateBuffer</span>(ctx, CL_MEM_USE_HOST_PTR, size, host_ptr, &err);
+<span class="cm">// Zero-copy: GPU reads directly from LPDDR5X, no copy needed</span>
+</div>
+    </div>
+  </div>
+
+  <button class="expand-btn" onclick="toggleExpand(this)">
+    <span class="chevron">▸</span> Deep Dive: What's Missing vs MNN-LLM
+  </button>
+  <div class="expand-panel">
+    <div class="expand-inner">
+      <table class="dtable">
+        <tr><th>Feature</th><th>Your OpenCL Backend</th><th>MNN-LLM</th><th>Impact</th></tr>
+        <tr><td>Weight storage</td><td style="color:var(--mem)">cl_mem buffer</td><td style="color:var(--accent2)">CL_RGBA Image2D</td><td>MNN gets texture L1 cache</td></tr>
+        <tr><td>Load pattern</td><td>Standard buffer reads</td><td style="color:var(--accent2)">128-bit vectorized</td><td>4× bandwidth per work-item</td></tr>
+        <tr><td>Weight layout</td><td>Row-major (from GGUF)</td><td style="color:var(--accent2)">[l/lp, h, lp] tiled</td><td>Coalesced access pattern</td></tr>
+        <tr><td>Kernel caching</td><td style="color:var(--accent2)">Binary cache</td><td style="color:var(--accent2)">Binary cache</td><td>Both good</td></tr>
+        <tr><td>UMA support</td><td style="color:var(--accent2)">USE_HOST_PTR</td><td style="color:var(--accent2)">Zero-copy</td><td>Both good</td></tr>
+        <tr><td>Recordable queue</td><td style="color:var(--mem)">Not used</td><td style="color:var(--muted)">Not used</td><td>Both miss this</td></tr>
+        <tr><td>Stage-aware kernels</td><td style="color:var(--mem)">Same kernel</td><td style="color:var(--muted)">Not used</td><td>ML Drift does this</td></tr>
+      </table>
+      <div class="desc" style="margin-top:12px;">
+        <strong>The CL_Image opportunity</strong>: Adreno has a separate texture engine with its own L1 cache.
+        When you store quantized weights as CL_RGBA Image2D objects, each work-item loads 128 bits
+        (4 × 32-bit RGBA channels) in one instruction, hitting the texture cache instead of compute cache.
+        This is THE reason MNN-LLM gets 7.1x decode over llama.cpp.
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="arrow">↓</div>
+
+<!-- S6: CPU BACKEND -->
+<div class="step" id="s6">
+  <div class="step-top">
+    <span class="step-num blue">06 CPU BACKEND</span>
+    <h2>ARM NEON, DOTPROD, I8MM, SVE</h2>
+    <div class="desc">
+      The CPU backend uses <strong>hand-written SIMD intrinsics</strong> for quantized dot products.
+      The hot function: <span class="hl">ggml_vec_dot_q4_0_q8_0</span> — computes the dot product
+      of a Q4_0 weight row with a Q8_0 activation vector using 128-bit NEON registers.
+      Your build with <span class="hl2">GGML_CPU_ALL_VARIANTS=ON</span> produces 7 .so variants
+      for runtime CPU feature detection.
+    </div>
+
+    <div class="vis">
+      <div class="vis-title">ARM NEON Q4_0 × Q8_0 Dot Product — The Hottest Loop</div>
+      <div class="code">
+<span class="cm">// For each block of 32 quantized values:</span>
+
+<span class="cm">// 1. Load 16 bytes of Q4_0 weights (32 × 4-bit packed)</span>
+uint8x16_t v0 = <span class="fn">vld1q_u8</span>(x[i].qs);            <span class="cm">// 128-bit load</span>
+
+<span class="cm">// 2. Extract low and high nibbles</span>
+int8x16_t lo = <span class="fn">vandq_u8</span>(v0, mask_0F);           <span class="cm">// low 4 bits</span>
+int8x16_t hi = <span class="fn">vshrq_n_u8</span>(v0, <span class="num">4</span>);              <span class="cm">// high 4 bits</span>
+
+<span class="cm">// 3. Subtract bias (Q4_0 stores 0..15, need -8..7)</span>
+lo = <span class="fn">vsubq_s8</span>(lo, bias_8);                     <span class="cm">// lo - 8</span>
+hi = <span class="fn">vsubq_s8</span>(hi, bias_8);                     <span class="cm">// hi - 8</span>
+
+<span class="cm">// 4. Load Q8_0 activations (32 × int8)</span>
+int8x16_t y_lo = <span class="fn">vld1q_s8</span>(y[i].qs);            <span class="cm">// first 16</span>
+int8x16_t y_hi = <span class="fn">vld1q_s8</span>(y[i].qs + <span class="num">16</span>);       <span class="cm">// next 16</span>
+
+<span class="cm">// 5. DOTPROD or I8MM accumulate</span>
+<span class="kw">#if</span> __ARM_FEATURE_MATMUL_INT8
+  <span class="cm">// I8MM: 8×8→32-bit matrix multiply (2× throughput vs DOTPROD)</span>
+  sum = <span class="fn">vmmlaq_s32</span>(sum, lo, y_lo);              <span class="cm">// fused matmul-acc</span>
+  sum = <span class="fn">vmmlaq_s32</span>(sum, hi, y_hi);
+<span class="kw">#elif</span> __ARM_FEATURE_DOTPROD
+  <span class="cm">// DOTPROD: 4-element dot product → 32-bit accumulate</span>
+  sum = <span class="fn">vdotq_s32</span>(sum, lo, y_lo);               <span class="cm">// 4×int8 → int32</span>
+  sum = <span class="fn">vdotq_s32</span>(sum, hi, y_hi);
+<span class="kw">#else</span>
+  <span class="cm">// Basic NEON: multiply-widen-accumulate (slowest path)</span>
+  int16x8_t p = <span class="fn">vmull_s8</span>(<span class="fn">vget_low_s8</span>(lo), <span class="fn">vget_low_s8</span>(y_lo));
+  sum = <span class="fn">vpadalq_s16</span>(sum, p);
+<span class="kw">#endif</span>
+
+<span class="cm">// 6. Scale by block scales</span>
+float scale = <span class="fn">FP16_TO_FP32</span>(x[i].d) * <span class="fn">FP16_TO_FP32</span>(y[i].d);
+result += <span class="fn">vaddvq_s32</span>(sum) * scale;
+</div>
+    </div>
+  </div>
+
+  <button class="expand-btn" onclick="toggleExpand(this)">
+    <span class="chevron">▸</span> Deep Dive: CPU Feature Tiers & Build Variants
+  </button>
+  <div class="expand-panel">
+    <div class="expand-inner">
+      <table class="dtable">
+        <tr><th>Variant .so</th><th>ARM Features</th><th>Throughput</th><th>Min SoC</th></tr>
+        <tr><td>ggml-cpu-armv8.0.so</td><td>Basic NEON</td><td>1× (baseline)</td><td>Any ARMv8</td></tr>
+        <tr><td>ggml-cpu-armv8.2-dotprod.so</td><td>DOTPROD</td><td>~2×</td><td>Cortex-A75 (2017)</td></tr>
+        <tr><td>ggml-cpu-armv8.2-fp16.so</td><td>FP16 arithmetic</td><td>~1.5×</td><td>Cortex-A75</td></tr>
+        <tr><td>ggml-cpu-armv8.6-i8mm.so</td><td>I8MM</td><td>~4×</td><td>Cortex-A78 (2020)</td></tr>
+        <tr><td>ggml-cpu-armv9.0-sve.so</td><td>SVE (128-2048b)</td><td>~3-6×</td><td>Cortex-A510+</td></tr>
+        <tr><td>ggml-cpu-armv9.2-sme.so</td><td>SME</td><td>~8×</td><td>Cortex-X4+ (2024)</td></tr>
+        <tr><td>ggml-cpu-armv9.2-sme2.so</td><td>SME2</td><td>~10×</td><td>Future</td></tr>
+      </table>
+      <div class="desc" style="margin-top:8px;">
+        Your Snapdragon 8s Gen 3 has Cortex-A720 cores → <span class="hl">I8MM</span> is the best path.
+        Runtime selects via <span class="hl2">GGML_BACKEND_DL=ON</span> dynamic loading.
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="arrow">↓</div>
+
+<!-- S7: MOBILE BOTTLENECKS -->
+<div class="step" id="s7">
+  <div class="step-top">
+    <span class="step-num red">07 MOBILE BOTTLENECKS</span>
+    <h2>Why llama.cpp Gets 2.7 tok/s on GPU</h2>
+    <div class="desc">
+      Your research doc identified the gap: <span class="hl">theoretical 93 tok/s, actual 2.7 tok/s on Vulkan</span>.
+      That's 72× slower. Here's the complete bottleneck analysis — every ms accounted for.
+    </div>
+
+    <div class="vis">
+      <div class="vis-title">Time Breakdown: One Decode Token (Vulkan, Qwen2-1.5B Q4_K_M)</div>
+      <table class="dtable">
+        <tr><th>Bottleneck</th><th>Time</th><th>% of Total</th><th>Cause</th></tr>
+        <tr><td style="color:var(--mem)">Weight tensor copies</td><td>~200 ms</td><td>54%</td><td>ggml_backend_tensor_copy() for EVERY weight EVERY token</td></tr>
+        <tr><td style="color:var(--mem)">Memory barriers</td><td>~80 ms</td><td>22%</td><td>Full L1 cache flush between every op on tile-based GPU</td></tr>
+        <tr><td style="color:var(--accent4)">Descriptor sets</td><td>~40 ms</td><td>11%</td><td>200+ allocate/update/bind cycles</td></tr>
+        <tr><td style="color:var(--accent4)">Pipeline switches</td><td>~25 ms</td><td>7%</td><td>Shader context switch on 2-4 ALU pipes</td></tr>
+        <tr><td style="color:var(--accent4)">Graph rebuild</td><td>~5 ms</td><td>1%</td><td>460 tensor allocs + topo sort + scheduler</td></tr>
+        <tr><td style="color:var(--gpu)">Actual GPU compute</td><td>~15 ms</td><td>4%</td><td>MUL_MAT + FLASH_ATTN + activations</td></tr>
+        <tr><td colspan="2"><strong>Total</strong></td><td><strong>~365 ms → 2.7 tok/s</strong></td><td></td></tr>
+      </table>
+
+      <div class="warn" style="margin-top:16px;">
+        <strong>96% of time is overhead, only 4% is useful compute.</strong>
+        The GPU is idle most of the time, waiting for the CPU to set up the next op.
+        This is the fundamental problem your engine rewrite must solve.
+      </div>
+    </div>
+  </div>
+
+  <button class="expand-btn" onclick="toggleExpand(this)">
+    <span class="chevron">▸</span> Deep Dive: Root Cause Analysis
+  </button>
+  <div class="expand-panel">
+    <div class="expand-inner">
+      <div class="desc"><strong>Root cause #1: Desktop architecture assumed</strong></div>
+      <div class="code">
+<span class="cm">// Desktop: CPU ←PCIe→ GPU (separate memory)</span>
+<span class="cm">// tensor_copy() over PCIe = necessary, ~12 GB/s</span>
+<span class="cm">// GPU has 80+ cores = hides CPU setup latency</span>
+<span class="cm">// VRAM bandwidth: 900+ GB/s = ops finish fast</span>
+
+<span class="cm">// Mobile: CPU + GPU share LPDDR5X (UMA)</span>
+<span class="cm">// tensor_copy() = memcpy within same DRAM = WASTE</span>
+<span class="cm">// GPU has 2-4 ALU pipes = can't hide latency</span>
+<span class="cm">// LPDDR5X: 68 GB/s = 13× slower than desktop VRAM</span>
+</div>
+
+      <div class="desc" style="margin-top:16px;"><strong>Root cause #2: No graph replay</strong></div>
+      <div class="code">
+<span class="cm">// Every token rebuilds the ENTIRE command buffer</span>
+<span class="cm">// But decode graph is IDENTICAL every token!</span>
+<span class="cm">// Only differences: KV cache pointers, position index</span>
+<span class="cm">//</span>
+<span class="cm">// Solution (XNet-DNN style): Record once, replay with</span>
+<span class="cm">// updated buffer offsets. Eliminates descriptor set</span>
+<span class="cm">// allocation, pipeline binding, barrier setup.</span>
+<span class="cm">//</span>
+<span class="cm">// Adreno has cl_qcom_recordable_queues for this!</span>
+<span class="cm">// Vulkan has VkCommandBuffer reuse potential</span>
+</div>
+
+      <div class="desc" style="margin-top:16px;"><strong>Root cause #3: Per-op barriers instead of graph-level scheduling</strong></div>
+      <div class="code">
+<span class="cm">// Current: barrier after EVERY op</span>
+<span class="cm">// RMS_NORM → BARRIER → MUL_MAT → BARRIER → MUL_MAT → BARRIER → ...</span>
+<span class="cm">//</span>
+<span class="cm">// Better: analyze data dependencies, only barrier when needed</span>
+<span class="cm">// RMS_NORM → MUL_MAT_Q → MUL_MAT_K → MUL_MAT_V → BARRIER → FLASH_ATTN</span>
+<span class="cm">//          (Q,K,V are independent — can pipeline without barriers)</span>
+<span class="cm">//</span>
+<span class="cm">// Best: fuse entire layer into 2-3 mega-kernels</span>
+<span class="cm">// MEGA_ATTN(norm+Q+K+V+rope+attn+O) → MEGA_FFN(norm+gate+up+silu+mul+down)</span>
+</div>
+    </div>
+  </div>
+</div>
+
+<div class="arrow">↓</div>
+
+<!-- S8: PROS & CONS -->
+<div class="step" id="s8">
+  <div class="step-top">
+    <span class="step-num purple">08 LLAMA.CPP: PROS & CONS</span>
+    <h2>Assessment for Your Engine Rewrite</h2>
+
+    <div class="vis">
+      <div class="pc-grid">
+        <div class="pc-box pro">
+          <h4>Strengths (Keep These)</h4>
+          <ul>
+            <li>GGUF loader — excellent, well-tested, mmap support</li>
+            <li>Quantized dot products — NEON/I8MM kernels are highly optimized</li>
+            <li>Flash attention algorithm — correct, numerically stable</li>
+            <li>Architecture support — 30+ model types from GGUF metadata</li>
+            <li>Tokenizer — complete BPE/SentencePiece implementation</li>
+            <li>Sampler chain — comprehensive, well-ordered</li>
+            <li>Backend abstraction — clean interface for adding new backends</li>
+            <li>KV cache management — grow/shrink/quantize/persist</li>
+            <li>Dynamic CPU variant loading — runtime feature detection</li>
+          </ul>
+        </div>
+        <div class="pc-box con">
+          <h4>Weaknesses (Fix These)</h4>
+          <ul>
+            <li>Graph rebuilt every token — should record & replay</li>
+            <li>Scheduler assumes discrete VRAM — wasteful copies on UMA</li>
+            <li>Per-op Vulkan dispatch — 200+ descriptor updates/token</li>
+            <li>Full barriers between every op — unnecessary on UMA</li>
+            <li>No CL_Image weight storage — missing Adreno texture cache</li>
+            <li>No GPU+NPU parallel execution — single backend per split</li>
+            <li>No stage-aware kernels — same kernel for prefill and decode</li>
+            <li>No weight rearrangement — row-major from GGUF, not tiled</li>
+            <li>Thread pool busy-waits 50% (battery drain on mobile)</li>
+            <li>GGML_DEFAULT_GRAPH_SIZE=2048 (needs ~500 for mobile decode)</li>
+            <li>4-copy pipeline parallelism = 2GB waste on mobile</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="desc" style="margin-top:16px;">
+        <strong>Bottom line</strong>: Keep the GGUF loader, tokenizer, sampler, and CPU dot product kernels.
+        Rewrite everything between "graph built" and "result returned": the scheduler, GPU dispatch,
+        memory management, and command recording. This is what pages 4-6 will show you how to do.
+      </div>
+    </div>
+  </div>
+</div>
+
+</div>
+
+<script>
+const observer=new IntersectionObserver(e=>{e.forEach(e=>{e.isIntersecting&&e.target.classList.add('visible')})},{threshold:.08});document.querySelectorAll('.step').forEach(s=>observer.observe(s));const sections=document.querySelectorAll('.step'),navLinks=document.querySelectorAll('.nav a'),navObs=new IntersectionObserver(e=>{e.forEach(e=>{if(e.isIntersecting){navLinks.forEach(l=>l.classList.remove('active'));const l=document.querySelector(`.nav a[href="#${e.target.id}"]`);l&&l.classList.add('active')}})},{threshold:.3,rootMargin:'-80px 0px -60% 0px'});sections.forEach(s=>navObs.observe(s));function toggleExpand(b){b.nextElementSibling.classList.toggle('open');b.classList.toggle('open')}function switchTab(e,id){const c=e.target.closest('.expand-inner');c.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));c.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));e.target.classList.add('active');c.querySelector('#'+id).classList.add('active')}
+</script>
+</body>
+</html>

@@ -1,0 +1,1243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>6 — Mobile SoC vs Desktop Hardware</title>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@300;400;500&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0a0a11;--surface:#111119;--card:#16162a;--card2:#1c1c35;--border:#252545;--border2:#2e2e50;--accent:#7c8cf5;--accent2:#6ee7b7;--accent3:#f0abfc;--accent4:#fbbf24;--text:#d4dae6;--muted:#6b7280;--dim:#3d3d5c;--cpu:#60a5fa;--gpu:#34d399;--npu:#fb923c;--mem:#f87171;--radius:16px;--radius-sm:10px}*{margin:0;padding:0;box-sizing:border-box}html{scroll-behavior:smooth}body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;font-size:15px;line-height:1.7;-webkit-font-smoothing:antialiased}::selection{background:var(--accent);color:var(--bg)}.nav{position:sticky;top:0;z-index:100;background:rgba(10,10,17,.85);backdrop-filter:blur(16px);border-bottom:1px solid var(--border);padding:10px 20px;display:flex;gap:8px;flex-wrap:wrap;justify-content:center}.nav a{font-family:'DM Mono',monospace;font-size:11px;color:var(--muted);text-decoration:none;padding:5px 14px;border-radius:20px;border:1px solid transparent;transition:all .25s}.nav a:hover,.nav a.active{color:var(--accent);border-color:var(--accent);background:rgba(124,140,245,.08)}.hero{text-align:center;padding:80px 20px 50px;position:relative}.hero::before{content:'';position:absolute;top:-120px;left:50%;transform:translateX(-50%);width:600px;height:600px;background:radial-gradient(circle,rgba(248,113,113,.08) 0%,transparent 70%);pointer-events:none}.hero-badge{font-family:'DM Mono',monospace;font-size:11px;color:var(--mem);background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.2);padding:4px 14px;border-radius:20px;display:inline-block;margin-bottom:20px}.hero h1{font-family:'Syne',sans-serif;font-weight:800;font-size:clamp(32px,5vw,52px);line-height:1.1;margin-bottom:16px;background:linear-gradient(135deg,var(--text) 0%,var(--mem) 40%,var(--accent4) 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent}.hero p{font-family:'DM Mono',monospace;font-size:13px;color:var(--muted);max-width:620px;margin:0 auto}.container{max-width:900px;margin:0 auto;padding:0 20px 80px}.arrow{text-align:center;color:var(--dim);font-size:20px;padding:16px 0;opacity:.5}.step{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;opacity:0;transform:translateY(30px);transition:opacity .5s,transform .5s;margin-bottom:8px}.step.visible{opacity:1;transform:translateY(0)}.step-top{padding:32px}.step-num{font-family:'DM Mono',monospace;font-size:10px;font-weight:500;padding:3px 10px;border-radius:12px;display:inline-block;margin-bottom:14px}.sn-purple{color:var(--accent);background:rgba(124,140,245,.1)}.sn-green{color:var(--accent2);background:rgba(110,231,183,.1)}.sn-pink{color:var(--accent3);background:rgba(240,171,252,.1)}.sn-amber{color:var(--accent4);background:rgba(251,191,36,.1)}.sn-blue{color:var(--cpu);background:rgba(96,165,250,.1)}.sn-orange{color:var(--npu);background:rgba(251,146,60,.1)}.sn-red{color:var(--mem);background:rgba(248,113,113,.1)}.step h2{font-family:'Syne',sans-serif;font-weight:700;font-size:22px;margin-bottom:10px;color:#fff}.step .desc{font-family:'DM Mono',monospace;font-size:12px;line-height:1.75;color:var(--muted);max-width:700px}.step .desc strong{color:var(--text)}.step .desc .hl{color:var(--accent)}.step .desc .hl2{color:var(--accent2)}.step .desc .hl3{color:var(--accent3)}.step .desc .hl4{color:var(--accent4)}.vis{margin-top:24px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);padding:24px;overflow-x:auto}.vis-title{font-family:'DM Mono',monospace;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:12px}.d-box{font-family:'DM Mono',monospace;font-size:11px;padding:8px 14px;border-radius:8px;border:1px solid var(--border);background:var(--card2);color:var(--text);text-align:center;transition:all .2s;cursor:default}.d-box:hover{border-color:var(--accent);transform:translateY(-2px)}.d-box small{display:block;font-size:9px;color:var(--muted);margin-top:2px}.d-arrow{color:var(--dim);font-size:16px;text-align:center}.expand-btn{display:block;width:100%;padding:14px 32px;background:none;border:none;border-top:1px solid var(--border);color:var(--muted);font-family:'DM Mono',monospace;font-size:11px;cursor:pointer;text-align:left;transition:all .2s}.expand-btn:hover{color:var(--accent);background:rgba(124,140,245,.03)}.expand-btn .chevron{display:inline-block;transition:transform .25s;margin-right:8px}.expand-btn.open .chevron{transform:rotate(90deg)}.expand-panel{max-height:0;overflow:hidden;transition:max-height .4s}.expand-panel.open{max-height:18000px}.expand-inner{padding:24px 32px}.tabs{display:flex;gap:4px;margin-bottom:16px;flex-wrap:wrap}.tab{font-family:'DM Mono',monospace;font-size:11px;padding:5px 14px;border-radius:8px;border:1px solid var(--border);background:none;color:var(--muted);cursor:pointer;transition:all .2s}.tab:hover{color:var(--text)}.tab.active{color:var(--accent);border-color:var(--accent);background:rgba(124,140,245,.08)}.tab-content{display:none}.tab-content.active{display:block}.code{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'DM Mono',monospace;font-size:11px;line-height:1.7;color:var(--text);overflow-x:auto;margin:12px 0;white-space:pre}.code .cm{color:var(--muted)}.code .kw{color:var(--accent)}.code .fn{color:var(--accent2)}.code .str{color:var(--accent3)}.code .num{color:var(--accent4)}.dtable{width:100%;border-collapse:collapse;font-family:'DM Mono',monospace;font-size:11px;margin:12px 0}.dtable th{text-align:left;padding:8px 12px;border-bottom:1px solid var(--border2);color:var(--muted);font-weight:400;text-transform:uppercase;font-size:10px;letter-spacing:.5px}.dtable td{padding:8px 12px;border-bottom:1px solid var(--border);color:var(--text)}.dtable tr:hover td{background:rgba(124,140,245,.03)}.formula{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:16px 20px;font-family:'DM Mono',monospace;font-size:13px;color:var(--accent);text-align:center;margin:12px 0}.pc-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:12px 0}.pc-box{background:var(--card);border:1px solid var(--border);border-radius:var(--radius-sm);padding:16px}.pc-box h4{font-family:'DM Mono',monospace;font-size:11px;margin-bottom:8px;text-transform:uppercase;letter-spacing:.5px}.pc-box.pro h4{color:var(--accent2)}.pc-box.con h4{color:var(--mem)}.pc-box ul{list-style:none}.pc-box li{font-family:'DM Mono',monospace;font-size:11px;color:var(--muted);padding:3px 0;padding-left:14px;position:relative}.pc-box.pro li::before{content:'+';position:absolute;left:0;color:var(--accent2)}.pc-box.con li::before{content:'-';position:absolute;left:0;color:var(--mem)}
+.warn{background:rgba(248,113,113,.06);border:1px solid rgba(248,113,113,.2);border-radius:8px;padding:14px 18px;font-family:'DM Mono',monospace;font-size:11px;color:var(--mem);margin:12px 0}
+.key-insight{background:rgba(110,231,183,.06);border:1px solid rgba(110,231,183,.2);border-radius:8px;padding:14px 18px;font-family:'DM Mono',monospace;font-size:11px;color:var(--accent2);margin:12px 0}
+.arch-box{display:grid;grid-template-columns:1fr;gap:2px;margin:12px 0}.arch-row{display:flex;align-items:stretch;gap:2px}.arch-cell{font-family:'DM Mono',monospace;font-size:11px;padding:10px 14px;border-radius:4px;text-align:center;flex:1}.arch-label{font-size:9px;color:var(--muted);display:block;margin-top:2px}
+.bar-container{display:flex;align-items:center;gap:12px;margin-bottom:8px}.bar-label{font-family:'DM Mono',monospace;font-size:11px;color:var(--muted);width:110px;flex-shrink:0}.bar-track{flex:1;background:var(--card2);border-radius:4px;height:22px;overflow:hidden}.bar-fill{height:100%;border-radius:4px;display:flex;align-items:center;padding-left:8px;font-family:'DM Mono',monospace;font-size:9px;color:var(--bg);font-weight:500}
+@media(max-width:640px){.pc-grid{grid-template-columns:1fr}.step-top{padding:20px}.expand-inner{padding:16px 20px}}
+</style>
+</head>
+<body>
+
+<nav class="nav">
+  <a href="#s1">SoC Architecture</a>
+  <a href="#s2">Memory Hierarchy</a>
+  <a href="#s3">CPU Cores</a>
+  <a href="#s4">Mobile GPU</a>
+  <a href="#s5">NPU/DSP</a>
+  <a href="#s6">Token Journey</a>
+  <a href="#s7">Desktop Comparison</a>
+  <a href="#s8">Optimizations</a>
+  <a href="#s9">Thermal</a>
+</nav>
+
+<header class="hero">
+  <div class="hero-badge">PAGE 6 OF 6</div>
+  <h1>Mobile SoC vs<br>Desktop Hardware</h1>
+  <p>How every tensor and every token flows through silicon. Cache lines, memory controllers, tile-based GPUs, thermal walls, and what optimizations are possible — and what aren't.</p>
+</header>
+
+<div class="container">
+
+<!-- ═══ SOC ARCHITECTURE ═══ -->
+<div class="step" id="s1">
+  <div class="step-top">
+    <span class="step-num sn-red">6A — SOC ARCHITECTURE</span>
+    <h2>System-on-Chip: Everything on One Die</h2>
+    <div class="desc">
+      A mobile SoC packs <span class="hl">CPU + GPU + NPU + DSP + ISP + memory controller</span> onto a single
+      die (or package). Everything shares the same LPDDR5X memory through a single memory
+      controller. This is fundamentally different from desktop where CPU and GPU have
+      <span class="hl4">separate memory pools connected by PCIe</span>.
+    </div>
+
+    <div class="vis">
+      <div class="vis-title">Snapdragon 8 Elite (2024) — Block Diagram</div>
+      <div class="arch-box">
+        <div class="arch-row">
+          <div class="arch-cell" style="background:rgba(96,165,250,.15);border:1px solid var(--cpu);flex:3">
+            <strong style="color:var(--cpu);">CPU — Oryon V2</strong>
+            <span class="arch-label">2× Prime (4.32 GHz) + 6× Perf (3.53 GHz) — all Oryon custom</span>
+          </div>
+          <div class="arch-cell" style="background:rgba(251,146,60,.1);border:1px solid var(--npu);flex:2">
+            <strong style="color:var(--npu);">NPU — Hexagon</strong>
+            <span class="arch-label">73 TOPS INT8, dedicated SRAM</span>
+          </div>
+        </div>
+        <div class="arch-row">
+          <div class="arch-cell" style="background:rgba(52,211,153,.1);border:1px solid var(--gpu);flex:3">
+            <strong style="color:var(--gpu);">GPU — Adreno 830</strong>
+            <span class="arch-label">Tile-based, 2-4 ALU pipes, 4.6 TFLOPS FP16, texture units with L1 cache</span>
+          </div>
+          <div class="arch-cell" style="background:rgba(124,140,245,.1);border:1px solid var(--accent);flex:2">
+            <strong style="color:var(--accent);">DSP + ISP + Modem</strong>
+            <span class="arch-label">Spectra ISP, X80 modem, Aqstic audio</span>
+          </div>
+        </div>
+        <div class="arch-row">
+          <div class="arch-cell" style="background:rgba(248,113,113,.1);border:1px solid var(--mem);">
+            <strong style="color:var(--mem);">Memory Controller → LPDDR5X</strong>
+            <span class="arch-label">68 GB/s peak bandwidth — SHARED by all processors above</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <button class="expand-btn" onclick="toggleExpand(this)">
+    <span class="chevron">&#9656;</span> Deep Dive: UMA vs Discrete, Vendor Comparison
+  </button>
+  <div class="expand-panel">
+    <div class="expand-inner">
+      <div class="tabs">
+        <button class="tab active" onclick="switchTab(event,'uma-disc')">UMA vs Discrete</button>
+        <button class="tab" onclick="switchTab(event,'vendor-cmp')">Vendor Comparison</button>
+      </div>
+
+      <div class="tab-content active" id="uma-disc">
+        <div class="desc"><strong>Unified Memory Architecture (UMA):</strong> the defining feature of mobile SoCs.</div>
+        <div class="code">
+<span class="cm">// Desktop: Discrete memory pools</span>
+<span class="cm">//</span>
+<span class="cm">//   CPU ←→ DDR5 (64-128 GB/s)</span>
+<span class="cm">//    |</span>
+<span class="cm">//   PCIe 4.0 x16 (32 GB/s bidirectional)</span>
+<span class="cm">//    |</span>
+<span class="cm">//   GPU ←→ GDDR6X/HBM (1-3 TB/s)</span>
+<span class="cm">//</span>
+<span class="cm">// To run a tensor on GPU:</span>
+<span class="cm">//   1. Allocate GPU memory (cudaMalloc)</span>
+<span class="cm">//   2. Copy tensor CPU→GPU over PCIe (32 GB/s max)</span>
+<span class="cm">//   3. Compute on GPU</span>
+<span class="cm">//   4. Copy result GPU→CPU (another PCIe transfer)</span>
+<span class="cm">//   ⚠ PCIe is the bottleneck for small tensors</span>
+
+<span class="cm">// Mobile: Unified memory</span>
+<span class="cm">//</span>
+<span class="cm">//   CPU ←→ ┐</span>
+<span class="cm">//   GPU ←→ ├→ LPDDR5X (68 GB/s shared)</span>
+<span class="cm">//   NPU ←→ ┘</span>
+<span class="cm">//</span>
+<span class="cm">// To run a tensor on GPU:</span>
+<span class="cm">//   1. Tensor already in shared memory</span>
+<span class="cm">//   2. Just tell GPU the address (zero-copy)</span>
+<span class="cm">//   3. GPU reads directly from same DRAM</span>
+<span class="cm">//   ✓ No transfer cost — but bandwidth is shared</span></div>
+
+        <div class="key-insight">
+          <strong>UMA trade-off for LLMs:</strong> Zero-copy is amazing for weight tensors (GPU reads
+          model weights directly, no upload). But ALL processors share 68 GB/s bandwidth.
+          When GPU + NPU + CPU all read weights simultaneously, they compete for the same pipe.
+          Desktop GPU has 1 TB/s all to itself.
+        </div>
+      </div>
+
+      <div class="tab-content" id="vendor-cmp">
+        <table class="dtable">
+          <tr><th>SoC (2024-2025)</th><th>CPU</th><th>GPU</th><th>NPU</th><th>Memory BW</th></tr>
+          <tr>
+            <td style="color:var(--accent)">Snapdragon 8 Elite</td>
+            <td>Oryon V2 (2P+6E)</td>
+            <td>Adreno 830</td>
+            <td>Hexagon 73 TOPS</td>
+            <td>68 GB/s</td>
+          </tr>
+          <tr>
+            <td style="color:var(--accent2)">Snapdragon 7s Gen 3</td>
+            <td>4× A720 + 4× A520</td>
+            <td>Adreno 710</td>
+            <td>Hexagon 12 TOPS</td>
+            <td>44 GB/s</td>
+          </tr>
+          <tr>
+            <td style="color:var(--accent3)">Dimensity 9400</td>
+            <td>Cortex-X925 + X4 + A720</td>
+            <td>Immortalis-G925</td>
+            <td>APU 890, 46 TOPS</td>
+            <td>76 GB/s</td>
+          </tr>
+          <tr>
+            <td style="color:var(--accent4)">Google Tensor G4</td>
+            <td>1× X4 + 3× A720 + 4× A520</td>
+            <td>Mali-G715</td>
+            <td>TPU (custom)</td>
+            <td>51 GB/s</td>
+          </tr>
+          <tr>
+            <td style="color:var(--mem)">Apple A18 Pro</td>
+            <td>2P+4E custom</td>
+            <td>6-core custom</td>
+            <td>ANE 35 TOPS</td>
+            <td>~75 GB/s</td>
+          </tr>
+          <tr>
+            <td style="color:var(--accent)">Samsung Exynos 2500</td>
+            <td>1× X5 + 3× A725 + 4× A520</td>
+            <td>Xclipse (RDNA3)</td>
+            <td>Dual NPU</td>
+            <td>51 GB/s</td>
+          </tr>
+        </table>
+        <div class="desc" style="margin-top:8px;">
+          <strong>For LLM inference, memory bandwidth is king.</strong> Dimensity 9400 (76 GB/s) and A18 Pro
+          (~75 GB/s) lead. Snapdragon 8 Elite (68 GB/s) is competitive. Everything else (44-51 GB/s) is
+          significantly slower for decode.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="arrow">&#8595;</div>
+
+<!-- ═══ MEMORY HIERARCHY ═══ -->
+<div class="step" id="s2">
+  <div class="step-top">
+    <span class="step-num sn-amber">6B — MEMORY HIERARCHY</span>
+    <h2>Cache Lines, DRAM, and the Bandwidth Wall</h2>
+    <div class="desc">
+      LLM decode is <span class="hl4">memory-bandwidth-bound</span>, not compute-bound. Every token requires
+      reading the entire model (weights + KV cache) from DRAM. Understanding the memory
+      hierarchy explains why decode is slow and what you can optimize.
+    </div>
+
+    <div class="vis">
+      <div class="vis-title">Mobile Memory Hierarchy (Snapdragon 8 Elite)</div>
+      <div style="display:flex;flex-direction:column;gap:6px;">
+        <div class="bar-container">
+          <div class="bar-label" style="color:var(--accent2)">CPU L1 Cache</div>
+          <div class="bar-track">
+            <div class="bar-fill" style="width:3%;background:var(--accent2);min-width:90px;">192 KB/core</div>
+          </div>
+          <div style="font-family:'DM Mono',monospace;font-size:10px;color:var(--accent2);width:60px;">~1 ns</div>
+        </div>
+        <div class="bar-container">
+          <div class="bar-label" style="color:var(--accent)">CPU L2 Cache</div>
+          <div class="bar-track">
+            <div class="bar-fill" style="width:10%;background:var(--accent);min-width:90px;">2-12 MB/cluster</div>
+          </div>
+          <div style="font-family:'DM Mono',monospace;font-size:10px;color:var(--accent);width:60px;">~5 ns</div>
+        </div>
+        <div class="bar-container">
+          <div class="bar-label" style="color:var(--accent4)">System Cache</div>
+          <div class="bar-track">
+            <div class="bar-fill" style="width:18%;background:var(--accent4);min-width:90px;">6-12 MB shared</div>
+          </div>
+          <div style="font-family:'DM Mono',monospace;font-size:10px;color:var(--accent4);width:60px;">~15 ns</div>
+        </div>
+        <div class="bar-container">
+          <div class="bar-label" style="color:var(--npu)">GPU L1/L2</div>
+          <div class="bar-track">
+            <div class="bar-fill" style="width:6%;background:var(--npu);min-width:90px;">32-256 KB</div>
+          </div>
+          <div style="font-family:'DM Mono',monospace;font-size:10px;color:var(--npu);width:60px;">~3 ns</div>
+        </div>
+        <div class="bar-container">
+          <div class="bar-label" style="color:var(--mem)">LPDDR5X DRAM</div>
+          <div class="bar-track">
+            <div class="bar-fill" style="width:95%;background:var(--mem);">8-16 GB — 68 GB/s — ~80 ns latency</div>
+          </div>
+          <div style="font-family:'DM Mono',monospace;font-size:10px;color:var(--mem);width:60px;">~80 ns</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <button class="expand-btn" onclick="toggleExpand(this)">
+    <span class="chevron">&#9656;</span> Deep Dive: Cache Lines, Bandwidth Math, DRAM Internals
+  </button>
+  <div class="expand-panel">
+    <div class="expand-inner">
+      <div class="tabs">
+        <button class="tab active" onclick="switchTab(event,'cache-lines')">Cache Lines</button>
+        <button class="tab" onclick="switchTab(event,'bw-math')">Bandwidth Math</button>
+        <button class="tab" onclick="switchTab(event,'dram-int')">DRAM Internals</button>
+      </div>
+
+      <div class="tab-content active" id="cache-lines">
+        <div class="desc"><strong>Cache line = 64 bytes.</strong> The minimum unit the CPU reads from memory.</div>
+        <div class="code">
+<span class="cm">// Cache line: 64 bytes on all modern ARM and x86</span>
+<span class="cm">// When CPU reads a single byte, it loads 64 bytes</span>
+
+<span class="cm">// For Q4_0 quantization (4.5 bits per weight):</span>
+<span class="cm">// One block = 18 bytes (2B scale + 16B data = 32 weights)</span>
+<span class="cm">// One 64-byte cache line = 3.5 blocks ≈ 112 weights</span>
+
+<span class="cm">// For Q8_0 quantization (8.5 bits per weight):</span>
+<span class="cm">// One block = 34 bytes (2B scale + 32B data = 32 weights)</span>
+<span class="cm">// One 64-byte cache line ≈ 1.88 blocks ≈ 60 weights</span>
+
+<span class="cm">// For FP16 (16 bits per weight):</span>
+<span class="cm">// One 64-byte cache line = 32 weights</span>
+
+<span class="cm">// Key insight: Q4_0 reads 3.5× more weights per cache line</span>
+<span class="cm">// This is exactly why quantization helps — not because</span>
+<span class="cm">// of reduced compute, but because of fewer DRAM reads</span></div>
+        <div class="key-insight">
+          <strong>LLM decode reads each weight exactly once per token.</strong>
+          For Qwen2-1.5B Q4_0: ~900 MB of weights read per token.
+          At 68 GB/s: 900 MB / 68 GB/s = 13.2 ms/token = 75.7 tok/s theoretical max.
+          With overhead: ~30-40 tok/s achievable.
+        </div>
+        <div class="desc" style="margin-top:12px;">
+          <strong>Cache line alignment matters:</strong>
+        </div>
+        <div class="code">
+<span class="cm">// Aligned access: tensor starts on 64-byte boundary</span>
+<span class="cm">// → one cache line fetch per 64 bytes</span>
+
+<span class="cm">// Misaligned access: tensor starts at offset 48</span>
+<span class="cm">// → first 16 bytes from line N, next 48 from line N+1</span>
+<span class="cm">// → 2 cache line fetches for 64 bytes of data</span>
+<span class="cm">// → 2× memory bandwidth wasted</span>
+
+<span class="cm">// GGUF enforces 32-byte alignment (not 64)</span>
+<span class="cm">// This means ~50% of tensors may cross cache line boundaries</span>
+<span class="cm">// Cactus: separate files = OS page-aligned = always aligned</span></div>
+      </div>
+
+      <div class="tab-content" id="bw-math">
+        <div class="desc"><strong>The roofline model for LLM decode:</strong></div>
+        <div class="formula">tok/s = memory_bandwidth / bytes_per_token</div>
+        <div class="code">
+<span class="cm">// Qwen2-1.5B model at different quantization levels:</span>
+<span class="cm">//</span>
+<span class="cm">// Q4_0:  ~900 MB weights + KV cache reads</span>
+<span class="cm">// Q8_0:  ~1.6 GB weights + KV cache reads</span>
+<span class="cm">// FP16:  ~3.0 GB weights + KV cache reads</span>
+
+<span class="cm">// On Snapdragon 8 Elite (68 GB/s LPDDR5X):</span>
+<span class="cm">//                    Weights    KV (256 ctx)  Total    tok/s</span>
+<span class="cm">// Q4_0:              900 MB  +  ~50 MB      = 950 MB   71.5</span>
+<span class="cm">// Q8_0:             1600 MB  +  ~50 MB      = 1650 MB  41.2</span>
+<span class="cm">// FP16:             3000 MB  +  ~100 MB     = 3100 MB  21.9</span>
+
+<span class="cm">// On desktop RTX 4090 (1008 GB/s GDDR6X):</span>
+<span class="cm">// Q4_0:              950 MB / 1008 GB/s      = 1061 tok/s</span>
+<span class="cm">// These are theoretical maximums — real numbers are lower</span>
+
+<span class="cm">// The gap: 68 GB/s vs 1008 GB/s = 14.8× bandwidth difference</span>
+<span class="cm">// That's why desktop gets 100+ tok/s and mobile gets 30-40</span></div>
+
+        <div class="warn">
+          <strong>KV cache grows with context length.</strong> At 2048 tokens with Qwen2-1.5B Q8_0 KV:
+          KV size = 2 × 28 layers × 2 heads × 2048 × 128 dim × 1 byte = 29 MB.
+          Small for short contexts. But at 32K tokens: 460 MB — nearly half the weight size.
+          This is why KV cache quantization and sliding window matter.
+        </div>
+      </div>
+
+      <div class="tab-content" id="dram-int">
+        <div class="desc"><strong>LPDDR5X vs DDR5 vs GDDR6X vs HBM3:</strong></div>
+        <table class="dtable">
+          <tr><th>Memory</th><th>Bandwidth</th><th>Latency</th><th>Channels</th><th>Power</th><th>Used By</th></tr>
+          <tr><td style="color:var(--mem)">LPDDR5X</td><td>68 GB/s</td><td>~80 ns</td><td>4× 16-bit</td><td>~3W</td><td>Mobile SoCs</td></tr>
+          <tr><td style="color:var(--cpu)">DDR5</td><td>64-128 GB/s</td><td>~70 ns</td><td>2× 64-bit</td><td>~8W</td><td>Desktop/Server CPU</td></tr>
+          <tr><td style="color:var(--gpu)">GDDR6X</td><td>1008 GB/s</td><td>~100 ns</td><td>384-bit</td><td>~40W</td><td>Desktop GPU</td></tr>
+          <tr><td style="color:var(--accent4)">HBM3</td><td>3350 GB/s</td><td>~50 ns</td><td>8192-bit stacks</td><td>~20W</td><td>Data center GPU</td></tr>
+        </table>
+        <div class="code">
+<span class="cm">// LPDDR5X physical layout:</span>
+<span class="cm">// 4 channels × 16-bit width = 64-bit total bus</span>
+<span class="cm">// Each channel: 8533 MT/s × 2 bytes = 17.07 GB/s</span>
+<span class="cm">// Total: 4 × 17.07 = 68.3 GB/s</span>
+
+<span class="cm">// BUT: each channel is independent</span>
+<span class="cm">// Sequential access from one channel: ~17 GB/s</span>
+<span class="cm">// To hit 68 GB/s, you need access patterns that</span>
+<span class="cm">// spread across all 4 channels simultaneously</span>
+
+<span class="cm">// Weight tensors are large enough to span all channels ✓</span>
+<span class="cm">// KV cache is sequential → may only use 1-2 channels ✗</span>
+<span class="cm">// This explains why KV cache reads are slower than expected</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="arrow">&#8595;</div>
+
+<!-- ═══ CPU CORES ═══ -->
+<div class="step" id="s3">
+  <div class="step-top">
+    <span class="step-num sn-blue">6C — CPU: big.LITTLE AND SIMD</span>
+    <h2>How ARM Cores Process Tensors</h2>
+    <div class="desc">
+      Mobile CPUs use <span class="hl">big.LITTLE</span> (or DynamIQ): a mix of high-performance and
+      efficiency cores. LLM inference wants the big cores for NEON/DOTPROD/I8MM SIMD
+      instructions. The efficiency cores are useless for matmul — too slow.
+    </div>
+
+    <div class="vis">
+      <div class="vis-title">ARM SIMD Evolution — ISA Extensions for LLM</div>
+      <table class="dtable">
+        <tr><th>Extension</th><th>ISA Level</th><th>Key Instructions</th><th>Speedup vs Base</th><th>Found On</th></tr>
+        <tr><td style="color:var(--accent)">NEON (base)</td><td>ARMv8.0-A</td><td>FMLA (FP16×FP16+FP32)</td><td>1×</td><td>All ARM64</td></tr>
+        <tr><td style="color:var(--accent2)">DOTPROD</td><td>ARMv8.2-A</td><td>SDOT/UDOT (4×INT8→INT32)</td><td>~4×</td><td>2019+ (SD 855+)</td></tr>
+        <tr><td style="color:var(--accent4)">I8MM</td><td>ARMv8.6-A</td><td>SMMLA (8×INT8→INT32)</td><td>~8×</td><td>2022+ (SD 8 Gen 1+)</td></tr>
+        <tr><td style="color:var(--accent3)">SVE/SVE2</td><td>ARMv9.0-A</td><td>Variable-length vectors</td><td>~2-4×</td><td>2023+ (limited)</td></tr>
+        <tr><td style="color:var(--mem)">SME</td><td>ARMv9.2-A</td><td>FMOPA (outer product)</td><td>~16×</td><td>Apple M4, future</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <button class="expand-btn" onclick="toggleExpand(this)">
+    <span class="chevron">&#9656;</span> Deep Dive: NEON Matmul, Thread Pinning, Power States
+  </button>
+  <div class="expand-panel">
+    <div class="expand-inner">
+      <div class="tabs">
+        <button class="tab active" onclick="switchTab(event,'neon-mm')">NEON Matmul</button>
+        <button class="tab" onclick="switchTab(event,'thread-pin')">Thread Pinning</button>
+        <button class="tab" onclick="switchTab(event,'power-st')">Power States</button>
+      </div>
+
+      <div class="tab-content active" id="neon-mm">
+        <div class="desc"><strong>How a single NEON matmul processes one output element:</strong></div>
+        <div class="code">
+<span class="cm">// Q4_0 GEMV: y[m] = W[m,:] · x[:]</span>
+<span class="cm">// W is quantized Q4_0, x is FP16</span>
+
+<span class="cm">// Step 1: Load 32 Q4_0 weights (18 bytes = 1 block)</span>
+<span class="cm">// block_q4_0 = { float16 scale; uint8_t qs[16]; }</span>
+<span class="cm">// Each uint8 holds 2 weights: low nibble + high nibble</span>
+
+<span class="kw">int8x16_t</span> raw  = <span class="fn">vld1q_u8</span>(&block.qs[<span class="num">0</span>]);
+<span class="kw">int8x16_t</span> lo   = <span class="fn">vandq_u8</span>(raw, <span class="fn">vdupq_n_u8</span>(<span class="num">0x0F</span>));  <span class="cm">// low nibbles</span>
+<span class="kw">int8x16_t</span> hi   = <span class="fn">vshrq_n_u8</span>(raw, <span class="num">4</span>);              <span class="cm">// high nibbles</span>
+<span class="cm">// Subtract 8 to center around zero (unsigned → signed)</span>
+lo = <span class="fn">vsubq_s8</span>(lo, <span class="fn">vdupq_n_s8</span>(<span class="num">8</span>));
+hi = <span class="fn">vsubq_s8</span>(hi, <span class="fn">vdupq_n_s8</span>(<span class="num">8</span>));
+
+<span class="cm">// Step 2: Load 32 FP16 input values, convert to INT8</span>
+<span class="cm">// (or compute in FP32 — depends on precision needed)</span>
+
+<span class="cm">// Step 3: Dot product (with DOTPROD extension)</span>
+<span class="kw">int32x4_t</span> sum = <span class="fn">vdotq_s32</span>(sum, lo_chunk, x_chunk);
+<span class="cm">// SDOT: 4 pairs of INT8 → 4 INT32 accumulates in 1 cycle</span>
+<span class="cm">// Without DOTPROD: need 4 multiplies + 3 adds = 7 cycles</span>
+
+<span class="cm">// Step 4: Scale by block scale factor</span>
+<span class="kw">float</span> result = <span class="fn">vaddvq_s32</span>(sum) * (<span class="kw">float</span>)block.d;</div>
+        <div class="desc" style="margin-top:12px;">
+          <strong>Throughput comparison per cycle:</strong>
+        </div>
+        <div class="code">
+<span class="cm">// Base NEON (ARMv8.0):  4 INT8 multiplies → 2 cycles = 2 ops/cycle</span>
+<span class="cm">// DOTPROD (ARMv8.2):   16 INT8 multiplies → 1 cycle  = 16 ops/cycle (8×)</span>
+<span class="cm">// I8MM (ARMv8.6):      64 INT8 multiplies → 1 cycle  = 64 ops/cycle (32×)</span>
+<span class="cm">//                      (SMMLA: 2×8 × 8×1 matrix multiply)</span>
+<span class="cm">// SME (ARMv9.2):       Outer product accumulate, scales with vector length</span>
+<span class="cm">//                      On Apple M4: ~256 INT8 ops/cycle</span></div>
+      </div>
+
+      <div class="tab-content" id="thread-pin">
+        <div class="desc"><strong>Thread affinity is critical on mobile:</strong></div>
+        <div class="code">
+<span class="cm">// Problem: Android scheduler may put LLM threads on LITTLE cores</span>
+<span class="cm">// LITTLE core (A520): ~1/4 the NEON throughput of big core</span>
+
+<span class="cm">// Solution: Pin inference threads to big cores</span>
+<span class="cm">// On Linux/Android:</span>
+<span class="kw">cpu_set_t</span> mask;
+<span class="fn">CPU_ZERO</span>(&mask);
+<span class="cm">// Snapdragon 8 Elite: cores 0-1 = Prime, 2-7 = Perf</span>
+<span class="kw">for</span> (<span class="kw">int</span> i = <span class="num">0</span>; i &lt; <span class="num">8</span>; i++)  <span class="cm">// Use all Oryon cores</span>
+    <span class="fn">CPU_SET</span>(i, &mask);
+<span class="fn">sched_setaffinity</span>(<span class="num">0</span>, <span class="kw">sizeof</span>(mask), &mask);
+
+<span class="cm">// llama.cpp approach: ggml_threadpool with affinity mask</span>
+<span class="cm">// Problem: it uses ALL cores including LITTLE ones</span>
+<span class="cm">// LITTLE cores are slower → they become stragglers</span>
+<span class="cm">// Other threads wait for slowest core → worse than fewer threads</span>
+
+<span class="cm">// Better approach: only use big cores</span>
+<span class="cm">// 2 Prime + 6 Perf = 8 threads on fast cores</span>
+<span class="cm">// Skip 4 LITTLE cores entirely</span></div>
+        <div class="warn">
+          <strong>llama.cpp's thread pool uses busy-waiting by default.</strong> Each worker thread
+          spins in a tight loop checking for work. On mobile, this wastes battery and generates
+          heat even when idle. Better: use futex/condition variable for sleep/wake.
+        </div>
+      </div>
+
+      <div class="tab-content" id="power-st">
+        <div class="code">
+<span class="cm">// ARM DynamIQ power states:</span>
+<span class="cm">//</span>
+<span class="cm">// C0: Active — full speed, full power</span>
+<span class="cm">// C1: WFI (Wait For Interrupt) — core clock gated</span>
+<span class="cm">//     Wake: ~1 μs (essentially free)</span>
+<span class="cm">// C2: Retention — L1 cache powered, core off</span>
+<span class="cm">//     Wake: ~50 μs</span>
+<span class="cm">// C3: Power collapse — everything off</span>
+<span class="cm">//     Wake: ~500 μs (L1 cache lost, refill needed)</span>
+
+<span class="cm">// For LLM decode (one token every ~25-30ms):</span>
+<span class="cm">// Between tokens, cores enter C1 or C2</span>
+<span class="cm">// C3 takes too long to recover → avoid by keeping thread alive</span>
+
+<span class="cm">// DVFS (Dynamic Voltage and Frequency Scaling):</span>
+<span class="cm">// Android governor adjusts frequency based on load</span>
+<span class="cm">// LLM inference = bursty: high load during compute, idle between</span>
+<span class="cm">// Governor may not ramp up fast enough</span>
+<span class="cm">//</span>
+<span class="cm">// Hack: set performance governor during inference</span>
+<span class="cm">// echo "performance" > /sys/devices/.../cpufreq/scaling_governor</span>
+<span class="cm">// (requires root — most apps can't do this)</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="arrow">&#8595;</div>
+
+<!-- ═══ MOBILE GPU ═══ -->
+<div class="step" id="s4">
+  <div class="step-top">
+    <span class="step-num sn-green">6D — MOBILE GPU: TILE-BASED RENDERING</span>
+    <h2>Adreno, Mali, PowerVR — Not Desktop GPUs</h2>
+    <div class="desc">
+      Mobile GPUs are <span class="hl2">Tile-Based Deferred Rendering (TBDR)</span> architectures — designed for
+      graphics, not compute. They split the screen into tiles and process each tile using
+      fast on-chip SRAM. For compute (LLM matmul), this tile architecture is both a
+      blessing and a curse.
+    </div>
+
+    <div class="vis">
+      <div class="vis-title">Mobile GPU Architecture (Adreno 830)</div>
+      <div class="arch-box">
+        <div class="arch-row">
+          <div class="arch-cell" style="background:rgba(52,211,153,.1);border:1px solid var(--gpu);">
+            <strong style="color:var(--gpu);">Shader Processors (2-4 ALU pipes)</strong>
+            <span class="arch-label">~256 ALUs total, FP16/FP32/INT8, wave size 64 (Adreno) or 16 (Mali)</span>
+          </div>
+        </div>
+        <div class="arch-row">
+          <div class="arch-cell" style="background:rgba(251,191,36,.1);border:1px solid var(--accent4);flex:1">
+            <strong style="color:var(--accent4);">Texture Units + L1 Cache</strong>
+            <span class="arch-label">Adreno: 32KB L1 per pipe, optimized for 2D image reads (CL_Image!)</span>
+          </div>
+          <div class="arch-cell" style="background:rgba(124,140,245,.1);border:1px solid var(--accent);flex:1">
+            <strong style="color:var(--accent);">Tile Memory (GMEM)</strong>
+            <span class="arch-label">1-4 MB on-chip SRAM, 10× faster than DRAM</span>
+          </div>
+        </div>
+        <div class="arch-row">
+          <div class="arch-cell" style="background:rgba(248,113,113,.1);border:1px solid var(--mem);">
+            <strong style="color:var(--mem);">Shared LPDDR5X</strong>
+            <span class="arch-label">Same DRAM as CPU/NPU — 68 GB/s total shared</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <button class="expand-btn" onclick="toggleExpand(this)">
+    <span class="chevron">&#9656;</span> Deep Dive: Tile Architecture, Texture Cache Trick, API Overhead
+  </button>
+  <div class="expand-panel">
+    <div class="expand-inner">
+      <div class="tabs">
+        <button class="tab active" onclick="switchTab(event,'tile-arch')">Tile Architecture</button>
+        <button class="tab" onclick="switchTab(event,'tex-trick')">Texture Cache Trick</button>
+        <button class="tab" onclick="switchTab(event,'api-over')">API Overhead</button>
+        <button class="tab" onclick="switchTab(event,'gpu-vs')">vs Desktop GPU</button>
+      </div>
+
+      <div class="tab-content active" id="tile-arch">
+        <div class="desc"><strong>How tile-based rendering works and why it matters for compute:</strong></div>
+        <div class="code">
+<span class="cm">// Desktop GPU (Immediate Mode Rendering — IMR):</span>
+<span class="cm">// 1. For each triangle:</span>
+<span class="cm">//    - Transform vertices</span>
+<span class="cm">//    - Rasterize to pixels</span>
+<span class="cm">//    - Shade pixels → write to framebuffer in DRAM</span>
+<span class="cm">// Every pixel write goes to DRAM → high bandwidth</span>
+<span class="cm">// OK because desktop has 1 TB/s GDDR6X</span>
+
+<span class="cm">// Mobile GPU (Tile-Based Deferred Rendering — TBDR):</span>
+<span class="cm">// 1. Bin: sort ALL triangles into screen tiles (16×16 or 32×32)</span>
+<span class="cm">// 2. For each tile:</span>
+<span class="cm">//    - Load tile from DRAM → on-chip GMEM (1-4 MB)</span>
+<span class="cm">//    - Rasterize + shade all triangles in tile</span>
+<span class="cm">//    - ALL reads/writes hit GMEM (10× faster than DRAM)</span>
+<span class="cm">//    - Write final tile back to DRAM</span>
+<span class="cm">// Massive bandwidth savings — only 2 DRAM transfers per tile</span>
+
+<span class="cm">// For compute (LLM matmul):</span>
+<span class="cm">// ✓ GMEM acts as a fast scratchpad for tile-sized chunks</span>
+<span class="cm">// ✓ If you tile your matmul to fit GMEM, inner loop is fast</span>
+<span class="cm">// ✗ But compute dispatches bypass tile binning</span>
+<span class="cm">// ✗ Each compute dispatch has ~0.1-0.5ms CPU-side overhead</span>
+<span class="cm">// ✗ For decode (one token), dispatch overhead dominates</span></div>
+      </div>
+
+      <div class="tab-content" id="tex-trick">
+        <div class="desc"><strong>MNN-LLM's key insight: use CL_Image2D to exploit texture cache.</strong></div>
+        <div class="code">
+<span class="cm">// Adreno GPU has specialized texture units with L1 cache</span>
+<span class="cm">// Designed for: read texture pixel → filter → output</span>
+<span class="cm">// This hardware path is separate from the compute path</span>
+
+<span class="cm">// CL_Buffer (standard):</span>
+<span class="cm">// → Read via general memory system</span>
+<span class="cm">// → Competes with compute for L2 cache</span>
+<span class="cm">// → Sequential access pattern</span>
+
+<span class="cm">// CL_Image2D (texture):</span>
+<span class="cm">// → Read via texture unit → dedicated L1 cache (32KB)</span>
+<span class="cm">// → 128-bit (4×FP32) vectorized reads per cycle</span>
+<span class="cm">// → Hardware handles 2D tiling automatically</span>
+<span class="cm">// → CL_RGBA format: 4 values per pixel = natural vectorization</span>
+
+<span class="cm">// MNN-LLM weight layout: [l/lp, h, lp]</span>
+<span class="cm">// l = total elements, lp = 32 (pack factor)</span>
+<span class="cm">// h = number of heads</span>
+<span class="cm">// Stored as 2D image: width = l/lp, height = h × lp</span>
+<span class="cm">// Each read_imagef() gets 4 weights in one cycle</span>
+
+<span class="cm">// Result: 5-7× faster weight reads on Adreno</span>
+<span class="cm">// This is why MNN-LLM is 7.1× faster than llama.cpp</span></div>
+
+        <div class="key-insight">
+          <strong>Not all mobile GPUs benefit equally.</strong> Adreno has the largest L1 texture cache
+          (32KB per pipe). Mali's texture cache is smaller (~8-16KB). PowerVR has good texture
+          units but different tiling. This trick is most effective on Qualcomm Snapdragon.
+        </div>
+      </div>
+
+      <div class="tab-content" id="api-over">
+        <div class="desc"><strong>The 96% overhead problem (from llama.cpp Vulkan analysis):</strong></div>
+        <div class="code">
+<span class="cm">// llama.cpp: one decode token on Vulkan (Adreno)</span>
+<span class="cm">// Total time: ~4 ms</span>
+<span class="cm">//</span>
+<span class="cm">// Breakdown:</span>
+<span class="cm">//   GPU compute (actual matmul):    0.16 ms  (4%)</span>
+<span class="cm">//   CPU-side overhead:              3.84 ms  (96%)</span>
+<span class="cm">//     ├── vkAllocateDescriptorSets: 0.8 ms</span>
+<span class="cm">//     ├── vkUpdateDescriptorSets:   0.5 ms (×200)</span>
+<span class="cm">//     ├── vkCmdBindPipeline:        0.3 ms</span>
+<span class="cm">//     ├── vkCmdBindDescriptorSets:  0.4 ms</span>
+<span class="cm">//     ├── vkCmdPipelineBarrier:     0.6 ms</span>
+<span class="cm">//     ├── vkCmdCopyBuffer:          0.5 ms (tensor copies!)</span>
+<span class="cm">//     ├── vkQueueSubmit:            0.3 ms</span>
+<span class="cm">//     └── vkWaitForFences:          0.34 ms</span>
+<span class="cm">//</span>
+<span class="cm">// Result: 4 ms/token = 250 tok/s theoretical</span>
+<span class="cm">// But most of that is overhead, not useful compute</span>
+<span class="cm">// Actual GPU utilization: ~4%</span>
+
+<span class="cm">// Fix strategies:</span>
+<span class="cm">// 1. Command tape replay (XNet-DNN): record once, replay</span>
+<span class="cm">// 2. Pre-allocated descriptor pools (reduce alloc to ~0)</span>
+<span class="cm">// 3. Pipeline caching (VkPipelineCache)</span>
+<span class="cm">// 4. Batch dispatches (fewer submits per token)</span>
+<span class="cm">// 5. cl_qcom_recordable_queues (Adreno-specific)</span></div>
+      </div>
+
+      <div class="tab-content" id="gpu-vs">
+        <div class="desc"><strong>Mobile GPU vs Desktop GPU — fundamental differences:</strong></div>
+        <table class="dtable">
+          <tr><th>Feature</th><th style="color:var(--gpu)">Mobile (Adreno 830)</th><th style="color:var(--accent)">Desktop (RTX 4090)</th></tr>
+          <tr><td>Architecture</td><td>TBDR (tile-based)</td><td>IMR (immediate mode)</td></tr>
+          <tr><td>Shader cores</td><td>~256 ALUs</td><td>16,384 CUDA cores</td></tr>
+          <tr><td>FP16 TFLOPS</td><td>~4.6</td><td>~330 (Tensor cores)</td></tr>
+          <tr><td>Memory</td><td style="color:var(--mem)">Shared LPDDR5X (68 GB/s)</td><td style="color:var(--accent2)">Dedicated GDDR6X (1008 GB/s)</td></tr>
+          <tr><td>On-chip SRAM</td><td>1-4 MB GMEM</td><td>~48 MB L2 cache</td></tr>
+          <tr><td>Texture cache</td><td style="color:var(--accent2)">32 KB L1 per pipe (exploitable!)</td><td>Less important (fast L2)</td></tr>
+          <tr><td>Dispatch overhead</td><td style="color:var(--mem)">0.1-0.5 ms per dispatch</td><td style="color:var(--accent2)">&lt;0.01 ms per dispatch</td></tr>
+          <tr><td>Power budget</td><td style="color:var(--mem)">3-5W total GPU</td><td>450W total card</td></tr>
+          <tr><td>TDP headroom</td><td style="color:var(--mem)">Throttles in 30-60s</td><td>Sustained indefinitely</td></tr>
+          <tr><td>API</td><td>Vulkan / OpenCL / OpenGL ES</td><td>CUDA / Vulkan / OpenCL</td></tr>
+        </table>
+        <div class="key-insight">
+          <strong>The 72× compute gap:</strong> RTX 4090 has 72× more FP16 TFLOPS.
+          But LLM decode is bandwidth-bound, so the real gap is 15× (memory bandwidth).
+          Mobile's disadvantage is smaller than the TFLOPS numbers suggest.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="arrow">&#8595;</div>
+
+<!-- ═══ NPU / DSP ═══ -->
+<div class="step" id="s5">
+  <div class="step-top">
+    <span class="step-num sn-orange">6E — NPU AND DSP</span>
+    <h2>Neural Processing Units — Promise vs Reality</h2>
+    <div class="desc">
+      Every SoC vendor ships an NPU: Qualcomm Hexagon, Google TPU, MediaTek APU, Apple ANE,
+      Samsung dual-NPU. They promise 30-70+ TOPS at INT8. But for LLM inference,
+      <span class="hl4">NPUs are complicated</span> — high TOPS doesn't mean high tok/s.
+    </div>
+
+    <div class="vis">
+      <div class="vis-title">NPU TOPS vs Actual LLM Usefulness</div>
+      <div style="display:flex;flex-direction:column;gap:8px;">
+        <div class="bar-container">
+          <div class="bar-label" style="color:var(--npu)">Hexagon</div>
+          <div class="bar-track">
+            <div class="bar-fill" style="width:94%;background:var(--npu);">73 TOPS INT8 — Qualcomm QNN SDK (restrictive)</div>
+          </div>
+        </div>
+        <div class="bar-container">
+          <div class="bar-label" style="color:var(--accent3)">MediaTek APU</div>
+          <div class="bar-track">
+            <div class="bar-fill" style="width:59%;background:var(--accent3);">46 TOPS INT8 — NeuroPilot SDK</div>
+          </div>
+        </div>
+        <div class="bar-container">
+          <div class="bar-label" style="color:var(--accent)">Apple ANE</div>
+          <div class="bar-track">
+            <div class="bar-fill" style="width:45%;background:var(--accent);">35 TOPS INT8 — Core ML (well-documented)</div>
+          </div>
+        </div>
+        <div class="bar-container">
+          <div class="bar-label" style="color:var(--accent4)">Google TPU</div>
+          <div class="bar-track">
+            <div class="bar-fill" style="width:19%;background:var(--accent4);">~15 TOPS INT8 — TensorFlow Lite delegate</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <button class="expand-btn" onclick="toggleExpand(this)">
+    <span class="chevron">&#9656;</span> Deep Dive: Why NPUs Underperform for LLMs
+  </button>
+  <div class="expand-panel">
+    <div class="expand-inner">
+      <div class="tabs">
+        <button class="tab active" onclick="switchTab(event,'npu-prob')">The Problem</button>
+        <button class="tab" onclick="switchTab(event,'npu-hex')">Hexagon Deep Dive</button>
+        <button class="tab" onclick="switchTab(event,'npu-use')">What NPUs Are Good For</button>
+      </div>
+
+      <div class="tab-content active" id="npu-prob">
+        <div class="desc"><strong>Why 73 TOPS doesn't mean 73 TOPS for LLMs:</strong></div>
+        <div class="code">
+<span class="cm">// NPU TOPS = peak theoretical at INT8</span>
+<span class="cm">// Assumes: 100% ALU utilization, perfect data reuse</span>
+<span class="cm">// This happens for: CNN (3×3 convolutions), image classification</span>
+
+<span class="cm">// LLM decode reality:</span>
+<span class="cm">// Operation: y[M] = W[M×N] × x[N] (GEMV — one vector)</span>
+<span class="cm">// Data reuse ratio: N reads, M×N weights, but only 1 vector</span>
+<span class="cm">// Arithmetic intensity: ~1 op per byte (bandwidth-bound)</span>
+
+<span class="cm">// At 1 op/byte and 68 GB/s bandwidth:</span>
+<span class="cm">// Max useful compute = 68 GOPS (billions of ops/sec)</span>
+<span class="cm">// NPU has 73 TOPS = 73,000 GOPS</span>
+<span class="cm">// Utilization: 68 / 73,000 = 0.09%</span>
+<span class="cm">//</span>
+<span class="cm">// The NPU is 99.91% idle waiting for memory</span></div>
+
+        <div class="desc" style="margin-top:12px;">
+          <strong>Additional NPU problems for LLMs:</strong>
+        </div>
+        <div class="code">
+<span class="cm">// 1. HIGH DISPATCH LATENCY</span>
+<span class="cm">//    NPU dispatch: 2-5 ms per operation (via NNAPI/QNN)</span>
+<span class="cm">//    For 28 layers × 7 ops/layer = 196 dispatches per token</span>
+<span class="cm">//    196 × 3 ms = 588 ms overhead alone → 1.7 tok/s</span>
+
+<span class="cm">// 2. FIXED GRAPH COMPILATION</span>
+<span class="cm">//    NPU requires pre-compiled computation graph</span>
+<span class="cm">//    Graph is compiled for fixed shapes (e.g., seq_len=1)</span>
+<span class="cm">//    Changing context length → recompile (~seconds)</span>
+<span class="cm">//    Dynamic KV cache = constant shape changes</span>
+
+<span class="cm">// 3. LIMITED OP SUPPORT</span>
+<span class="cm">//    RoPE? Often not natively supported → falls back to CPU</span>
+<span class="cm">//    Custom attention? Not supported → falls back</span>
+<span class="cm">//    Fallback = data transfer CPU↔NPU = more overhead</span>
+
+<span class="cm">// 4. QUANTIZATION MISMATCH</span>
+<span class="cm">//    NPU wants symmetric INT8 with per-tensor scales</span>
+<span class="cm">//    GGUF uses per-block scales (32 or 256 elements)</span>
+<span class="cm">//    Need format conversion → extra memory + compute</span></div>
+
+        <div class="warn">
+          <strong>HeteroInfer's insight:</strong> NPUs ARE useful — but only for their separate memory
+          bandwidth, not their compute. Run simple GEMV on NPU to use its memory port, not
+          its ALUs. This gives 25% more total bandwidth without using compute at all.
+        </div>
+      </div>
+
+      <div class="tab-content" id="npu-hex">
+        <div class="desc"><strong>Qualcomm Hexagon — the most accessible NPU on Android:</strong></div>
+        <div class="code">
+<span class="cm">// Hexagon NPU architecture (Snapdragon 8 Elite):</span>
+<span class="cm">// - 73 TOPS INT8 (4 tensor cores × 18.25 TOPS each)</span>
+<span class="cm">// - Dedicated HVX (Hexagon Vector eXtensions) SIMD</span>
+<span class="cm">// - Dedicated SRAM (~2-4 MB, exact size NDA-protected)</span>
+<span class="cm">// - Separate memory controller (key for HeteroInfer!)</span>
+
+<span class="cm">// SDK: Qualcomm AI Engine Direct (QNN)</span>
+<span class="cm">// Access: Restricted — requires Qualcomm partnership/NDA for</span>
+<span class="cm">//         full NPU access. Public API via NNAPI is limited.</span>
+
+<span class="cm">// QNN API flow:</span>
+<span class="cm">// 1. QnnBackend_create() — initialize Hexagon runtime</span>
+<span class="cm">// 2. QnnGraph_create() — define computation graph</span>
+<span class="cm">// 3. QnnGraph_addNode() — add ops (matmul, etc.)</span>
+<span class="cm">// 4. QnnGraph_finalize() — compile graph for hardware</span>
+<span class="cm">//    ↑ This step takes 1-10 seconds for LLM layers</span>
+<span class="cm">// 5. QnnGraph_execute() — run inference</span>
+<span class="cm">// 6. Repeat step 5 per token</span>
+
+<span class="cm">// Your ai_gguf status: nativeSetHexagonConfig() scaffolded</span>
+<span class="cm">// but Hexagon backend commented out (needs QNN SDK to build)</span></div>
+      </div>
+
+      <div class="tab-content" id="npu-use">
+        <div class="desc"><strong>What NPUs actually excel at for on-device AI:</strong></div>
+        <table class="dtable">
+          <tr><th>Task</th><th>NPU Advantage</th><th>Why</th></tr>
+          <tr><td style="color:var(--accent2)">Image classification</td><td>10-100× vs CPU</td><td>High arithmetic intensity (conv), fixed shapes</td></tr>
+          <tr><td style="color:var(--accent2)">Object detection</td><td>10-50× vs CPU</td><td>CNN-based, fixed input size, batch-friendly</td></tr>
+          <tr><td style="color:var(--accent2)">LLM prefill</td><td>2-5× vs CPU</td><td>Batch matmul (many tokens × weights)</td></tr>
+          <tr><td style="color:var(--accent4)">LLM decode</td><td>~1× vs CPU</td><td>GEMV = bandwidth-bound, dispatch overhead</td></tr>
+          <tr><td style="color:var(--mem)">Embedding lookup</td><td>Slower than CPU</td><td>Random memory access, NPU wants sequential</td></tr>
+          <tr><td style="color:var(--accent2)">Whisper/TTS</td><td>3-10× vs CPU</td><td>Conv1D + attention, fixed-length audio chunks</td></tr>
+        </table>
+        <div class="key-insight">
+          <strong>Best strategy for LLM on mobile:</strong> Use NPU for prefill (batch matmul, worth
+          the dispatch overhead). Use CPU for decode (GEMV, too many small dispatches).
+          Use GPU for weight storage in texture cache (MNN-LLM style). Hybrid wins.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="arrow">&#8595;</div>
+
+<!-- ═══ TOKEN JOURNEY ═══ -->
+<div class="step" id="s6">
+  <div class="step-top">
+    <span class="step-num sn-pink">6F — TOKEN JOURNEY THROUGH HARDWARE</span>
+    <h2>One Token, Every Layer of Silicon</h2>
+    <div class="desc">
+      Follow a single decode token through <span class="hl3">Qwen2-1.5B Q4_0</span> on Snapdragon 8 Elite.
+      Every tensor read, every cache line, every NEON instruction.
+    </div>
+
+    <div class="vis">
+      <div class="vis-title">Token #257: Generating "gravity" — Hardware Journey</div>
+      <div style="display:grid;grid-template-columns:1fr;gap:4px;">
+        <div class="d-box" style="border-color:var(--accent);">
+          <strong style="color:var(--accent);">1. Token ID → Embedding Lookup</strong>
+          <small>Token 26521 ("grav") → read row 26521 from embed_tokens [151936 × 1536]<br>
+          = 1536 × 2 bytes (FP16) = 3072 bytes = 48 cache lines from DRAM (~80 ns each)</small>
+        </div>
+        <div class="d-arrow">&#8595;</div>
+        <div class="d-box" style="border-color:var(--accent2);">
+          <strong style="color:var(--accent2);">2. For each of 28 layers: RMSNorm</strong>
+          <small>Read 1536 norm weights (3 KB) + compute: x_norm = x / sqrt(mean(x^2) + eps) * w<br>
+          ~48 cache lines. NEON: vfmaq_f32 for multiply-accumulate, vaddvq_f32 for reduction</small>
+        </div>
+        <div class="d-arrow">&#8595;</div>
+        <div class="d-box" style="border-color:var(--accent4);">
+          <strong style="color:var(--accent4);">3. Q/K/V Projections (the big reads)</strong>
+          <small>Q: W_q[1536×1536] × x[1536] → read ~1.2 MB Q4_0 weights (18,750 cache lines!)<br>
+          K: W_k[256×1536] × x → 200 KB. V: W_v[256×1536] × x → 200 KB. GQA: 2 KV heads.</small>
+        </div>
+        <div class="d-arrow">&#8595;</div>
+        <div class="d-box" style="border-color:var(--accent3);">
+          <strong style="color:var(--accent3);">4. RoPE (Rotary Position Encoding)</strong>
+          <small>Rotate Q and K by position 257. Read precomputed sin/cos table (256 bytes).<br>
+          Pure compute: complex multiply. Tiny cost — ~100 NEON ops per head.</small>
+        </div>
+        <div class="d-arrow">&#8595;</div>
+        <div class="d-box" style="border-color:var(--cpu);">
+          <strong style="color:var(--cpu);">5. Attention: Q × K^T → softmax → × V</strong>
+          <small>Read KV cache: K[257×128×2] + V[257×128×2] per head = 131 KB per head (Q8_0 cache)<br>
+          12 Q heads × 2 KV heads (GQA) = each KV head shared by 6 Q heads. ~2000 cache lines.</small>
+        </div>
+        <div class="d-arrow">&#8595;</div>
+        <div class="d-box" style="border-color:var(--npu);">
+          <strong style="color:var(--npu);">6. Output Projection + FFN</strong>
+          <small>W_o[1536×1536] × attn_out → 1.2 MB read. Then FFN: gate[4096×1536] + up[4096×1536]<br>
+          → SwiGLU → down[1536×4096]. FFN reads: 3 × ~3.2 MB = ~9.6 MB Q4_0. The biggest cost!</small>
+        </div>
+        <div class="d-arrow">&#8595;</div>
+        <div class="d-box" style="border-color:var(--mem);">
+          <strong style="color:var(--mem);">7. Repeat 28× → Final RMSNorm → LM Head</strong>
+          <small>LM head: W_lm[151936×1536] × x → ~138 MB Q4_0 read. Produces 151936 logits.<br>
+          Total per token: ~900 MB read from DRAM. At 68 GB/s: 13.2 ms minimum.</small>
+        </div>
+        <div class="d-arrow">&#8595;</div>
+        <div class="d-box" style="border-color:var(--accent2);">
+          <strong style="color:var(--accent2);">8. Sample → "ity" (token 488)</strong>
+          <small>Temperature scaling → top-p filtering → multinomial sample → decode to text.<br>
+          Negligible compute. Append new K,V to cache (quantize to INT8 before storing).</small>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <button class="expand-btn" onclick="toggleExpand(this)">
+    <span class="chevron">&#9656;</span> Deep Dive: Byte-Level Accounting
+  </button>
+  <div class="expand-panel">
+    <div class="expand-inner">
+      <div class="desc"><strong>Exact bytes read from DRAM per token (Qwen2-1.5B Q4_0, context 256):</strong></div>
+      <table class="dtable">
+        <tr><th>Component</th><th>Per Layer</th><th>× 28 Layers</th><th>% Total</th></tr>
+        <tr><td>Embedding lookup</td><td colspan="2">3,072 bytes</td><td>0.0%</td></tr>
+        <tr><td>RMSNorm weights</td><td>3,072 B</td><td>86 KB</td><td>0.0%</td></tr>
+        <tr><td style="color:var(--accent4)">Q projection (W_q)</td><td>1.18 MB</td><td>33.0 MB</td><td>3.7%</td></tr>
+        <tr><td>K projection (W_k)</td><td>197 KB</td><td>5.5 MB</td><td>0.6%</td></tr>
+        <tr><td>V projection (W_v)</td><td>197 KB</td><td>5.5 MB</td><td>0.6%</td></tr>
+        <tr><td>O projection (W_o)</td><td>1.18 MB</td><td>33.0 MB</td><td>3.7%</td></tr>
+        <tr><td style="color:var(--cpu)">KV cache reads</td><td>131 KB</td><td>3.7 MB</td><td>0.4%</td></tr>
+        <tr><td style="color:var(--mem)">FFN gate+up+down</td><td>9.6 MB</td><td style="color:var(--mem)">268.8 MB</td><td style="color:var(--mem)">30.1%</td></tr>
+        <tr><td style="color:var(--mem)">LM Head</td><td colspan="2" style="color:var(--mem)">138.5 MB</td><td style="color:var(--mem)">15.5%</td></tr>
+        <tr><td style="color:var(--accent2)"><strong>Total per token</strong></td><td colspan="2"><strong>~893 MB</strong></td><td><strong>100%</strong></td></tr>
+      </table>
+      <div class="formula">893 MB / 68 GB/s = 13.1 ms/token = 76.3 tok/s theoretical max</div>
+      <div class="desc" style="margin-top:8px;">
+        <strong>FFN dominates at 30%</strong> because it has the largest weight matrices (4096×1536 × 3 per layer).
+        LM head is 15.5% — it multiplies against the entire vocabulary (151936 tokens).
+        KV cache is only 0.4% at context 256 — but grows linearly with context length.
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="arrow">&#8595;</div>
+
+<!-- ═══ DESKTOP COMPARISON ═══ -->
+<div class="step" id="s7">
+  <div class="step-top">
+    <span class="step-num sn-purple">6G — DESKTOP vs MOBILE: FULL COMPARISON</span>
+    <h2>Why Desktop Gets 10-15x More tok/s</h2>
+    <div class="desc">
+      Same model, same quantization, same algorithm. The hardware difference explains
+      almost everything.
+    </div>
+
+    <div class="vis">
+      <div class="vis-title">Qwen2-1.5B Q4_0 — Same Model, Different Hardware</div>
+      <table class="dtable">
+        <tr><th>Metric</th><th style="color:var(--mem)">Snapdragon 8 Elite</th><th style="color:var(--accent2)">RTX 4090</th><th style="color:var(--accent)">Apple M4 Pro</th></tr>
+        <tr><td>Memory BW</td><td>68 GB/s</td><td>1008 GB/s</td><td>273 GB/s</td></tr>
+        <tr><td>Theoretical tok/s</td><td>76</td><td>1127</td><td>305</td></tr>
+        <tr><td>Actual tok/s (est.)</td><td>30-40</td><td>200-400</td><td>100-150</td></tr>
+        <tr><td>Efficiency</td><td>~50%</td><td>~30%</td><td>~40%</td></tr>
+        <tr><td>Power draw</td><td style="color:var(--accent2)">~5W</td><td style="color:var(--mem)">~150W</td><td>~30W</td></tr>
+        <tr><td>tok/s per Watt</td><td style="color:var(--accent2)">~7</td><td>~2</td><td>~4</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <button class="expand-btn" onclick="toggleExpand(this)">
+    <span class="chevron">&#9656;</span> Deep Dive: Why Efficiency Differs
+  </button>
+  <div class="expand-panel">
+    <div class="expand-inner">
+      <div class="code">
+<span class="cm">// Why mobile achieves higher % of roofline than desktop GPU:</span>
+
+<span class="cm">// 1. SIMPLER PIPELINE</span>
+<span class="cm">//    Mobile CPU: load weights → NEON dot product → store</span>
+<span class="cm">//    Desktop GPU: allocate → upload → dispatch → sync → download</span>
+<span class="cm">//    Fewer steps = less overhead</span>
+
+<span class="cm">// 2. NO PCIe BOTTLENECK</span>
+<span class="cm">//    Mobile: weights already in shared memory (UMA)</span>
+<span class="cm">//    Desktop: weights must be in GPU VRAM</span>
+<span class="cm">//    If model > VRAM → spill to PCIe (32 GB/s) → disaster</span>
+
+<span class="cm">// 3. LOWER DISPATCH OVERHEAD RATIO</span>
+<span class="cm">//    Mobile CPU NEON: ~0 dispatch overhead (just function call)</span>
+<span class="cm">//    GPU Vulkan: ~0.5ms per dispatch × 460 ops = 230ms overhead!</span>
+<span class="cm">//    (This is why llama.cpp Vulkan on mobile is often SLOWER than CPU)</span>
+
+<span class="cm">// 4. MEMORY LATENCY HIDING</span>
+<span class="cm">//    GPU: thousands of threads hide memory latency by switching</span>
+<span class="cm">//    But GEMV has too few threads (output dim ~1536)</span>
+<span class="cm">//    Not enough parallelism to hide 80ns DRAM latency</span>
+<span class="cm">//    CPU with prefetching handles GEMV better for small models</span>
+
+<span class="cm">// Why desktop GPU ABSOLUTE numbers are higher:</span>
+<span class="cm">// Pure bandwidth: 1008 vs 68 GB/s = 14.8× more</span>
+<span class="cm">// Even at 30% efficiency: 300+ tok/s vs 40 tok/s</span></div>
+
+      <div class="key-insight">
+        <strong>The sweet spot:</strong> Apple M-series gets both — high bandwidth (273 GB/s),
+        UMA (no PCIe), strong CPU NEON + ANE, and low dispatch overhead.
+        This is why M4 Pro achieves 100+ tok/s for 1B models — best of both worlds.
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="arrow">&#8595;</div>
+
+<!-- ═══ OPTIMIZATIONS ═══ -->
+<div class="step" id="s8">
+  <div class="step-top">
+    <span class="step-num sn-amber">6H — OPTIMIZATIONS: POSSIBLE AND IMPOSSIBLE</span>
+    <h2>What You Can and Can't Fix</h2>
+    <div class="desc">
+      Some bottlenecks are fixable with smart software. Others are hard physics.
+      Know the difference.
+    </div>
+
+    <div class="vis">
+      <div class="vis-title">Optimization Map</div>
+      <table class="dtable">
+        <tr><th>Optimization</th><th>Type</th><th>Expected Gain</th><th>Difficulty</th><th>Status</th></tr>
+        <tr><td style="color:var(--accent2)">CL_Image weight storage</td><td>Software</td><td>5-7× GPU decode</td><td>Medium</td><td style="color:var(--accent2)">POSSIBLE</td></tr>
+        <tr><td style="color:var(--accent2)">Command tape replay</td><td>Software</td><td>Eliminate 90% overhead</td><td>Medium</td><td style="color:var(--accent2)">POSSIBLE</td></tr>
+        <tr><td style="color:var(--accent2)">GPU+NPU parallel</td><td>Software</td><td>1.7× bandwidth</td><td>High</td><td style="color:var(--accent2)">POSSIBLE</td></tr>
+        <tr><td style="color:var(--accent2)">Chunked prefill</td><td>Software</td><td>Prevent OOM</td><td>Low</td><td style="color:var(--accent2)">POSSIBLE</td></tr>
+        <tr><td style="color:var(--accent2)">KV cache quantization</td><td>Software</td><td>50% KV memory</td><td>Low</td><td style="color:var(--accent2)">DONE (Q8_0)</td></tr>
+        <tr><td style="color:var(--accent2)">Sliding window KV</td><td>Software</td><td>74% KV savings</td><td>Low</td><td style="color:var(--accent2)">POSSIBLE</td></tr>
+        <tr><td style="color:var(--accent4)">Thread pinning to big cores</td><td>Software</td><td>20-50% decode</td><td>Low</td><td style="color:var(--accent4)">NEEDS ROOT</td></tr>
+        <tr><td style="color:var(--accent4)">Better quantization (Q4_K)</td><td>Software</td><td>5-10% quality</td><td>Low</td><td style="color:var(--accent4)">EXISTS (GGUF)</td></tr>
+        <tr><td style="color:var(--mem)">Increase DRAM bandwidth</td><td>Hardware</td><td>Would be huge</td><td>N/A</td><td style="color:var(--mem)">IMPOSSIBLE</td></tr>
+        <tr><td style="color:var(--mem)">Add GPU VRAM</td><td>Hardware</td><td>Would be huge</td><td>N/A</td><td style="color:var(--mem)">IMPOSSIBLE (UMA)</td></tr>
+        <tr><td style="color:var(--mem)">Reduce model size below Q4</td><td>Algorithm</td><td>2× speed but quality drops</td><td>Medium</td><td style="color:var(--mem)">QUALITY LOSS</td></tr>
+        <tr><td style="color:var(--mem)">Eliminate thermal throttling</td><td>Physics</td><td>Would help a lot</td><td>N/A</td><td style="color:var(--mem)">IMPOSSIBLE</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <button class="expand-btn" onclick="toggleExpand(this)">
+    <span class="chevron">&#9656;</span> Deep Dive: Optimization Priority Matrix
+  </button>
+  <div class="expand-panel">
+    <div class="expand-inner">
+      <div class="desc"><strong>For your ai_gguf engine rewrite — priority order:</strong></div>
+      <div class="code">
+<span class="cm">// PRIORITY 1 — Eliminate CPU-side dispatch overhead</span>
+<span class="cm">// Current: ~96% of Vulkan time is overhead</span>
+<span class="cm">// Fix: Command tape replay (XNet-DNN style)</span>
+<span class="cm">//   - Record command buffer once at first token</span>
+<span class="cm">//   - Replay identical commands for subsequent tokens</span>
+<span class="cm">//   - On Adreno: use cl_qcom_recordable_queues</span>
+<span class="cm">// Expected: 4ms → 0.4ms per token = 10× Vulkan improvement</span>
+
+<span class="cm">// PRIORITY 2 — CL_Image weight storage (MNN-LLM)</span>
+<span class="cm">// Current: weights in CL_Buffer, read via compute path</span>
+<span class="cm">// Fix: Store weights as CL_Image2D (RGBA format)</span>
+<span class="cm">//   - Exploits Adreno's texture L1 cache (32KB per pipe)</span>
+<span class="cm">//   - 128-bit vectorized reads via read_imagef()</span>
+<span class="cm">// Expected: 5-7× decode speedup on GPU path</span>
+
+<span class="cm">// PRIORITY 3 — GPU+NPU parallel (HeteroInfer)</span>
+<span class="cm">// Current: GPU or CPU, one at a time</span>
+<span class="cm">// Fix: Split weight matrices 75/25 between GPU and NPU</span>
+<span class="cm">//   - Both have independent memory controllers</span>
+<span class="cm">//   - Total bandwidth: ~60 GB/s vs 43 GB/s single</span>
+<span class="cm">//   - Use flag-bit polling for sync (&lt;1μs vs 400μs)</span>
+<span class="cm">// Expected: 1.7× bandwidth → proportional tok/s gain</span>
+
+<span class="cm">// PRIORITY 4 — Stage-aware kernels (ML Drift)</span>
+<span class="cm">// Prefill: use convolution-style kernels (batch matmul)</span>
+<span class="cm">// Decode: use GEMV-optimized kernels</span>
+<span class="cm">// Different optimal kernel for each phase</span>
+
+<span class="cm">// PRIORITY 5 — Sliding window KV + attention sinking</span>
+<span class="cm">// Keep first 4 tokens + last N tokens in KV cache</span>
+<span class="cm">// Discard middle → 74% memory savings at long contexts</span>
+<span class="cm">// Already proven by StreamingLLM and Cactus</span>
+
+<span class="cm">// COMBINED TARGET:</span>
+<span class="cm">// From current ~2.7 tok/s (llama.cpp Vulkan)</span>
+<span class="cm">// To estimated 40-60 tok/s on Qwen2-1.5B Q4_0</span>
+<span class="cm">// = 15-22× improvement through software alone</span></div>
+    </div>
+  </div>
+</div>
+
+<div class="arrow">&#8595;</div>
+
+<!-- ═══ THERMAL ═══ -->
+<div class="step" id="s9">
+  <div class="step-top">
+    <span class="step-num sn-red">6I — THERMAL WALL</span>
+    <h2>The Physics You Can't Optimize Away</h2>
+    <div class="desc">
+      Mobile SoCs have a <span class="hl4">5-10W thermal envelope</span>. LLM inference at full speed consumes
+      3-5W. After 30-60 seconds of sustained inference, the SoC hits thermal throttling
+      and clocks down 20-40%. This is physics — no software can fix it.
+    </div>
+
+    <div class="vis">
+      <div class="vis-title">Thermal Throttling Timeline — Sustained LLM Decode</div>
+      <div style="display:flex;flex-direction:column;gap:4px;">
+        <div class="bar-container">
+          <div class="bar-label">0-15s</div>
+          <div class="bar-track">
+            <div class="bar-fill" style="width:100%;background:var(--accent2);">100% clock — 40 tok/s — skin temp OK</div>
+          </div>
+        </div>
+        <div class="bar-container">
+          <div class="bar-label">15-30s</div>
+          <div class="bar-track">
+            <div class="bar-fill" style="width:90%;background:var(--accent4);">90% clock — 36 tok/s — junction 85°C</div>
+          </div>
+        </div>
+        <div class="bar-container">
+          <div class="bar-label">30-60s</div>
+          <div class="bar-track">
+            <div class="bar-fill" style="width:70%;background:var(--npu);">70% clock — 28 tok/s — junction 95°C, throttling</div>
+          </div>
+        </div>
+        <div class="bar-container">
+          <div class="bar-label">60-120s</div>
+          <div class="bar-track">
+            <div class="bar-fill" style="width:60%;background:var(--mem);">60% clock — 24 tok/s — sustained thermal limit</div>
+          </div>
+        </div>
+        <div class="bar-container">
+          <div class="bar-label">120s+</div>
+          <div class="bar-track">
+            <div class="bar-fill" style="width:55%;background:var(--mem);">55-60% clock — steady state — skin temp 42-44°C</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <button class="expand-btn" onclick="toggleExpand(this)">
+    <span class="chevron">&#9656;</span> Deep Dive: Thermal Mitigation Strategies
+  </button>
+  <div class="expand-panel">
+    <div class="expand-inner">
+      <div class="code">
+<span class="cm">// What you CAN do about thermal:</span>
+
+<span class="cm">// 1. MONITOR AND ADAPT</span>
+<span class="cm">//    Read thermal sensors (your ai_gguf already has this!)</span>
+<span class="cm">//    nativeGetThermalState() — reads sysfs for GPU/NPU temp</span>
+<span class="cm">//    When approaching 90°C: reduce threads, add idle gaps</span>
+
+<span class="cm">// 2. EFFICIENT COMPUTATION = LESS HEAT</span>
+<span class="cm">//    Every wasted cycle generates heat without useful work</span>
+<span class="cm">//    Eliminating 96% Vulkan overhead → 96% less wasted heat</span>
+<span class="cm">//    Better kernels → same tok/s at lower clock → less heat</span>
+
+<span class="cm">// 3. SPREAD LOAD ACROSS PROCESSORS</span>
+<span class="cm">//    CPU-only: all heat on CPU cores</span>
+<span class="cm">//    CPU+GPU+NPU: heat spread across die</span>
+<span class="cm">//    More thermal mass → slower temperature rise</span>
+<span class="cm">//    HeteroInfer approach helps thermal indirectly</span>
+
+<span class="cm">// 4. BURST + IDLE PATTERN</span>
+<span class="cm">//    Generate response at full speed → goes idle</span>
+<span class="cm">//    Natural chat pattern: user reads, device cools</span>
+<span class="cm">//    Problem: long generations (500+ tokens) hit thermal wall</span>
+
+<span class="cm">// 5. QUANTIZE HARDER</span>
+<span class="cm">//    Q4_0 reads 50% less than Q8_0 → 50% less energy per token</span>
+<span class="cm">//    Same tok/s but less heat → can sustain longer</span>
+
+<span class="cm">// What you CANNOT do:</span>
+<span class="cm">// - Increase thermal envelope (hardware design decision)</span>
+<span class="cm">// - Prevent throttling (it protects the chip from damage)</span>
+<span class="cm">// - Cool the phone (no fans, passive cooling only)</span>
+<span class="cm">// - Change skin temperature limit (42-45°C per OEM spec)</span></div>
+
+      <div class="desc" style="margin-top:16px;"><strong>Desktop doesn't have this problem:</strong></div>
+      <div class="code">
+<span class="cm">// Desktop: 450W TDP, active cooling (fans/liquid)</span>
+<span class="cm">// RTX 4090 can sustain full clock indefinitely</span>
+<span class="cm">// No thermal throttling for LLM workloads</span>
+
+<span class="cm">// Data center: 350-700W per GPU, forced air/liquid</span>
+<span class="cm">// H100/H200 never throttle — designed for 24/7 load</span>
+
+<span class="cm">// Mobile: 5-10W, no fans, glass + metal case</span>
+<span class="cm">// Must dissipate ALL heat through the case</span>
+<span class="cm">// Skin temp limit: 42-45°C (above = user discomfort)</span>
+<span class="cm">// This caps sustained power to ~3-4W</span>
+
+<span class="cm">// The brutal math:</span>
+<span class="cm">// At 68 GB/s and 3W sustained: ~22 nJ per byte</span>
+<span class="cm">// 900 MB per token × 22 nJ = 19.8 mJ per token</span>
+<span class="cm">// 30 tok/s × 19.8 mJ = 594 mW on memory alone</span>
+<span class="cm">// + CPU compute + overhead = ~3-4W total ✓</span></div>
+    </div>
+  </div>
+</div>
+
+<div class="arrow">&#8595;</div>
+
+<!-- ═══ FINAL SUMMARY ═══ -->
+<div class="step" id="s10">
+  <div class="step-top">
+    <span class="step-num sn-green">SUMMARY</span>
+    <h2>Mobile vs Desktop — Pros and Cons</h2>
+
+    <div class="pc-grid">
+      <div class="pc-box pro"><h4>Mobile Pros</h4><ul>
+        <li>UMA — zero-copy tensor sharing between CPU/GPU/NPU</li>
+        <li>No PCIe bottleneck — all processors see same memory</li>
+        <li>Low power — 5W vs 450W = 90× more efficient per Watt</li>
+        <li>Always available — in your pocket, no server needed</li>
+        <li>Privacy — data never leaves device</li>
+        <li>Low latency for small models — no network round trip</li>
+        <li>Multiple processors to exploit (CPU+GPU+NPU+DSP)</li>
+        <li>ARM NEON/DOTPROD/I8MM — excellent INT8 throughput</li>
+        <li>Texture cache trick (CL_Image) — unique to mobile GPUs</li>
+      </ul></div>
+      <div class="pc-box con"><h4>Mobile Cons</h4><ul>
+        <li>68 GB/s vs 1 TB/s — 15× less memory bandwidth</li>
+        <li>Thermal throttling — 40% performance drop after 60s</li>
+        <li>Shared bandwidth — all processors compete for 68 GB/s</li>
+        <li>Small models only — 0.5B to 3B params (max 7B with Q4)</li>
+        <li>GPU dispatch overhead — 96% of time wasted on Vulkan</li>
+        <li>NPU limited — high latency, fixed shapes, poor op coverage</li>
+        <li>No CUDA — Vulkan/OpenCL have worse tooling and drivers</li>
+        <li>Battery drain — sustained inference kills battery life</li>
+        <li>Fragmentation — 100+ SoCs with different capabilities</li>
+      </ul></div>
+    </div>
+
+    <div class="pc-grid">
+      <div class="pc-box pro"><h4>Desktop Pros</h4><ul>
+        <li>1 TB/s+ memory bandwidth (GDDR6X/HBM3)</li>
+        <li>No thermal throttling — sustained performance forever</li>
+        <li>CUDA — best ML tooling, libraries, documentation</li>
+        <li>Large models — 70B+ params with quantization</li>
+        <li>Dedicated VRAM — no bandwidth sharing</li>
+        <li>Tensor cores — hardware matrix multiply acceleration</li>
+        <li>Mature ecosystem — ONNX, TensorRT, vLLM, etc.</li>
+        <li>Consistent hardware — fewer compatibility issues</li>
+      </ul></div>
+      <div class="pc-box con"><h4>Desktop Cons</h4><ul>
+        <li>PCIe bottleneck — 32 GB/s between CPU and GPU</li>
+        <li>No UMA — must copy tensors to GPU VRAM</li>
+        <li>450W power draw — expensive, needs cooling</li>
+        <li>Not portable — requires wall power</li>
+        <li>GPU cost — $1,500+ for inference-grade card</li>
+        <li>VRAM limits — 24GB (4090), 80GB (H100), model must fit</li>
+        <li>Network dependency — if cloud-hosted, adds latency</li>
+        <li>Privacy concerns — data on server infrastructure</li>
+      </ul></div>
+    </div>
+
+    <div class="key-insight" style="margin-top:16px;">
+      <strong>The bottom line for your engine:</strong> Mobile hardware CAN deliver 30-60 tok/s for
+      1.5B models — but only with mobile-specific optimizations. Desktop techniques (just throw
+      CUDA at it) don't work here. Your engine needs: CL_Image weight storage, command tape
+      replay, GPU+NPU parallelism, stage-aware kernels, and thermal-aware scheduling.
+      The hardware is capable. The software (llama.cpp) just doesn't exploit it.
+    </div>
+  </div>
+</div>
+
+</div>
+
+<script>
+const observer=new IntersectionObserver(e=>{e.forEach(e=>{e.isIntersecting&&e.target.classList.add('visible')})},{threshold:.08});document.querySelectorAll('.step').forEach(s=>observer.observe(s));const sections=document.querySelectorAll('.step'),navLinks=document.querySelectorAll('.nav a'),navObs=new IntersectionObserver(e=>{e.forEach(e=>{if(e.isIntersecting){navLinks.forEach(l=>l.classList.remove('active'));const l=document.querySelector(`.nav a[href="#${e.target.id}"]`);l&&l.classList.add('active')}})},{threshold:.3,rootMargin:'-80px 0px -60% 0px'});sections.forEach(s=>navObs.observe(s));function toggleExpand(b){b.nextElementSibling.classList.toggle('open');b.classList.toggle('open')}function switchTab(e,id){const c=e.target.closest('.expand-inner');c.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));c.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));e.target.classList.add('active');c.querySelector('#'+id).classList.add('active')}
+</script>
+</body>
+</html>

@@ -23,3 +23,7 @@ rootProject.name = "Ai-Systems"
 include(":ai_gguf")
 include(":ai_sd")
 include(":ai_supertonic_tts")
+include(":app")
+include(":backend_manager")
+include(":backend_plugin_api")
+include(":gguf_lib")
