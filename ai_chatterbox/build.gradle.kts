@@ -9,6 +9,10 @@ android {
     }
     ndkVersion = "27.3.13750724"
 
+    buildFeatures {
+        prefab = true
+    }
+
     defaultConfig {
         minSdk = 27
         consumerProguardFiles("consumer-rules.pro")
