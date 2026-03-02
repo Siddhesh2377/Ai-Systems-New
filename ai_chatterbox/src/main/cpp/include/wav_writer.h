@@ -31,6 +31,8 @@ struct WavHeader {
     uint32_t dataSize       = 0;
 };
 
+static_assert(sizeof(WavHeader) == 44, "WAV header must be exactly 44 bytes");
+
 /**
  * Write PCM int16 audio data to a WAV file.
  *

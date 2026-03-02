@@ -3,18 +3,26 @@
  *
  * Pattern follows ai_sd/src/main/cpp/src/ai_sd_jni.cpp:
  * - Global state singletons with mutex protection
- * - Cached JNI callback method IDs
  * - jstring <-> std::string conversion with proper release
  *
  * JNI naming: Java_com_dark_ai_1chatterbox_ChatterboxNativeLib_<method>
  * (the _1 encodes the underscore in "ai_chatterbox")
+ *
+ * Threading model:
+ * - g_mtx protects g_engine/g_tokenizer ownership (create, destroy, replace)
+ * - nativeSynthesize() copies raw pointers under lock, then runs inference unlocked
+ * - nativeStop() takes lock briefly to read g_engine, then calls requestStop() unlocked
+ * - nativeRelease() takes lock and resets pointers (waits for synthesize to finish via stopFlag)
  */
 
 #include <jni.h>
 #include <android/log.h>
+#include <atomic>
+#include <chrono>
 #include <mutex>
 #include <memory>
 #include <string>
+#include <thread>
 
 #include "chatterbox_engine.h"
 #include "bpe_tokenizer.h"
@@ -28,10 +36,8 @@ static std::unique_ptr<ChatterboxEngine> g_engine;
 static std::unique_ptr<BPETokenizer> g_tokenizer;
 static std::mutex g_mtx;
 
-// Cached JNI callback method IDs (populated on first use)
-static jmethodID g_onSpeechTokenProgress = nullptr;
-static jmethodID g_onAudioReady = nullptr;
-static jmethodID g_onError = nullptr;
+// Tracks whether nativeSynthesize is running (prevents release during inference)
+static std::atomic<bool> g_synthesizing{false};
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -49,29 +55,31 @@ static std::string jstring_to_string(JNIEnv* env, jstring jstr) {
 }
 
 /**
- * Cache callback method IDs on first use.
- * Returns true if all method IDs are valid.
+ * Resolve callback method IDs fresh each call.
+ * jmethodID resolution is a fast hash lookup — no need to cache across calls,
+ * and caching is unsafe if different callback classes are passed.
  */
-static bool ensureCallbackIds(JNIEnv* env, jobject callback) {
-    if (g_onSpeechTokenProgress != nullptr) return true;
+struct CallbackIds {
+    jmethodID onSpeechTokenProgress = nullptr;
+    jmethodID onAudioReady = nullptr;
+    jmethodID onError = nullptr;
+};
 
+static bool resolveCallbackIds(JNIEnv* env, jobject callback, CallbackIds& ids) {
     jclass cls = env->GetObjectClass(callback);
     if (!cls) {
-        LOGE("ensureCallbackIds: failed to get callback class");
+        LOGE("resolveCallbackIds: failed to get callback class");
         return false;
     }
 
-    g_onSpeechTokenProgress = env->GetMethodID(cls, "onSpeechTokenProgress", "(I)V");
-    g_onAudioReady = env->GetMethodID(cls, "onAudioReady", "([SI)V");
-    g_onError = env->GetMethodID(cls, "onError", "(Ljava/lang/String;)V");
+    ids.onSpeechTokenProgress = env->GetMethodID(cls, "onSpeechTokenProgress", "(I)V");
+    ids.onAudioReady = env->GetMethodID(cls, "onAudioReady", "([SI)V");
+    ids.onError = env->GetMethodID(cls, "onError", "(Ljava/lang/String;)V");
 
     env->DeleteLocalRef(cls);
 
-    if (!g_onSpeechTokenProgress || !g_onAudioReady || !g_onError) {
-        LOGE("ensureCallbackIds: failed to resolve one or more callback method IDs");
-        g_onSpeechTokenProgress = nullptr;
-        g_onAudioReady = nullptr;
-        g_onError = nullptr;
+    if (!ids.onSpeechTokenProgress || !ids.onAudioReady || !ids.onError) {
+        LOGE("resolveCallbackIds: failed to resolve one or more callback method IDs");
         return false;
     }
 
@@ -81,11 +89,11 @@ static bool ensureCallbackIds(JNIEnv* env, jobject callback) {
 /**
  * Report an error to the callback (if available) and log it.
  */
-static void reportError(JNIEnv* env, jobject callback, const char* msg) {
+static void reportError(JNIEnv* env, jobject callback, jmethodID errorMethod, const char* msg) {
     LOGE("%s", msg);
-    if (callback && g_onError) {
+    if (callback && errorMethod) {
         jstring jmsg = env->NewStringUTF(msg);
-        env->CallVoidMethod(callback, g_onError, jmsg);
+        env->CallVoidMethod(callback, errorMethod, jmsg);
         env->DeleteLocalRef(jmsg);
     }
 }
@@ -202,9 +210,27 @@ JNIEXPORT void JNICALL
 Java_com_dark_ai_1chatterbox_ChatterboxNativeLib_nativeRelease(
         JNIEnv* /* env */, jobject /* thiz */) {
 
-    std::lock_guard<std::mutex> lock(g_mtx);
-
     LOGI("nativeRelease: releasing engine and tokenizer");
+
+    // If synthesis is running, request stop and wait for it to finish
+    {
+        std::lock_guard<std::mutex> lock(g_mtx);
+        if (g_engine) {
+            g_engine->requestStop();
+        }
+    }
+
+    // Spin-wait for synthesis to finish (stop flag ensures it exits quickly)
+    int waitCount = 0;
+    while (g_synthesizing.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (++waitCount > 500) { // 5 second timeout
+            LOGE("nativeRelease: timed out waiting for synthesis to finish");
+            break;
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(g_mtx);
 
     if (g_engine) {
         try {
@@ -244,74 +270,103 @@ JNIEXPORT jboolean JNICALL
 Java_com_dark_ai_1chatterbox_ChatterboxNativeLib_nativeSynthesize(
         JNIEnv* env, jobject /* thiz */, jstring jText, jobject callback) {
 
-    std::lock_guard<std::mutex> lock(g_mtx);
-
-    // Validate prerequisites
-    if (!g_engine || !g_engine->isLoaded()) {
-        reportError(env, callback, "nativeSynthesize: engine not loaded");
-        return JNI_FALSE;
-    }
-
-    if (!g_engine->isVoiceLoaded()) {
-        reportError(env, callback, "nativeSynthesize: voice preset not loaded");
-        return JNI_FALSE;
-    }
-
-    if (!g_tokenizer) {
-        reportError(env, callback, "nativeSynthesize: tokenizer not loaded");
-        return JNI_FALSE;
-    }
-
-    // Cache callback method IDs
-    if (!ensureCallbackIds(env, callback)) {
+    // Resolve callback method IDs fresh each call (safe across classloaders)
+    CallbackIds cbIds;
+    if (!resolveCallbackIds(env, callback, cbIds)) {
         LOGE("nativeSynthesize: failed to resolve callback methods");
         return JNI_FALSE;
     }
 
+    // Grab raw pointers under lock, then release lock before long-running inference.
+    // g_synthesizing flag prevents nativeRelease from destroying objects mid-inference.
+    ChatterboxEngine* engine = nullptr;
+    BPETokenizer* tokenizer = nullptr;
+
+    {
+        std::lock_guard<std::mutex> lock(g_mtx);
+
+        if (!g_engine || !g_engine->isLoaded()) {
+            reportError(env, callback, cbIds.onError, "nativeSynthesize: engine not loaded");
+            return JNI_FALSE;
+        }
+
+        if (!g_engine->isVoiceLoaded()) {
+            reportError(env, callback, cbIds.onError, "nativeSynthesize: voice preset not loaded");
+            return JNI_FALSE;
+        }
+
+        if (!g_tokenizer) {
+            reportError(env, callback, cbIds.onError, "nativeSynthesize: tokenizer not loaded");
+            return JNI_FALSE;
+        }
+
+        engine = g_engine.get();
+        tokenizer = g_tokenizer.get();
+        g_synthesizing.store(true);
+    }
+    // Lock released — other JNI calls (isLoaded, setConfig, stop) can proceed.
+    // nativeRelease will wait for g_synthesizing to clear.
+
     std::string text = jstring_to_string(env, jText);
     if (text.empty()) {
-        reportError(env, callback, "nativeSynthesize: text is empty");
+        g_synthesizing.store(false);
+        reportError(env, callback, cbIds.onError, "nativeSynthesize: text is empty");
         return JNI_FALSE;
     }
 
     LOGI("nativeSynthesize: text length=%zu", text.size());
 
+    jboolean result = JNI_FALSE;
     try {
         // Step 1: Tokenize
-        auto tokenIds = g_tokenizer->encode(text, true);
+        auto tokenIds = tokenizer->encode(text, true);
         LOGI("nativeSynthesize: tokenized %zu tokens", tokenIds.size());
 
         if (tokenIds.empty()) {
-            reportError(env, callback, "nativeSynthesize: tokenization produced 0 tokens");
+            reportError(env, callback, cbIds.onError,
+                        "nativeSynthesize: tokenization produced 0 tokens");
+            g_synthesizing.store(false);
             return JNI_FALSE;
         }
 
-        // Step 2: Generate speech tokens (report progress via callback)
-        auto speechTokens = g_engine->generateSpeechTokens(tokenIds);
+        // Step 2: Generate speech tokens (autoregressive — the long-running part)
+        auto speechTokens = engine->generateSpeechTokens(tokenIds);
         LOGI("nativeSynthesize: generated %zu speech tokens", speechTokens.size());
 
         // Report speech token progress
-        env->CallVoidMethod(callback, g_onSpeechTokenProgress,
+        env->CallVoidMethod(callback, cbIds.onSpeechTokenProgress,
                             static_cast<jint>(speechTokens.size()));
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            LOGE("nativeSynthesize: callback exception in onSpeechTokenProgress");
+            g_synthesizing.store(false);
+            return JNI_FALSE;
+        }
 
         if (speechTokens.empty()) {
-            reportError(env, callback, "nativeSynthesize: speech token generation produced 0 tokens");
+            reportError(env, callback, cbIds.onError,
+                        "nativeSynthesize: speech token generation produced 0 tokens");
+            g_synthesizing.store(false);
             return JNI_FALSE;
         }
 
         // Step 3: Decode speech tokens to PCM audio
-        auto pcm = g_engine->decodeSpeechTokens(speechTokens);
+        auto pcm = engine->decodeSpeechTokens(speechTokens);
         LOGI("nativeSynthesize: decoded %zu PCM samples", pcm.size());
 
         if (pcm.empty()) {
-            reportError(env, callback, "nativeSynthesize: decoder produced 0 PCM samples");
+            reportError(env, callback, cbIds.onError,
+                        "nativeSynthesize: decoder produced 0 PCM samples");
+            g_synthesizing.store(false);
             return JNI_FALSE;
         }
 
         // Step 4: Deliver result via callback
         jshortArray jpcm = env->NewShortArray(static_cast<jsize>(pcm.size()));
         if (!jpcm) {
-            reportError(env, callback, "nativeSynthesize: failed to allocate ShortArray");
+            reportError(env, callback, cbIds.onError,
+                        "nativeSynthesize: failed to allocate ShortArray");
+            g_synthesizing.store(false);
             return JNI_FALSE;
         }
 
@@ -319,31 +374,43 @@ Java_com_dark_ai_1chatterbox_ChatterboxNativeLib_nativeSynthesize(
                                  reinterpret_cast<const jshort*>(pcm.data()));
 
         // 24000 Hz mono PCM — the Chatterbox model output sample rate
-        env->CallVoidMethod(callback, g_onAudioReady, jpcm, 24000);
+        env->CallVoidMethod(callback, cbIds.onAudioReady, jpcm, 24000);
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            LOGE("nativeSynthesize: callback exception in onAudioReady");
+        }
 
         env->DeleteLocalRef(jpcm);
 
         LOGI("nativeSynthesize: success");
-        return JNI_TRUE;
+        result = JNI_TRUE;
 
     } catch (const std::exception& e) {
         std::string msg = std::string("nativeSynthesize: exception: ") + e.what();
-        reportError(env, callback, msg.c_str());
-        return JNI_FALSE;
+        reportError(env, callback, cbIds.onError, msg.c_str());
     }
+
+    g_synthesizing.store(false);
+    return result;
 }
 
 /**
- * Request stop — NO MUTEX.
- * Must be callable from any thread while synthesize() is running.
+ * Request stop — brief lock to read g_engine safely, then call requestStop() unlocked.
+ * requestStop() writes an atomic bool, so it's safe after we've verified the pointer.
+ * The lock prevents a TOCTOU race with nativeRelease() resetting g_engine.
  */
 JNIEXPORT void JNICALL
 Java_com_dark_ai_1chatterbox_ChatterboxNativeLib_nativeStop(
         JNIEnv* /* env */, jobject /* thiz */) {
 
     LOGI("nativeStop: requesting stop");
-    if (g_engine) {
-        g_engine->requestStop();
+    ChatterboxEngine* engine = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mtx);
+        engine = g_engine.get();
+    }
+    if (engine) {
+        engine->requestStop();
     }
 }
 
