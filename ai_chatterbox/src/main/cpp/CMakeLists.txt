@@ -8,6 +8,7 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,max-page-size
 
 set(SRC_FILES
     src/chatterbox_jni.cpp
+    src/bpe_tokenizer.cpp
 )
 
 add_library(${CMAKE_PROJECT_NAME} SHARED ${SRC_FILES})
