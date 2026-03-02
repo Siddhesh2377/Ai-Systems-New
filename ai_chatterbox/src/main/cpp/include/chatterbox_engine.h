@@ -32,6 +32,17 @@
 
 #include <onnxruntime/onnxruntime_cxx_api.h>
 
+/**
+ * Model variant — determines architecture constants and feature availability.
+ *
+ * TURBO:    GPT-2 Medium 350M, 24 layers, no exaggeration, no CFG
+ * ORIGINAL: Llama 500M, 30 layers, exaggeration input on embed_tokens, cfg_weight=0.5
+ */
+enum class ChatterboxVariant {
+    TURBO,    // GPT-2 Medium 350M, 24 layers, no exaggeration
+    ORIGINAL  // Llama 500M, 30 layers, has exaggeration
+};
+
 class ChatterboxEngine {
 public:
     ChatterboxEngine();
@@ -114,6 +125,24 @@ public:
     void setMaxTokens(int maxTokens);
 
     /**
+     * Set the model variant. MUST be called BEFORE loadModels() because it
+     * determines the number of KV cache layers and I/O name arrays.
+     *
+     * Calling after loadModels() will rebuild I/O names but they won't match
+     * the already-loaded ONNX graph — only call before loading.
+     */
+    void setVariant(ChatterboxVariant variant);
+
+    /**
+     * Set the emotion exaggeration parameter.
+     * Only effective for ORIGINAL variant (silently ignored for TURBO).
+     *
+     * Values:  0.0 = flat/monotone, 1.0 = normal, 2.0 = very expressive
+     * Default: 1.0
+     */
+    void setExaggeration(float exaggeration);
+
+    /**
      * Request cancellation of an in-progress generation.
      * Safe to call from any thread. Resets automatically on next synthesize() call.
      */
@@ -161,10 +190,14 @@ private:
     static constexpr int64_t STOP_SPEECH_TOKEN  = 6562;
     static constexpr int64_t SILENCE_TOKEN      = 4299;
     static constexpr float   MAX_WAV_VALUE      = 32767.0f;
-    static constexpr int     NUM_LAYERS         = 24;
     static constexpr int     NUM_KV_HEADS       = 16;
     static constexpr int     HEAD_DIM           = 64;
     static constexpr int     EMBED_DIM          = 1024;
+
+    // ── Variant-dependent state ──────────────────────────────────
+    ChatterboxVariant variant_ = ChatterboxVariant::TURBO;
+    int numLayers_ = 24;           // 24 for TURBO, 30 for ORIGINAL
+    float exaggeration_ = 1.0f;   // emotion exaggeration (ORIGINAL only)
 
     // ── Helpers ─────────────────────────────────────────────────
     std::vector<float>   loadBinaryFile(const std::string& path);

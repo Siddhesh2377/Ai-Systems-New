@@ -39,23 +39,23 @@ ChatterboxEngine::~ChatterboxEngine() {
 
 void ChatterboxEngine::buildIONames() {
     // Language model inputs: inputs_embeds, attention_mask, position_ids,
-    //   then 48 KV cache tensors: past_key_values.{0..23}.key, past_key_values.{0..23}.value
+    //   then numLayers_*2 KV cache tensors: past_key_values.{0..N-1}.key/value
     lmInputNameStrings_.clear();
     lmInputNameStrings_.push_back("inputs_embeds");
     lmInputNameStrings_.push_back("attention_mask");
     lmInputNameStrings_.push_back("position_ids");
 
-    for (int i = 0; i < NUM_LAYERS; i++) {
+    for (int i = 0; i < numLayers_; i++) {
         lmInputNameStrings_.push_back("past_key_values." + std::to_string(i) + ".key");
         lmInputNameStrings_.push_back("past_key_values." + std::to_string(i) + ".value");
     }
 
     // Language model outputs: logits,
-    //   then 48 present KV tensors: present.{0..23}.key, present.{0..23}.value
+    //   then numLayers_*2 present KV tensors: present.{0..N-1}.key/value
     lmOutputNameStrings_.clear();
     lmOutputNameStrings_.push_back("logits");
 
-    for (int i = 0; i < NUM_LAYERS; i++) {
+    for (int i = 0; i < numLayers_; i++) {
         lmOutputNameStrings_.push_back("present." + std::to_string(i) + ".key");
         lmOutputNameStrings_.push_back("present." + std::to_string(i) + ".value");
     }
@@ -236,13 +236,34 @@ std::vector<int64_t> ChatterboxEngine::generateSpeechTokens(
                     inputIdsCopy.data(), inputIdsCopy.size(),
                     embedDim.data(), embedDim.size());
 
-                const char* inputNames[]  = { kEmbedInputName };
-                const char* outputNames[] = { kEmbedOutputName };
+                std::vector<Ort::Value> output;
+                if (variant_ == ChatterboxVariant::ORIGINAL) {
+                    // Original embed_tokens has 2 inputs: input_ids + exaggeration
+                    const char* inputNames[]  = { "input_ids", "exaggeration" };
+                    const char* outputNames[] = { kEmbedOutputName };
 
-                auto output = embedTokensSession_->Run(
-                    Ort::RunOptions{nullptr},
-                    inputNames, &embedInput, 1,
-                    outputNames, 1);
+                    std::vector<float> exagData = { exaggeration_ };
+                    std::vector<int64_t> exagShape = { 1 };
+
+                    std::vector<Ort::Value> inputs;
+                    inputs.push_back(std::move(embedInput));
+                    inputs.push_back(Ort::Value::CreateTensor<float>(
+                        memoryInfo_, exagData.data(), 1, exagShape.data(), 1));
+
+                    output = embedTokensSession_->Run(
+                        Ort::RunOptions{nullptr},
+                        inputNames, inputs.data(), inputs.size(),
+                        outputNames, 1);
+                } else {
+                    // Turbo: single input (input_ids only)
+                    const char* inputNames[]  = { kEmbedInputName };
+                    const char* outputNames[] = { kEmbedOutputName };
+
+                    output = embedTokensSession_->Run(
+                        Ort::RunOptions{nullptr},
+                        inputNames, &embedInput, 1,
+                        outputNames, 1);
+                }
 
                 const float* promptData = output.front().GetTensorData<float>();
                 size_t promptSize = output.front().GetTensorTypeAndShapeInfo().GetElementCount();
@@ -257,9 +278,10 @@ std::vector<int64_t> ChatterboxEngine::generateSpeechTokens(
                     EMBED_DIM
                 };
 
-                LOGD("First step: embedsSize=%zu, shape=[1,%lld,%d]",
+                LOGD("First step: embedsSize=%zu, shape=[1,%lld,%d], variant=%s",
                      currentEmbedsData.size(),
-                     (long long)currentEmbedsShape[1], EMBED_DIM);
+                     (long long)currentEmbedsShape[1], EMBED_DIM,
+                     variant_ == ChatterboxVariant::ORIGINAL ? "ORIGINAL" : "TURBO");
             } else {
                 // ── Subsequent iterations: embed single next token ──
                 std::vector<int64_t> nextVec = { nextTokenId };
@@ -270,13 +292,34 @@ std::vector<int64_t> ChatterboxEngine::generateSpeechTokens(
                     nextVec.data(), nextVec.size(),
                     embedDim.data(), embedDim.size());
 
-                const char* inputNames[]  = { kEmbedInputName };
-                const char* outputNames[] = { kEmbedOutputName };
+                std::vector<Ort::Value> output;
+                if (variant_ == ChatterboxVariant::ORIGINAL) {
+                    // Original embed_tokens: input_ids + exaggeration
+                    const char* inputNames[]  = { "input_ids", "exaggeration" };
+                    const char* outputNames[] = { kEmbedOutputName };
 
-                auto output = embedTokensSession_->Run(
-                    Ort::RunOptions{nullptr},
-                    inputNames, &embedInput, 1,
-                    outputNames, 1);
+                    std::vector<float> exagData = { exaggeration_ };
+                    std::vector<int64_t> exagShape = { 1 };
+
+                    std::vector<Ort::Value> inputs;
+                    inputs.push_back(std::move(embedInput));
+                    inputs.push_back(Ort::Value::CreateTensor<float>(
+                        memoryInfo_, exagData.data(), 1, exagShape.data(), 1));
+
+                    output = embedTokensSession_->Run(
+                        Ort::RunOptions{nullptr},
+                        inputNames, inputs.data(), inputs.size(),
+                        outputNames, 1);
+                } else {
+                    // Turbo: single input
+                    const char* inputNames[]  = { kEmbedInputName };
+                    const char* outputNames[] = { kEmbedOutputName };
+
+                    output = embedTokensSession_->Run(
+                        Ort::RunOptions{nullptr},
+                        inputNames, &embedInput, 1,
+                        outputNames, 1);
+                }
 
                 const float* newData = output.front().GetTensorData<float>();
                 size_t newSize = output.front().GetTensorTypeAndShapeInfo().GetElementCount();
@@ -319,10 +362,10 @@ std::vector<int64_t> ChatterboxEngine::generateSpeechTokens(
                 posIds.data(), posIds.size(),
                 posShape.data(), posShape.size()));
 
-            // Input 3..50: past_key_values (48 tensors = 24 layers x 2 key/value)
+            // Input 3..: past_key_values (numLayers_*2 tensors = key/value per layer)
             if (i == 0) {
                 // First step: empty KV cache tensors with seq_len=0
-                for (int j = 0; j < NUM_LAYERS * 2; j++) {
+                for (int j = 0; j < numLayers_ * 2; j++) {
                     std::vector<int64_t> pastShape = {
                         1, NUM_KV_HEADS, 0, HEAD_DIM
                     };
@@ -537,6 +580,20 @@ void ChatterboxEngine::setRepetitionPenalty(float penalty) {
 void ChatterboxEngine::setMaxTokens(int maxTokens) {
     maxTokens_ = maxTokens;
     LOGD("Max tokens set to %d", maxTokens);
+}
+
+void ChatterboxEngine::setVariant(ChatterboxVariant variant) {
+    variant_ = variant;
+    numLayers_ = (variant == ChatterboxVariant::ORIGINAL) ? 30 : 24;
+    buildIONames();  // Rebuild I/O names with new layer count
+    LOGI("Variant set to %s (%d layers)",
+         variant == ChatterboxVariant::ORIGINAL ? "ORIGINAL" : "TURBO", numLayers_);
+}
+
+void ChatterboxEngine::setExaggeration(float exaggeration) {
+    exaggeration_ = exaggeration;
+    LOGD("Exaggeration set to %.2f%s", exaggeration,
+         variant_ != ChatterboxVariant::ORIGINAL ? " (ignored, turbo variant)" : "");
 }
 
 void ChatterboxEngine::requestStop() {

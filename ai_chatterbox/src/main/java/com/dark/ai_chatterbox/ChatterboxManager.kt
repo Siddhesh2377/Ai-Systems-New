@@ -55,6 +55,12 @@ class ChatterboxManager private constructor() {
     suspend fun loadModel(config: ChatterboxConfig): Boolean = withContext(Dispatchers.IO) {
         updateState(ChatterboxState.Loading)
         try {
+            // Set variant BEFORE loading models — determines I/O name count
+            nativeLib.nativeSetVariant(
+                if (config.variant == ChatterboxVariant.ORIGINAL) 1 else 0
+            )
+            nativeLib.nativeSetExaggeration(config.exaggeration)
+
             // Load tokenizer
             if (!nativeLib.nativeLoadTokenizer(config.tokenizerPath)) {
                 updateState(ChatterboxState.Error("Failed to load tokenizer"))

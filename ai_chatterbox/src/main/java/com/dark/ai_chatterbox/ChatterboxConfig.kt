@@ -1,6 +1,17 @@
 package com.dark.ai_chatterbox
 
 /**
+ * Model variant — determines architecture constants and feature availability.
+ *
+ * TURBO:    GPT-2 Medium 350M, 24 layers, no exaggeration, no CFG
+ * ORIGINAL: Llama 500M, 30 layers, exaggeration input on embed_tokens, cfg_weight=0.5
+ */
+enum class ChatterboxVariant {
+    TURBO,    // GPT-2 Medium 350M, 24 layers, no exaggeration
+    ORIGINAL  // Llama 500M, 30 layers, has exaggeration
+}
+
+/**
  * Configuration for loading a Chatterbox TTS model.
  */
 data class ChatterboxConfig(
@@ -8,7 +19,10 @@ data class ChatterboxConfig(
     val tokenizerPath: String,
     val voicePresetDir: String? = null,
     val repetitionPenalty: Float = 1.2f,
-    val maxTokens: Int = 1024
+    val maxTokens: Int = 1024,
+    val variant: ChatterboxVariant = ChatterboxVariant.TURBO,
+    /** Emotion exaggeration: 0.0=flat, 1.0=normal, 2.0=very expressive. Only effective for ORIGINAL variant. */
+    val exaggeration: Float = 1.0f
 )
 
 /**

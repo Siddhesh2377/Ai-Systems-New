@@ -20,6 +20,12 @@ class ChatterboxNativeLib {
     external fun nativeSetRepetitionPenalty(penalty: Float)
     external fun nativeSetMaxTokens(maxTokens: Int)
 
+    // Variant & exaggeration
+    /** Set model variant: 0=TURBO, 1=ORIGINAL. Must be called BEFORE nativeLoadModels(). */
+    external fun nativeSetVariant(variant: Int)
+    /** Set emotion exaggeration (ORIGINAL variant only). 0.0=flat, 1.0=normal, 2.0=expressive. */
+    external fun nativeSetExaggeration(exaggeration: Float)
+
     companion object {
         init {
             System.loadLibrary("ai_chatterbox")

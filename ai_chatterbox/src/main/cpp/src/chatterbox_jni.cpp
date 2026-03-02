@@ -417,4 +417,37 @@ Java_com_dark_ai_1chatterbox_ChatterboxNativeLib_nativeSetMaxTokens(
     g_engine->setMaxTokens(static_cast<int>(maxTokens));
 }
 
+// ────────────────── Variant & Exaggeration ──────────────────
+
+JNIEXPORT void JNICALL
+Java_com_dark_ai_1chatterbox_ChatterboxNativeLib_nativeSetVariant(
+        JNIEnv* /* env */, jobject /* thiz */, jint variant) {
+
+    std::lock_guard<std::mutex> lock(g_mtx);
+
+    if (!g_engine) {
+        // Engine not yet created — create it so setVariant can rebuild I/O names
+        g_engine = std::make_unique<ChatterboxEngine>();
+    }
+
+    LOGI("nativeSetVariant: %d (%s)", static_cast<int>(variant),
+         variant == 1 ? "ORIGINAL" : "TURBO");
+    g_engine->setVariant(variant == 1 ? ChatterboxVariant::ORIGINAL : ChatterboxVariant::TURBO);
+}
+
+JNIEXPORT void JNICALL
+Java_com_dark_ai_1chatterbox_ChatterboxNativeLib_nativeSetExaggeration(
+        JNIEnv* /* env */, jobject /* thiz */, jfloat exaggeration) {
+
+    std::lock_guard<std::mutex> lock(g_mtx);
+
+    if (!g_engine) {
+        LOGE("nativeSetExaggeration: engine not initialized");
+        return;
+    }
+
+    LOGI("nativeSetExaggeration: %.2f", static_cast<float>(exaggeration));
+    g_engine->setExaggeration(static_cast<float>(exaggeration));
+}
+
 } // extern "C"
