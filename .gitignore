@@ -1,15 +1,24 @@
-*.iml
-.gradle
-/local.properties
-/.idea/caches
-/.idea/libraries
-/.idea/modules.xml
-/.idea/workspace.xml
-/.idea/navEditor.xml
-/.idea/assetWizardSettings.xml
-.DS_Store
-/build
+# IDE
+**/*.iml
+.idea/
+.gradle/
+.kotlin/
+.vscode/
+
+# Build artifacts
+build/
+.cxx/
+.externalNativeBuild/
 /captures
-.externalNativeBuild
-.cxx
+
+# Local configuration
 local.properties
+
+# Claude Code
+.claude/
+**/CLAUDE.md
+**/docs/plans/
+
+# OS
+.DS_Store
+Thumbs.db

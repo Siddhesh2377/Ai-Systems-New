@@ -7,9 +7,11 @@ android {
     compileSdk {
         version = release(36)
     }
+    ndkVersion = "27.3.13750724"
 
     defaultConfig {
         minSdk = 27
+        consumerProguardFiles("consumer-rules.pro")
 
         ndk {
             //noinspection ChromeOsAbiSupport
@@ -38,7 +40,7 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
             )
@@ -47,7 +49,7 @@ android {
     externalNativeBuild {
         cmake {
             path("src/main/cpp/CMakeLists.txt")
-            version = "3.22.1"
+            version = "3.31.4"
         }
     }
     compileOptions {
@@ -62,10 +64,12 @@ android {
 }
 
 dependencies {
-    // Keep: tar.xz extraction for QNN libs from assets
+    // tar.xz extraction for QNN libs
+    // NOTE: AAR does not bundle transitive deps — consuming apps must also declare:
+    //   implementation("org.apache.commons:commons-compress:1.28.0")
+    //   implementation("org.tukaani:xz:1.11")
     implementation(libs.commons.compress)
     implementation(libs.xz)
-    // Removed: okhttp (no more HTTP client)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.appcompat)
     implementation(libs.material)

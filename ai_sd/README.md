@@ -1,6 +1,6 @@
-# ai_sd — Image Generation SDK
+# ai_sd — Image Generation & Processing SDK
 
-On-device Stable Diffusion for Android via Qualcomm QNN (Hexagon DSP) or MNN (CPU fallback).
+On-device Stable Diffusion and AI image processing for Android.
 
 **Package**: `com.dark.ai_sd`
 **ABI**: `arm64-v8a`
@@ -8,123 +8,113 @@ On-device Stable Diffusion for Android via Qualcomm QNN (Hexagon DSP) or MNN (CP
 
 ---
 
-## Core API — `SDNativeLib`
+## Backends
 
-Singleton JNI interface for native image generation.
+| Backend | Hardware | Precision | Models |
+|---------|----------|-----------|--------|
+| QNN (Hexagon HTP) | Snapdragon 8 Gen 1+ | W8A16 | QNN-compiled .bin |
+| MNN (CPU) | Any ARM64 | FP32 | .mnn converted models |
+| MNN + OpenCL | Adreno GPU | FP16 | .mnn converted models |
 
-### Runtime Setup
+---
 
-```kotlin
-// Initialize QNN runtime (extract libs first)
-SDNativeLib.nativeInitRuntime(qnnLibDir: String)
-```
-
-### Model Loading
-
-```kotlin
-SDNativeLib.nativeLoadModel(
-    clipPath: String,
-    unetPath: String,
-    vaeDecoderPath: String,
-    vaeEncoderPath: String?,    // null if txt2img only
-    tokenizerPath: String,
-    safetyModelPath: String?,   // null to disable safety checker
-    embeddingDir: String?,      // textual inversions directory
-    schedulerType: String,      // "dpm" or "euler_a"
-    isPony: Boolean,            // Pony Diffusion v5.5 mode
-    useSafetyChecker: Boolean
-): Boolean
-
-SDNativeLib.nativeRelease()
-SDNativeLib.nativeGetModelInfo(): String  // JSON metadata
-```
-
-### Image Generation
+## Quick Start
 
 ```kotlin
-SDNativeLib.nativeGenerate(
-    prompt: String,
-    negativePrompt: String,
-    steps: Int,              // 20 default
-    cfgScale: Float,         // 7.5 default
-    seed: Long,              // -1 for random
-    width: Int,
-    height: Int,
-    scheduler: String,       // "dpm" or "euler_a"
-    useOpenCL: Boolean,      // GPU acceleration for MNN
-    inputImage: ByteArray?,  // null for txt2img, image bytes for img2img
-    mask: ByteArray?,        // null for no mask, mask bytes for inpainting
-    denoiseStrength: Float,  // 0.0-1.0, only for img2img
-    showProcess: Boolean,    // Send intermediate step images
-    showStride: Int,         // Every N steps
-    callback: SDCallback
-): Boolean
+val sdManager = StableDiffusionManager.getInstance(context)
 
-SDNativeLib.nativeStopGeneration()
+// Load model
+sdManager.loadModel(DiffusionModelConfig(
+    name = "SD 1.5",
+    modelDir = "/path/to/model/",
+    runOnCpu = true
+))
+
+// Generate
+sdManager.generateImage(DiffusionGenerationParams(
+    prompt = "a photo of a cat",
+    steps = 28,
+    width = 512,
+    height = 512
+))
+
+// Observe state
+sdManager.diffusionGenerationState.collect { state ->
+    when (state) {
+        is DiffusionGenerationState.Progress -> updateUI(state.progress)
+        is DiffusionGenerationState.Complete -> showImage(state.bitmap)
+        is DiffusionGenerationState.Error -> showError(state.message)
+        else -> {}
+    }
+}
 ```
 
-### LoRA
+---
+
+## Generation API
+
+### StableDiffusionManager (High-Level)
 
 ```kotlin
-SDNativeLib.nativeApplyLora(loraPath: String, weight: Float): Boolean
-SDNativeLib.nativeClearLora()
+// Lifecycle
+loadModel(config: DiffusionModelConfig, width: Int = 512, height: Int = 512): Boolean
+cleanup()
+
+// Generation
+generateImage(params: DiffusionGenerationParams)
+cancelGeneration()
+resetGenerationState()
+
+// State flows
+diffusionBackendState: StateFlow<DiffusionBackendState>
+diffusionGenerationState: StateFlow<DiffusionGenerationState>
+isGenerating: StateFlow<Boolean>
+
+// Upscaler
+loadUpscaler(modelPath: String, useMnn: Boolean = true, useOpenCL: Boolean = false): Boolean
+upscaleImage(inputBitmap: Bitmap)
+releaseUpscaler()
+upscaleState: StateFlow<UpscaleState>
 ```
 
-### Callback
+### SDNativeLib (Low-Level JNI)
+
+```kotlin
+nativeInitRuntime(qnnLibDir: String): Boolean
+nativeLoadModel(clipPath, unetPath, vaeDecoderPath, vaeEncoderPath,
+                tokenizerPath, safetyCheckerPath, patchPath, modelDir,
+                qnnBackendPath, qnnSystemLibPath, textEmbeddingSize,
+                runOnCpu, useCpuClip, isPony, useSafetyChecker): Boolean
+nativeGenerate(prompt, negativePrompt, steps, cfgScale, seed,
+               width, height, scheduler, useOpenCL, inputImage,
+               mask, denoiseStrength, showProcess, showStride,
+               callback: SDCallback): Boolean
+nativeStopGeneration()
+nativeRelease(): Boolean
+nativeGetModelInfo(): String
+nativeLoadUpscaler(modelPath, useMnn, useOpenCL): Boolean
+nativeUpscaleImage(inputRgb, width, height, callback): Boolean
+nativeReleaseUpscaler()
+```
+
+### SDCallback
 
 ```kotlin
 interface SDCallback {
     fun onProgress(step: Int, totalSteps: Int)
-    fun onImageReady(imageData: ByteArray, width: Int, height: Int)
+    fun onImageProgress(step: Int, totalSteps: Int, rgbData: ByteArray, width: Int, height: Int)
+    fun onComplete(rgbData: ByteArray, width: Int, height: Int, seed: Long, generationTimeMs: Int)
     fun onError(message: String)
 }
 ```
 
 ---
 
-## High-Level API — `StableDiffusionManager`
-
-Kotlin singleton facade with state management and coroutine support.
-
-```kotlin
-val sdManager = StableDiffusionManager
-
-// Initialize
-sdManager.initialize(context)
-
-// Load model
-sdManager.loadModel(config: DiffusionModelConfig)
-
-// Generate
-sdManager.generateImage(params: DiffusionGenerationParams)
-
-// State observation
-sdManager.diffusionGenerationState  // StateFlow
-sdManager.diffusionBackendState     // StateFlow
-sdManager.isGenerating              // Boolean
-
-// Control
-sdManager.cancelGeneration()
-sdManager.cleanup()
-```
-
----
-
-## Supported Configurations
-
-### Backends
-
-| Backend | Hardware | Precision | Models |
-|---------|----------|-----------|--------|
-| QNN (Hexagon DSP) | Snapdragon 8 Gen 1+ | INT8/INT16 | QNN-compiled models |
-| MNN (CPU) | Any ARM64 | FP32 | SafeTensor/ONNX models |
-| MNN + OpenCL | Adreno GPU | FP16 | SafeTensor/ONNX models |
-
-### Generation Modes
+## Generation Modes
 
 | Mode | Inputs | Use Case |
 |------|--------|----------|
-| txt2img | prompt only | Generate from text |
+| txt2img | prompt | Generate from text |
 | img2img | prompt + image | Transform existing image |
 | inpainting | prompt + image + mask | Edit specific regions |
 
@@ -132,16 +122,76 @@ sdManager.cleanup()
 
 | Scheduler | Quality | Speed |
 |-----------|---------|-------|
-| `dpm` (DPM-Solver++) | Higher | Slower |
-| `euler_a` (Euler Ancestral) | Good | Faster |
+| `dpm` (DPM-Solver++) | Higher | ~28 steps |
+| `euler_a` (Euler Ancestral) | Good | ~20 steps |
 
 ---
 
-## Native Build
+## Image Processing Modules
 
-```cmake
-CMAKE_BUILD_TYPE=Release
--O3 -ffast-math -fno-finite-math-only -ffp-contract=fast
+C++ implementations ready for MNN-converted models:
+
+| Module | Class | Model | Speed |
+|--------|-------|-------|-------|
+| **4x Super-Resolution** | `upscaler/` | Real-ESRGAN x4v3 (17MB) | 4-8ms/tile |
+| **Segmentation** | `segmenter/` | MobileSAM TinyViT (~50MB) | ~12ms/query |
+| **Object Removal** | `lama_inpainter/` | LaMa-Dilated (~100MB) | 100-300ms |
+| **Depth Estimation** | `depth_estimator/` | MiDaS v2.1 / DepthAnything (25-50MB) | 15-60ms |
+| **Style Transfer** | `style_transfer/` | AdaIN arbitrary (10-70MB) | 30-60 FPS |
+
+### Combo Pipelines
+
+- **Smart Object Removal**: tap -> MobileSAM (12ms) -> LaMa (200ms) -> upscale (8ms) = ~220ms
+- **Background Swap**: MobileSAM foreground + SD-generated background
+- **Depth Bokeh**: depth estimation -> selective blur by depth
+- **AI Photo Enhance**: depth + bokeh + upscale
+
+---
+
+## Data Classes
+
+```kotlin
+data class DiffusionModelConfig(
+    val name: String,
+    val modelDir: String,
+    val textEmbeddingSize: Int = 768,
+    val runOnCpu: Boolean = false,
+    val useCpuClip: Boolean = false,
+    val isPony: Boolean = false,
+    val safetyMode: Boolean = false
+)
+
+data class DiffusionGenerationParams(
+    val prompt: String,
+    val negativePrompt: String = "",
+    val steps: Int = 28,
+    val cfgScale: Float = 7f,
+    val seed: Long? = null,
+    val width: Int = 512,
+    val height: Int = 512,
+    val scheduler: String = "dpm",
+    val useOpenCL: Boolean = false,
+    val inputImage: String? = null,
+    val mask: String? = null,
+    val denoiseStrength: Float = 0.6f,
+    val showDiffusionProcess: Boolean = false,
+    val showDiffusionStride: Int = 1
+)
+
+// State sealed classes: DiffusionBackendState, DiffusionGenerationState,
+// DiffusionGenerationResult, UpscaleState
 ```
 
-Dependencies: QNN SDK libs (extracted from assets at runtime), MNN (statically linked).
+---
+
+## Build
+
+```
+NDK: 27.3.13750724
+CMake: 3.31.4
+ABI: arm64-v8a (16KB page alignment)
+C++: -O3 -ffast-math -march=armv8.2-a+dotprod+fp16 -flto=thin
+R8: Enabled (consumer-rules.pro auto-applied to consumers)
+```
+
+Dependencies: MNN (static), QNN SDK (dlopen at runtime), tokenizers-cpp, xtensor, stb, zstd, nlohmann/json.

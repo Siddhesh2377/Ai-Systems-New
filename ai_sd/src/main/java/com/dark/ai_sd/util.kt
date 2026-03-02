@@ -1,5 +1,6 @@
 package com.dark.ai_sd
 
+import android.app.ActivityManager
 import android.content.Context
 import android.graphics.Bitmap
 import android.util.Log
@@ -9,68 +10,131 @@ import org.tukaani.xz.XZInputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
 import java.util.Base64
 
 /**
  * Extension functions and utility helpers for Stable Diffusion operations
  */
 
+/**
+ * Calculate optimal buffer size based on available device RAM.
+ * Low memory: 8KB, normal: 64KB, high: 256KB.
+ */
+fun getAdaptiveBufferSize(context: Context): Int {
+    val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+    val memInfo = ActivityManager.MemoryInfo()
+    am?.getMemoryInfo(memInfo)
+    val availMb = memInfo.availMem / (1024 * 1024)
+    return when {
+        memInfo.lowMemory || availMb < 256 -> 8 * 1024       // 8KB — critically low
+        availMb < 512                      -> 32 * 1024      // 32KB — low
+        availMb < 1024                     -> 64 * 1024      // 64KB — normal
+        else                               -> 256 * 1024     // 256KB — plenty
+    }
+}
 
-fun extractTarXzWithCommonsCompress(tarXzFile: File, targetDir: File) {
+/**
+ * Copy stream with progress reporting and adaptive buffer size.
+ * @param onProgress called with (bytesWritten, totalBytes). totalBytes is -1 if unknown.
+ */
+fun InputStream.copyToWithProgress(
+    out: OutputStream,
+    bufferSize: Int,
+    totalBytes: Long = -1L,
+    onProgress: ((bytesWritten: Long, totalBytes: Long) -> Unit)? = null
+): Long {
+    val buffer = ByteArray(bufferSize)
+    var bytesCopied = 0L
+    var bytesRead: Int
+    while (read(buffer).also { bytesRead = it } >= 0) {
+        out.write(buffer, 0, bytesRead)
+        bytesCopied += bytesRead
+        onProgress?.invoke(bytesCopied, totalBytes)
+    }
+    return bytesCopied
+}
+
+/**
+ * Extract a tar.xz archive with progress reporting and adaptive buffer sizing.
+ *
+ * @param tarXzFile The tar.xz archive to extract
+ * @param targetDir Target directory to extract into
+ * @param bufferSize I/O buffer size (use [getAdaptiveBufferSize] for RAM-aware sizing)
+ * @param onProgress Called per extracted file with (filesExtracted, currentFileName)
+ */
+fun extractTarXzWithCommonsCompress(
+    tarXzFile: File,
+    targetDir: File,
+    bufferSize: Int = 64 * 1024,
+    onProgress: ((filesExtracted: Int, currentFile: String) -> Unit)? = null
+) {
     try {
-        val inputStream = tarXzFile.inputStream()
-        val xzIn = XZInputStream(inputStream)
-        val tarIn = TarArchiveInputStream(xzIn)
+        var filesExtracted = 0
 
-        var entry: TarArchiveEntry?
-        var rootDirName: String? = null
+        tarXzFile.inputStream().buffered(bufferSize).use { inputStream ->
+        XZInputStream(inputStream).use { xzIn ->
+        TarArchiveInputStream(xzIn).use { tarIn ->
 
-        while (tarIn.nextEntry.also { entry = it } != null) {
-            val entryName = entry!!.name
+            var entry: TarArchiveEntry?
+            var rootDirName: String? = null
+            val buf = ByteArray(bufferSize)
 
-            // Detect and strip the root directory
-            val pathComponents = entryName.split("/")
-            if (rootDirName == null && pathComponents.size > 1) {
-                rootDirName = pathComponents[0]
-            }
+            while (tarIn.nextEntry.also { entry = it } != null) {
+                val currentEntry = entry ?: continue
+                val entryName = currentEntry.name
 
-            // Strip root directory if present
-            val relativePath = if (rootDirName != null && entryName.startsWith("$rootDirName/")) {
-                entryName.substring(rootDirName.length + 1)
-            } else {
-                entryName
-            }
-
-            // Skip if it's just the root directory itself or empty path
-            if (relativePath.isEmpty()) continue
-
-            val outputFile = File(targetDir, relativePath)
-
-            // Path traversal protection: ensure extracted file stays within target directory
-            if (!outputFile.canonicalPath.startsWith(targetDir.canonicalPath + File.separator)) {
-                throw SecurityException("Path traversal detected: ${entry!!.name}")
-            }
-
-            if (entry.isDirectory) {
-                outputFile.mkdirs()
-            } else {
-                outputFile.parentFile?.mkdirs()
-                outputFile.outputStream().use { output ->
-                    tarIn.copyTo(output)
+                // Detect and strip the root directory
+                val pathComponents = entryName.split("/")
+                if (rootDirName == null && pathComponents.size > 1) {
+                    rootDirName = pathComponents[0]
                 }
 
-                // Set executable permissions if needed
-                if (entry.mode and 0x40 != 0) { // Check execute bit
-                    outputFile.setExecutable(true)
+                // Strip root directory if present
+                val relativePath = if (rootDirName != null && entryName.startsWith("$rootDirName/")) {
+                    entryName.substring(rootDirName.length + 1)
+                } else {
+                    entryName
+                }
+
+                // Skip if it's just the root directory itself or empty path
+                if (relativePath.isEmpty()) continue
+
+                val outputFile = File(targetDir, relativePath)
+
+                // Path traversal protection: ensure extracted file stays within target directory
+                if (!outputFile.canonicalPath.startsWith(targetDir.canonicalPath + File.separator)) {
+                    throw SecurityException("Path traversal detected: ${currentEntry.name}")
+                }
+
+                if (currentEntry.isDirectory) {
+                    outputFile.mkdirs()
+                } else {
+                    outputFile.parentFile?.mkdirs()
+                    FileOutputStream(outputFile).use { fos ->
+                        var bytesRead: Int
+                        while (tarIn.read(buf).also { bytesRead = it } >= 0) {
+                            fos.write(buf, 0, bytesRead)
+                        }
+                    }
+
+                    // Set executable permissions if needed
+                    if (currentEntry.mode and 0x40 != 0) { // Check execute bit
+                        outputFile.setExecutable(true)
+                    }
+
+                    filesExtracted++
+                    onProgress?.invoke(filesExtracted, relativePath)
+                    Log.d("Model-Runtime", "Extracted [$filesExtracted]: $relativePath (${currentEntry.size} bytes)")
                 }
             }
-        }
 
-        tarIn.close()
-        xzIn.close()
-        inputStream.close()
+        } // tarIn auto-closed
+        } // xzIn auto-closed
+        } // inputStream auto-closed
 
-        Log.d("Model-Runtime", "Successfully extracted using Apache Commons Compress")
+        Log.d("Model-Runtime", "Successfully extracted $filesExtracted files using Apache Commons Compress")
     } catch (e: Exception) {
         Log.e("Model-Runtime", "Failed to extract tar.xz with Commons Compress", e)
         throw IOException("Failed to extract tar.xz archive", e)

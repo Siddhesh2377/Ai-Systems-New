@@ -1,21 +1,32 @@
-# Add project specific ProGuard rules here.
-# You can control the set of applied configuration files using the
-# proguardFiles setting in build.gradle.
-#
-# For more details, see
-#   http://developer.android.com/guide/developing/tools/proguard.html
+# ============================================================================
+# ai_sd — Module ProGuard/R8 Rules (applied when building the library AAR)
+# ============================================================================
 
-# If your project uses WebView with JS, uncomment the following
-# and specify the fully qualified class name to the JavaScript interface
-# class:
-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
-#   public *;
-#}
+# Preserve line numbers for crash reports
+-keepattributes SourceFile,LineNumberTable
+-renamesourcefileattribute SourceFile
 
-# Uncomment this to preserve the line number information for
-# debugging stack traces.
-#-keepattributes SourceFile,LineNumberTable
+# Keep all public SDK API surface
+-keep public class com.dark.ai_sd.** { public *; }
 
-# If you keep the line number information, uncomment this to
-# hide the original source file name.
-#-renamesourcefileattribute SourceFile
+# JNI: native methods must retain exact signatures
+-keepclasseswithmembernames class com.dark.ai_sd.SDNativeLib {
+    native <methods>;
+}
+
+# JNI callback: C++ calls these via GetMethodID reflection
+-keep interface com.dark.ai_sd.SDCallback { *; }
+-keep class * implements com.dark.ai_sd.SDCallback { *; }
+
+# Sealed class subclasses — needed for when-expressions and instanceof checks
+-keep class com.dark.ai_sd.DiffusionBackendState$* { *; }
+-keep class com.dark.ai_sd.DiffusionGenerationState$* { *; }
+-keep class com.dark.ai_sd.DiffusionGenerationResult$* { *; }
+-keep class com.dark.ai_sd.UpscaleState$* { *; }
+-keep class com.dark.ai_sd.RuntimeSetupState$* { *; }
+
+# Apache Commons Compress + XZ (tar.xz extraction for QNN libs)
+-dontwarn org.apache.commons.compress.**
+-keep class org.apache.commons.compress.archivers.tar.** { *; }
+-keep class org.apache.commons.compress.compressors.xz.** { *; }
+-keep class org.tukaani.xz.** { *; }

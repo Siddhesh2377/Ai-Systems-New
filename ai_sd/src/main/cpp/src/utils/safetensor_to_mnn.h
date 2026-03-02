@@ -2,7 +2,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
-#include <iostream>
+#include "sd_logger.h"
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -381,20 +381,20 @@ void generateMNNModels(const std::string &dir,
                        bool clip_skip_2 = false,
                        const std::vector<std::string> &loras = {},
                        const std::vector<float> &lora_weights = {}) {
-  std::cout << "Generating CLIP model..." << std::endl;
+  SD_LOG_INFO("[LOAD] Generating CLIP model...");
   generateClipModel(dir, safetensor_file, clip_skip_2, loras, lora_weights);
 
-  std::cout << "Generating UNet model..." << std::endl;
+  SD_LOG_INFO("[LOAD] Generating UNet model...");
   generateModel(dir, safetensor_file, "unet", unet_structure, loras,
                 lora_weights);
   patchModel(dir, safetensor_file, "unet", unet_small_weights);
 
-  std::cout << "Generating VAE Decoder model..." << std::endl;
+  SD_LOG_INFO("[LOAD] Generating VAE Decoder model...");
   generateModel(dir, safetensor_file, "vae_decoder", vae_decoder_structure);
   patchModel(dir, safetensor_file, "vae_decoder", vae_decoder_small_weights,
              true);
 
-  std::cout << "Generating VAE Encoder model..." << std::endl;
+  SD_LOG_INFO("[LOAD] Generating VAE Encoder model...");
   generateModel(dir, safetensor_file, "vae_encoder", vae_encoder_structure);
   patchModel(dir, safetensor_file, "vae_encoder", vae_encoder_small_weights,
              true);
@@ -402,5 +402,5 @@ void generateMNNModels(const std::string &dir,
   std::ofstream finished_file(dir + "/finished");
   finished_file.close();
 
-  std::cout << "All models generated successfully!" << std::endl;
+  SD_LOG_INFO("[LOAD] All models generated successfully!");
 }

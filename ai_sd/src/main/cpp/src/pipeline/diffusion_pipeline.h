@@ -20,6 +20,8 @@
 #include <string>
 #include <atomic>
 
+struct PipelineContext;
+
 namespace sd_pipeline {
 
 /**
@@ -34,7 +36,8 @@ bool initialize_models(const SDModelConfig& config);
  * Progress is reported via the callback.
  * The stopFlag is checked each diffusion step for cancellation.
  */
-SDGenerationResult run_generation(const SDGenerateParams& params,
+SDGenerationResult run_generation(PipelineContext& ctx,
+                                  const SDGenerateParams& params,
                                   SDProgressCallback progressCb,
                                   std::atomic<bool>& stopFlag);
 

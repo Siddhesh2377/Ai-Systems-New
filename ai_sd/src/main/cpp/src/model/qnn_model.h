@@ -10,6 +10,8 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <unordered_map>
+#include <vector>
 
 #include "DataUtil.hpp"
 #include "Logger.hpp"
@@ -190,18 +192,13 @@ class QnnModel : public QnnSampleApp {
       QNN_ERROR("clip graph execution failed!");
     }
 
-    // get output
+    // get output — Perf 4: write directly into caller buffer (no malloc/free)
     if (StatusCode::SUCCESS == returnStatus) {
-      float *tmp = nullptr;
-      if (qnn::tools::iotensor::StatusCode::SUCCESS !=
-          m_ioTensor.convertToFloat(&tmp, &outputs[0])) {
-        returnStatus = StatusCode::FAILURE;
-        return returnStatus;
-      }
-
       uint32_t elementCount = 1 * 77 * text_embedding_size;
-      memcpy(text_embedding, tmp, elementCount * sizeof(float));
-      free(tmp);
+      if (qnn::tools::iotensor::StatusCode::SUCCESS !=
+          m_ioTensor.convertToFloat(text_embedding, elementCount, &outputs[0])) {
+        returnStatus = StatusCode::FAILURE;
+      }
     }
 
     return returnStatus;
@@ -252,15 +249,22 @@ class QnnModel : public QnnSampleApp {
       positionData[0] = timestep;
     }
 
-    // text_embedding
+    // text_embedding — Perf 3: cache quantized embeddings per source pointer
+    // (embeddings are constant across all denoising steps)
     {
       uint16_t *text_embedding_uint16 =
           static_cast<uint16_t *>(QNN_TENSOR_GET_CLIENT_BUF(inputs[2]).data);
       int elementCount = 1 * 77 * text_embedding_size;
-      qnn::tools::datautil::floatToTfN(
-          text_embedding_uint16, text_embedding,
-          inputs[2].v1.quantizeParams.scaleOffsetEncoding.offset,
-          inputs[2].v1.quantizeParams.scaleOffsetEncoding.scale, elementCount);
+      auto& cache = m_embedCache[text_embedding];
+      if (cache.empty()) {
+        cache.resize(elementCount);
+        qnn::tools::datautil::floatToTfN(
+            cache.data(), text_embedding,
+            inputs[2].v1.quantizeParams.scaleOffsetEncoding.offset,
+            inputs[2].v1.quantizeParams.scaleOffsetEncoding.scale, elementCount);
+      }
+      memcpy(text_embedding_uint16, cache.data(),
+             elementCount * sizeof(uint16_t));
     }
 
     // execute graph
@@ -282,18 +286,13 @@ class QnnModel : public QnnSampleApp {
       QNN_ERROR("unet graph execution failed!");
     }
 
-    // get output
+    // get output — Perf 4: write directly into caller buffer
     if (StatusCode::SUCCESS == returnStatus) {
-      float *tmp = nullptr;
-      if (qnn::tools::iotensor::StatusCode::SUCCESS !=
-          m_ioTensor.convertToFloat(&tmp, &outputs[0])) {
-        returnStatus = StatusCode::FAILURE;
-        return returnStatus;
-      }
-
       int elementCount = 1 * 4 * sample_width * sample_height;
-      memcpy(latents_pred, tmp, elementCount * sizeof(float));
-      free(tmp);
+      if (qnn::tools::iotensor::StatusCode::SUCCESS !=
+          m_ioTensor.convertToFloat(latents_pred, elementCount, &outputs[0])) {
+        returnStatus = StatusCode::FAILURE;
+      }
     }
 
     return returnStatus;
@@ -356,29 +355,18 @@ class QnnModel : public QnnSampleApp {
       QNN_ERROR("vae encoder graph execution failed!");
     }
 
-    // get output
+    // get output — Perf 4: write directly into caller buffers
     if (StatusCode::SUCCESS == returnStatus) {
-      {
-        float *tmp = nullptr;
-        int elementCount = 1 * 4 * sample_width * sample_height;
-        if (qnn::tools::iotensor::StatusCode::SUCCESS !=
-            m_ioTensor.convertToFloat(&tmp, &outputs[0])) {
-          returnStatus = StatusCode::FAILURE;
-          return returnStatus;
-        }
-        memcpy(mean, tmp, elementCount * sizeof(float));
-        free(tmp);
+      int elementCount = 1 * 4 * sample_width * sample_height;
+      if (qnn::tools::iotensor::StatusCode::SUCCESS !=
+          m_ioTensor.convertToFloat(mean, elementCount, &outputs[0])) {
+        returnStatus = StatusCode::FAILURE;
+        return returnStatus;
       }
-      {
-        float *tmp = nullptr;
-        int elementCount = 1 * 4 * sample_width * sample_height;
-        if (qnn::tools::iotensor::StatusCode::SUCCESS !=
-            m_ioTensor.convertToFloat(&tmp, &outputs[1])) {
-          returnStatus = StatusCode::FAILURE;
-          return returnStatus;
-        }
-        memcpy(std, tmp, elementCount * sizeof(float));
-        free(tmp);
+      if (qnn::tools::iotensor::StatusCode::SUCCESS !=
+          m_ioTensor.convertToFloat(std, elementCount, &outputs[1])) {
+        returnStatus = StatusCode::FAILURE;
+        return returnStatus;
       }
     }
     return returnStatus;
@@ -440,17 +428,14 @@ class QnnModel : public QnnSampleApp {
       QNN_ERROR("vae decoder graph execution failed!");
     }
 
-    // get output
+    // get output — Perf 4: write directly into caller buffer
     if (StatusCode::SUCCESS == returnStatus) {
-      float *tmp = nullptr;
-      int elementCount = 1 * 3 * output_width * output_height;
+      size_t elementCount = 1 * 3 * output_width * output_height;
       if (qnn::tools::iotensor::StatusCode::SUCCESS !=
-          m_ioTensor.convertToFloat(&tmp, &outputs[0])) {
+          m_ioTensor.convertToFloat(pixel_values, elementCount, &outputs[0])) {
         returnStatus = StatusCode::FAILURE;
         return returnStatus;
       }
-      memcpy(pixel_values, tmp, elementCount * sizeof(float));
-      free(tmp);
     }
     return returnStatus;
   }
@@ -626,6 +611,14 @@ class QnnModel : public QnnSampleApp {
 
     return returnStatus;
   }
+
+  // Perf 3: Clear cached quantized embeddings (call between generations)
+  void clearCachedEmbeddings() { m_embedCache.clear(); }
+
+ private:
+  // Perf 3: Cached quantized CLIP embeddings keyed by source pointer
+  // (uncond + cond are two distinct pointers, both constant across steps)
+  std::unordered_map<const float*, std::vector<uint16_t>> m_embedCache;
 };
 
 #endif  // QNNMODEL_HPP

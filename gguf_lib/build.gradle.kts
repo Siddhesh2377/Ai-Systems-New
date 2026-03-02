@@ -9,6 +9,7 @@ android {
             minorApiLevel = 1
         }
     }
+    ndkVersion = "27.3.13750724"
 
     defaultConfig {
         minSdk = 29
@@ -17,7 +18,7 @@ android {
         consumerProguardFiles("consumer-rules.pro")
         externalNativeBuild {
             cmake {
-                cppFlags("-std=c++17 -O3")
+                cppFlags("-std=c++17")
                 arguments(
                     "-DANDROID_STL=c++_shared",
                 )
@@ -40,7 +41,7 @@ android {
     externalNativeBuild {
         cmake {
             path("src/main/cpp/CMakeLists.txt")
-            version = "3.22.1"
+            version = "3.31.4"
         }
     }
     compileOptions {

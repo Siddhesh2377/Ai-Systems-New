@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.22.1)
+cmake_minimum_required(VERSION 3.31.4)
 project(ai_sd LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -18,7 +18,7 @@ endif()
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,max-page-size=16384")
 
 # ============================================================================
-# Compiler flags (matching xororz's build)
+# Compiler flags
 # ============================================================================
 add_compile_options(
     -O3
@@ -26,8 +26,25 @@ add_compile_options(
     -fno-rtti
     -fPIC
     -fvisibility=hidden
+    # ARM architecture: dotprod enables int8 matmul, fp16 enables half-precision
+    # Compatible with 2020+ Snapdragon/Exynos/Dimensity (minSdk 27 already requires 2018+)
+    -march=armv8.2-a+dotprod+fp16
+    # FP reassociation + reciprocal approx — critical for inference throughput
+    -ffast-math
+    # Fused multiply-add on A78 cores
+    -ffp-contract=fast
 )
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error=for-loop-analysis")
+
+# Release-only: disable asserts, enable thin LTO
+if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_compile_options(-DNDEBUG)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -flto=thin")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -flto=thin")
+    # lld: native LTO support, faster linking than gold, NDK default since r22
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -flto=thin -fuse-ld=lld")
+endif()
 
 # Platform libs
 set(PLATFORM_LIBS log android dl m c GLESv2 EGL)
@@ -56,6 +73,17 @@ set(MNN_BUILD_FOR_ANDROID_COMMAND ON CACHE BOOL "" FORCE)
 set(MNN_USE_LOGCAT OFF CACHE BOOL "" FORCE)
 set(MNN_OPENCL ON CACHE BOOL "" FORCE)
 set(MNN_SUPPORT_TRANSFORMER_FUSE ON CACHE BOOL "" FORCE)
+# BF16 ops — 7s Gen 3 has hw bf16, 5-30% speedup on capable cores
+set(MNN_SUPPORT_BF16 ON CACHE BOOL "" FORCE)
+# NNAPI bridge — NPU fallback for non-QNN devices (Exynos, Dimensity, Tensor)
+set(MNN_NNAPI ON CACHE BOOL "" FORCE)
+# Lightweight image ops for Phase 5 features (resize, crop, color convert)
+set(MNN_BUILD_OPENCV ON CACHE BOOL "" FORCE)
+set(MNN_IMGCODECS ON CACHE BOOL "" FORCE)
+# Vulkan — DISABLED: buggy on Adreno, OpenCL is the stable GPU path
+# set(MNN_VULKAN ON CACHE BOOL "" FORCE)
+# KleidiAI — Arm's optimized kernels (known to fail with CMake 3.22.1 FetchContent)
+# set(MNN_KLEIDIAI ON CACHE BOOL "" FORCE)
 add_subdirectory(${MNN_ROOT_DIR} mnn_build EXCLUDE_FROM_ALL)
 
 # ============================================================================
@@ -145,8 +173,35 @@ set(AI_SD_SOURCES
     # JNI utilities
     src/utils/jni_utils.cpp
 
-    # Core inference pipeline (ported from xororz)
-    src/pipeline/diffusion_pipeline.cpp
+    # STB implementations (single TU — ODR fix, Phase 1.12)
+    src/utils/stb_impl.cpp
+
+    # Model loading and release (Phase 1.2 extraction)
+    src/loader/model_loader.cpp
+
+    # Text encoder (Phase 1.3 extraction)
+    src/clip/text_encoder.cpp
+
+    # UNet runner (Phase 1.5 extraction)
+    src/unet/unet_runner.cpp
+
+    # VAE codec — tiling and blending (Phase 1.6 extraction)
+    src/vae/vae_codec.cpp
+
+    # Upscaler — 4x super-resolution (Phase 1.7 extraction)
+    src/upscaler/upscaler.cpp
+
+    # Safety checker — NSFW detection (Phase 1.8 extraction)
+    src/safety/safety_checker.cpp
+
+    # Core inference pipeline (ported from xororz, refactored Phase 1.10)
+    src/core/pipeline_orchestrator.cpp
+
+    # Phase 5 feature modules
+    src/segmentation/segmenter.cpp
+    src/inpainting/lama_inpainter.cpp
+    src/depth/depth_estimator.cpp
+    src/style/style_transfer.cpp
 )
 
 # ============================================================================
@@ -165,6 +220,18 @@ target_compile_definitions(ai_sd PRIVATE
     XTENSOR_USE_XSIMD
     QNN_API=__attribute__\(\(visibility\(\"default\"\)\)\)
 )
+
+# Logging: INFO in release, TRACE+diagnostics in debug
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    target_compile_definitions(ai_sd PRIVATE
+        SD_LOG_LEVEL_MAX=5
+        SD_ENABLE_DIAGNOSTICS
+    )
+else()
+    target_compile_definitions(ai_sd PRIVATE
+        SD_LOG_LEVEL_MAX=3
+    )
+endif()
 
 # ============================================================================
 # Link libraries

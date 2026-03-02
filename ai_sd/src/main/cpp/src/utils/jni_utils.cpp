@@ -6,7 +6,7 @@
  */
 
 #include "jni_utils.h"
-#include "logger.h"
+#include "sd_logger.h"
 
 #include <jni.h>
 #include <string>
@@ -23,6 +23,10 @@ struct CallbackCache {
     jmethodID onComplete = nullptr;       // ([BIIJI)V
     jmethodID onError = nullptr;          // (Ljava/lang/String;)V
     bool initialized = false;
+
+    // Perf 13: Cached jbyteArray for preview steps (avoids 786KB alloc per step)
+    jbyteArray cachedPreviewArray = nullptr;
+    int cachedPreviewSize = 0;
 
     void init(JNIEnv* env, jobject callback) {
         if (initialized) return;
@@ -52,6 +56,11 @@ struct CallbackCache {
         if (cls) {
             env->DeleteGlobalRef(cls);
             cls = nullptr;
+        }
+        if (cachedPreviewArray) {
+            env->DeleteGlobalRef(cachedPreviewArray);
+            cachedPreviewArray = nullptr;
+            cachedPreviewSize = 0;
         }
         onProgress = nullptr;
         onImageProgress = nullptr;
@@ -86,13 +95,29 @@ void on_image_progress(JNIEnv* env, jobject cb, int step, int totalSteps,
     g_cache.init(env, cb);
     if (!g_cache.onImageProgress) return;
 
-    jbyteArray jdata = env->NewByteArray(dataLen);
-    if (!jdata) return;
-    env->SetByteArrayRegion(jdata, 0, dataLen, reinterpret_cast<const jbyte*>(rgbData));
+    // Perf 13: Reuse cached jbyteArray across steps (same size within a generation)
+    if (!g_cache.cachedPreviewArray || g_cache.cachedPreviewSize != dataLen) {
+        if (g_cache.cachedPreviewArray) {
+            env->DeleteGlobalRef(g_cache.cachedPreviewArray);
+            g_cache.cachedPreviewArray = nullptr;
+        }
+        jbyteArray local = env->NewByteArray(dataLen);
+        if (!local) {
+            SD_LOG_ERROR("on_image_progress: NewByteArray(%d) failed — likely OOM", dataLen);
+            on_error(env, cb, "Out of memory allocating image progress buffer");
+            return;
+        }
+        g_cache.cachedPreviewArray = static_cast<jbyteArray>(env->NewGlobalRef(local));
+        env->DeleteLocalRef(local);
+        g_cache.cachedPreviewSize = dataLen;
+    }
+
+    env->SetByteArrayRegion(g_cache.cachedPreviewArray, 0, dataLen,
+                            reinterpret_cast<const jbyte*>(rgbData));
 
     env->CallVoidMethod(cb, g_cache.onImageProgress,
-                        (jint)step, (jint)totalSteps, jdata, (jint)width, (jint)height);
-    env->DeleteLocalRef(jdata);
+                        (jint)step, (jint)totalSteps, g_cache.cachedPreviewArray,
+                        (jint)width, (jint)height);
 }
 
 void on_complete(JNIEnv* env, jobject cb, const uint8_t* rgbData, int dataLen,
@@ -103,7 +128,11 @@ void on_complete(JNIEnv* env, jobject cb, const uint8_t* rgbData, int dataLen,
     if (!g_cache.onComplete) return;
 
     jbyteArray jdata = env->NewByteArray(dataLen);
-    if (!jdata) return;
+    if (!jdata) {
+        SD_LOG_ERROR("on_complete: NewByteArray(%d) failed — likely OOM", dataLen);
+        on_error(env, cb, "Out of memory allocating completion image buffer");
+        return;
+    }
     env->SetByteArrayRegion(jdata, 0, dataLen, reinterpret_cast<const jbyte*>(rgbData));
 
     env->CallVoidMethod(cb, g_cache.onComplete,

@@ -91,6 +91,10 @@ class IOTensor {
 #ifndef __hexagon__
   StatusCode convertToFloat(float **out, Qnn_Tensor_t *output);
 
+  // Perf 4: Overload that writes into caller-provided buffer (no malloc/free).
+  // outBuf must be large enough to hold all elements. Returns element count via outCount.
+  StatusCode convertToFloat(float *outBuf, size_t outBufSize, Qnn_Tensor_t *output, size_t *outCount = nullptr);
+
   StatusCode convertAndWriteOutputTensorInFloat(Qnn_Tensor_t *output,
                                                 std::vector<std::string> outputPaths,
                                                 std::string fileName,

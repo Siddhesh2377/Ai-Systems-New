@@ -83,6 +83,21 @@ sealed class DiffusionGenerationResult {
 }
 
 /**
+ * Sealed class representing the state of an upscale operation
+ */
+sealed class UpscaleState {
+    object Idle : UpscaleState()
+    object Processing : UpscaleState()
+    data class Complete(
+        val bitmap: Bitmap,
+        val width: Int,
+        val height: Int,
+        val timeMs: Int
+    ) : UpscaleState()
+    data class Error(val message: String) : UpscaleState()
+}
+
+/**
  * Configuration for the runtime environment
  */
 data class DiffusionRuntimeConfig(
@@ -91,3 +106,16 @@ data class DiffusionRuntimeConfig(
     val safetyCheckerEnabled: Boolean = true,
     val safetyCheckerPath: String = "assets/safety_checker.mnn"
 )
+
+/**
+ * Sealed class representing runtime setup progress
+ */
+sealed class RuntimeSetupState {
+    object Idle : RuntimeSetupState()
+    data class CopyingAsset(val bytesWritten: Long, val totalBytes: Long) : RuntimeSetupState()
+    data class Extracting(val filesExtracted: Int, val currentFile: String) : RuntimeSetupState()
+    object CopyingSafetyChecker : RuntimeSetupState()
+    object InitializingRuntime : RuntimeSetupState()
+    object Complete : RuntimeSetupState()
+    data class Error(val message: String) : RuntimeSetupState()
+}

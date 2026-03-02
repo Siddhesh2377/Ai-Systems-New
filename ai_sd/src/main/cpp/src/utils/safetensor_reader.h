@@ -66,10 +66,10 @@ class SafeTensorReader {
     file.close();
   }
 
-  int calculate_tensor_size(const std::vector<int> &shape) {
-    int size = 1;
+  int64_t calculate_tensor_size(const std::vector<int> &shape) {
+    int64_t size = 1;
     for (int dim : shape) {
-      size *= dim;
+      size *= static_cast<int64_t>(dim);
     }
     return size;
   }
@@ -96,7 +96,7 @@ class SafeTensorReader {
       throw std::runtime_error("Unsupported tensor dtype: " + info.dtype);
     }
 
-    int tensor_size = calculate_tensor_size(info.shape);
+    int64_t tensor_size = calculate_tensor_size(info.shape);
     long data_start = info.data_offsets[0];
     long data_end = info.data_offsets[1];
 

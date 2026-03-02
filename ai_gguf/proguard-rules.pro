@@ -1,1 +1,0 @@
--keep class com.mp.ai_gguf.** { *; }

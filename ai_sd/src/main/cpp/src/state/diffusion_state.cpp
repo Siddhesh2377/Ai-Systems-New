@@ -11,7 +11,8 @@
  */
 
 #include "diffusion_state.h"
-#include "../utils/logger.h"
+#include "../core/pipeline_context.h"
+#include "../utils/sd_logger.h"
 
 #include <chrono>
 #include <sstream>
@@ -19,7 +20,8 @@
 // Forward-declare pipeline functions (defined in diffusion_pipeline.cpp)
 namespace sd_pipeline {
     bool initialize_models(const SDModelConfig& config);
-    SDGenerationResult run_generation(const SDGenerateParams& params,
+    SDGenerationResult run_generation(PipelineContext& ctx,
+                                      const SDGenerateParams& params,
                                       SDProgressCallback progressCb,
                                       std::atomic<bool>& stopFlag);
     bool apply_lora(const std::string& path, float weight);
@@ -29,9 +31,7 @@ namespace sd_pipeline {
 }
 
 struct DiffusionState::Impl {
-    // Currently empty - all state is in the pipeline globals
-    // (matching xororz's architecture). Refactoring to instance-based
-    // state is a future improvement.
+    PipelineContext ctx;
 };
 
 DiffusionState::DiffusionState() = default;
@@ -70,7 +70,7 @@ SDGenerationResult DiffusionState::generate(const SDGenerateParams& params,
         return {};
     }
 
-    return sd_pipeline::run_generation(params, std::move(progressCb), stopFlag);
+    return sd_pipeline::run_generation(m_impl->ctx, params, std::move(progressCb), stopFlag);
 }
 
 bool DiffusionState::apply_lora(const std::string& loraPath, float weight) {

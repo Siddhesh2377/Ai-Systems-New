@@ -12,7 +12,7 @@
 #include <xtensor/xview.hpp>
 
 #include "scheduler.h"
-#include "../../utils/logger.h"
+#include "../../utils/sd_logger.h"
 
 class DPMSolverMultistepScheduler : public Scheduler {
  public:
@@ -95,6 +95,7 @@ class DPMSolverMultistepScheduler : public Scheduler {
     begin_index_ = std::nullopt;
 
     // Log computed sigmas for debugging
+#ifdef SD_ENABLE_DIAGNOSTICS
     SD_LOG_INFO("[DIAG][DPM] set_timesteps: num_steps=%d sigmas_size=%zu",
                 num_inference_steps, (size_t)sigmas_.size());
     if (sigmas_.size() >= 3) {
@@ -107,6 +108,7 @@ class DPMSolverMultistepScheduler : public Scheduler {
                   timesteps_(0), timesteps_(1), timesteps_(2),
                   timesteps_(timesteps_.size() - 1));
     }
+#endif
   }
 
   std::tuple<float, float> _sigma_to_alpha_sigma_t(float sigma) const {
@@ -129,8 +131,10 @@ class DPMSolverMultistepScheduler : public Scheduler {
                                          const xt::xarray<float> &sample) {
     float sigma = sigmas_(step_index_.value());
     auto [alpha_t, sigma_t_val] = _sigma_to_alpha_sigma_t(sigma);
+#ifdef SD_ENABLE_DIAGNOSTICS
     SD_LOG_INFO("[DIAG][DPM] convert_model_output: step_idx=%d sigma=%.8f alpha_t=%.8f sigma_t=%.8f pred_type=%s",
                 step_index_.value(), sigma, alpha_t, sigma_t_val, prediction_type_.c_str());
+#endif
     if (prediction_type_ == "epsilon") {
       return (sample - sigma_t_val * model_output) / alpha_t;
     } else if (prediction_type_ == "v_prediction") {
@@ -158,12 +162,14 @@ class DPMSolverMultistepScheduler : public Scheduler {
     float coeff_sample = sigma_t_val / sigma_s_val;
     float coeff_x0 = -alpha_t * (std::exp(-h) - 1.0f);
 
+#ifdef SD_ENABLE_DIAGNOSTICS
     SD_LOG_INFO("[DIAG][DPM] first_order: step_idx=%d sigma_curr=%.8f sigma_next=%.8f "
                 "alpha_t=%.8f sigma_t=%.8f alpha_s=%.8f sigma_s=%.8f h=%.8f "
                 "coeff_sample=%.8f coeff_x0=%.8f",
                 step_index_.value(), sigma_curr, sigma_next,
                 alpha_t, sigma_t_val, alpha_s, sigma_s_val, h,
                 coeff_sample, coeff_x0);
+#endif
 
     return coeff_sample * sample + coeff_x0 * model_output;
   }

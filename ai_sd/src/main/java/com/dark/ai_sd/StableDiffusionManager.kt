@@ -1,5 +1,6 @@
 package com.dark.ai_sd
 
+import android.graphics.Bitmap
 import android.content.Context
 import kotlinx.coroutines.flow.StateFlow
 
@@ -56,6 +57,8 @@ class StableDiffusionManager private constructor(context: Context) {
     val diffusionBackendState: StateFlow<DiffusionBackendState> = diffusionManager.diffusionBackendState
     val diffusionGenerationState: StateFlow<DiffusionGenerationState> = diffusionManager.diffusionGenerationState
     val isGenerating: StateFlow<Boolean> = diffusionManager.isGenerating
+    val upscaleState: StateFlow<UpscaleState> = diffusionManager.upscaleState
+    val runtimeSetupState: StateFlow<RuntimeSetupState> = diffusionManager.runtimeSetupState
 
     /**
      * Initialize the runtime environment.
@@ -117,6 +120,14 @@ class StableDiffusionManager private constructor(context: Context) {
     }
 
     /**
+     * Get SoC hardware info from native C++ level.
+     * Returns JSON: {"soc_id","machine","family","revision","htp_version","has_qnn_htp"}
+     */
+    fun getSocInfo(): String {
+        return diffusionManager.getSocInfo()
+    }
+
+    /**
      * Get the currently loaded model.
      */
     fun getCurrentModel(): DiffusionModelConfig? {
@@ -135,5 +146,30 @@ class StableDiffusionManager private constructor(context: Context) {
      */
     fun cleanup() {
         diffusionManager.cleanup()
+    }
+
+    // ========================================================================
+    // Upscaler (Phase 5.1)
+    // ========================================================================
+
+    /**
+     * Load a 4x upscaler model.
+     */
+    fun loadUpscaler(modelPath: String, useMnn: Boolean = true, useOpenCL: Boolean = false): Boolean {
+        return diffusionManager.loadUpscaler(modelPath, useMnn, useOpenCL)
+    }
+
+    /**
+     * Upscale a bitmap 4x. Monitor via [upscaleState] flow.
+     */
+    fun upscaleImage(inputBitmap: Bitmap) {
+        diffusionManager.upscaleImage(inputBitmap)
+    }
+
+    /**
+     * Release upscaler model resources.
+     */
+    fun releaseUpscaler() {
+        diffusionManager.releaseUpscaler()
     }
 }

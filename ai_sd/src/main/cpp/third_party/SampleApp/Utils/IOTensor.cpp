@@ -729,6 +729,57 @@ iotensor::StatusCode iotensor::IOTensor::convertToFloat(float** out, Qnn_Tensor_
   return returnStatus;
 }
 
+// Perf 4: convertToFloat into caller-provided buffer (no malloc/free).
+iotensor::StatusCode iotensor::IOTensor::convertToFloat(float *outBuf, size_t outBufSize,
+                                                         Qnn_Tensor_t *tensor, size_t *outCount) {
+  if (nullptr == tensor || nullptr == outBuf) {
+    QNN_ERROR("tensor or outBuf is nullptr");
+    return StatusCode::FAILURE;
+  }
+  std::vector<size_t> dims;
+  fillDims(dims, QNN_TENSOR_GET_DIMENSIONS(tensor), QNN_TENSOR_GET_RANK(tensor));
+  size_t elementCount = datautil::calculateElementCount(dims);
+  if (elementCount > outBufSize) {
+    QNN_ERROR("outBuf too small: need %zu, got %zu", elementCount, outBufSize);
+    return StatusCode::FAILURE;
+  }
+  if (outCount) *outCount = elementCount;
+
+  auto returnStatus = StatusCode::SUCCESS;
+  switch (QNN_TENSOR_GET_DATA_TYPE(tensor)) {
+    case QNN_DATATYPE_UFIXED_POINT_8:
+      if (datautil::StatusCode::SUCCESS !=
+          datautil::tfNToFloat<uint8_t>(
+              outBuf,
+              reinterpret_cast<uint8_t*>(QNN_TENSOR_GET_CLIENT_BUF(tensor).data),
+              QNN_TENSOR_GET_QUANT_PARAMS(tensor).scaleOffsetEncoding.offset,
+              QNN_TENSOR_GET_QUANT_PARAMS(tensor).scaleOffsetEncoding.scale,
+              elementCount)) {
+        returnStatus = StatusCode::FAILURE;
+      }
+      break;
+    case QNN_DATATYPE_UFIXED_POINT_16:
+      if (datautil::StatusCode::SUCCESS !=
+          datautil::tfNToFloat<uint16_t>(
+              outBuf,
+              reinterpret_cast<uint16_t*>(QNN_TENSOR_GET_CLIENT_BUF(tensor).data),
+              QNN_TENSOR_GET_QUANT_PARAMS(tensor).scaleOffsetEncoding.offset,
+              QNN_TENSOR_GET_QUANT_PARAMS(tensor).scaleOffsetEncoding.scale,
+              elementCount)) {
+        returnStatus = StatusCode::FAILURE;
+      }
+      break;
+    case QNN_DATATYPE_FLOAT_32:
+      memcpy(outBuf, QNN_TENSOR_GET_CLIENT_BUF(tensor).data, elementCount * sizeof(float));
+      break;
+    default:
+      QNN_ERROR("convertToFloat(buf): unsupported dtype for zero-copy path");
+      returnStatus = StatusCode::FAILURE;
+      break;
+  }
+  return returnStatus;
+}
+
 // Helper method to convert Output tensors to float and write them
 // out to files.
 iotensor::StatusCode iotensor::IOTensor::convertAndWriteOutputTensorInFloat(

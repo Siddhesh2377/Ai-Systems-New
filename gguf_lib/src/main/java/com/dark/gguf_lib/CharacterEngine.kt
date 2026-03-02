@@ -1,96 +1,101 @@
 package com.dark.gguf_lib
 
+import org.json.JSONObject
+
 /**
- * CharacterEngine - Personality and behavior control.
+ * CharacterEngine - Personality, mood, and uncensored mode control.
  *
- * Controls model behavior at the logit level with mood states,
- * personality traits, and sampling parameter adjustments.
+ * Controls model behavior at the logit/sampling level via the native
+ * character engine. Supports personality traits, mood states, control
+ * vectors, and uncensored mode (vocabulary-level refusal suppression).
+ *
+ * Usage:
+ * ```
+ * val engine = GGMLEngine()
+ * val character = CharacterEngine(engine)
+ *
+ * character.setPersonality(Personality(
+ *     name = "Luna",
+ *     persona = "A warm, empathetic AI companion",
+ *     temperature = 0.8f,
+ *     creativity = 0.7f,
+ * ))
+ *
+ * character.setMood(Mood.HAPPY)
+ * character.setUncensored(true)
+ * ```
  */
-class CharacterEngine : AutoCloseable {
+class CharacterEngine(private val engine: GGMLEngine) {
 
-    private var nativeHandle: Long = 0L
-
-    init {
-        nativeHandle = nativeCreate()
-    }
-
+    /**
+     * Set the character personality.
+     * This adjusts sampling parameters (temperature, top_p, repetition penalty)
+     * and applies logit biases based on the personality traits.
+     */
     fun setPersonality(personality: Personality) {
-        check(nativeHandle != 0L) { "CharacterEngine already destroyed" }
-        nativeSetPersonality(
-            nativeHandle,
-            personality.name,
-            personality.persona,
-            personality.temperature,
-            personality.topP,
-            personality.repetitionPenalty,
-            personality.creativity,
-            personality.verbosity,
-            personality.formality,
-        )
-    }
-
-    fun setMood(mood: Mood) {
-        check(nativeHandle != 0L) { "CharacterEngine already destroyed" }
-        nativeSetMood(nativeHandle, mood.ordinal)
-    }
-
-    fun getContext(): String {
-        check(nativeHandle != 0L) { "CharacterEngine already destroyed" }
-        return nativeGetContext(nativeHandle)
-    }
-
-    fun getEffectiveParams(): CharacterParams {
-        check(nativeHandle != 0L) { "CharacterEngine already destroyed" }
-        val vals = nativeGetParams(nativeHandle)
-        return CharacterParams(
-            temperature = vals[0],
-            topP = vals[1],
-            minP = vals[2],
-            repetitionPenalty = vals[3],
-            topK = vals[4].toInt(),
-        )
+        val json = JSONObject().apply {
+            put("name", personality.name)
+            put("persona", personality.persona)
+            put("temperature", personality.temperature)
+            put("topP", personality.topP)
+            put("repetitionPenalty", personality.repetitionPenalty)
+            put("creativity", personality.creativity)
+            put("verbosity", personality.verbosity)
+            put("formality", personality.formality)
+        }
+        GGUFNativeLib.nativeSetPersonality(json.toString())
     }
 
     /**
-     * Build SamplingParams from the character engine state.
-     * Use this to pass directly to GGMLEngine.generate().
+     * Set the mood state. Adjusts sampling parameters for the mood.
      */
-    fun toSamplingParams(maxTokens: Int = 256): SamplingParams {
-        val p = getEffectiveParams()
-        return SamplingParams(
-            temperature = p.temperature,
-            topK = p.topK,
-            topP = p.topP,
-            minP = p.minP,
-            repeatPenalty = p.repetitionPenalty,
-            maxTokens = maxTokens,
-        )
+    fun setMood(mood: Mood) {
+        GGUFNativeLib.nativeSetMood(mood.ordinal)
     }
 
-    override fun close() {
-        if (nativeHandle != 0L) {
-            nativeDestroy(nativeHandle)
-            nativeHandle = 0L
-        }
+    /**
+     * Get the formatted personality/mood context block.
+     * Can be injected into the system prompt for reinforcement.
+     */
+    fun getContext(): String = GGUFNativeLib.nativeGetCharacterContext()
+
+    /**
+     * Enable uncensored mode.
+     * Scans the model vocabulary for refusal pattern tokens and applies
+     * negative logit biases to suppress them. This is vocabulary-level
+     * manipulation, not prompt engineering.
+     */
+    fun setUncensored(enabled: Boolean) {
+        GGUFNativeLib.nativeSetUncensored(enabled)
     }
 
-    // ---- Native methods ----
+    val isUncensored: Boolean get() = GGUFNativeLib.nativeGetUncensored()
 
-    private external fun nativeCreate(): Long
-    private external fun nativeDestroy(handle: Long)
-    private external fun nativeSetPersonality(
-        handle: Long, name: String, persona: String,
-        temperature: Float, topP: Float, repPenalty: Float,
-        creativity: Float, verbosity: Float, formality: Float
-    )
-    private external fun nativeSetMood(handle: Long, mood: Int)
-    private external fun nativeGetContext(handle: Long): String
-    private external fun nativeGetParams(handle: Long): FloatArray
-
-    companion object {
-        init {
-            System.loadLibrary("gguf_lib")
+    /**
+     * Load control vectors for fine-grained emotional/behavioral tuning.
+     * @param vectors List of control vector configs
+     */
+    fun loadControlVectors(vectors: List<ControlVectorConfig>): Boolean {
+        val json = org.json.JSONArray()
+        vectors.forEach { cv ->
+            json.put(JSONObject().apply {
+                put("path", cv.path)
+                put("scale", cv.strength)
+            })
         }
+        return engine.loadControlVectors(json.toString())
+    }
+
+    fun clearControlVectors() = engine.clearControlVector()
+
+    /**
+     * Set per-token logit biases for persona control.
+     * @param biases Map of token string to bias value
+     */
+    fun setLogitBias(biases: Map<String, Float>) {
+        val json = JSONObject()
+        biases.forEach { (token, bias) -> json.put(token, bias) }
+        GGUFNativeLib.nativeSetLogitBias(json.toString())
     }
 }
 
@@ -111,10 +116,7 @@ data class Personality(
     val formality: Float = 0.5f,
 )
 
-data class CharacterParams(
-    val temperature: Float,
-    val topP: Float,
-    val minP: Float,
-    val repetitionPenalty: Float,
-    val topK: Int,
+data class ControlVectorConfig(
+    val path: String,
+    val strength: Float = 1.0f,
 )

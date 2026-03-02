@@ -5,7 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <fstream>
-#include <iostream>
+#include "sd_logger.h"
 #include <memory>
 #include <random>
 #include <stdexcept>
@@ -13,9 +13,7 @@
 #include <unordered_map>
 #include <vector>
 
-#define STB_IMAGE_IMPLEMENTATION
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#define STB_IMAGE_RESIZE_IMPLEMENTATION
+// STB_*_IMPLEMENTATION defines moved to stb_impl.cpp (ODR fix)
 
 #include <MNN/MNNDefine.h>
 
@@ -116,7 +114,7 @@ inline unsigned hashSeed(unsigned long long seed) {
 inline std::string LoadBytesFromFile(const std::string &path) {
   std::ifstream fs(path, std::ios::in | std::ios::binary);
   if (fs.fail()) {
-    std::cerr << "Cannot open " << path << std::endl;
+    SD_LOG_ERROR("[LOAD] Cannot open %s", path.c_str());
     throw std::runtime_error("Failed to open file: " + path);
   }
   std::string data;
@@ -169,68 +167,9 @@ std::vector<T> loadVectorFromFile(const std::string &filename) {
   return vec;
 }
 
-bool safety_check(const std::vector<uint8_t> &image_data, int width, int height,
-                  float &nsfw_score, MNN::Interpreter *interpreter,
-                  MNN::Session *session) {
-  try {
-    std::vector<uint8_t> resized_256(256 * 256 * 3);
-    if (!stbir_resize_uint8_linear(image_data.data(), width, height, 0,
-                                   resized_256.data(), 256, 256, 0,
-                                   STBIR_RGB)) {
-      throw std::runtime_error("Resize failed");
-    }
-    std::vector<unsigned char> jpeg_buffer;
-    if (!stbi_write_jpg_to_func(
-            [](void *context, void *data, int size) {
-              auto &buffer =
-                  *static_cast<std::vector<unsigned char> *>(context);
-              buffer.insert(buffer.end(), static_cast<unsigned char *>(data),
-                            static_cast<unsigned char *>(data) + size);
-            },
-            &jpeg_buffer, 256, 256, 3, resized_256.data(), 95)) {
-      throw std::runtime_error("JPEG encoding failed");
-    }
-    int jpeg_width, jpeg_height, jpeg_channels;
-    uint8_t *decoded_data =
-        stbi_load_from_memory(jpeg_buffer.data(), jpeg_buffer.size(),
-                              &jpeg_width, &jpeg_height, &jpeg_channels, 3);
-    if (!decoded_data) {
-      throw std::runtime_error("JPEG decoding failed");
-    }
-    std::vector<float> processed_data(224 * 224 * 3);
-    int crop_x = (256 - 224) / 2;
-    int crop_y = (256 - 224) / 2;
-    float vgg_mean[] = {104.0f, 117.0f, 123.0f};
-    for (int y = 0; y < 224; y++) {
-      for (int x = 0; x < 224; x++) {
-        for (int c = 0; c < 3; c++) {
-          int src_idx = ((y + crop_y) * 256 + (x + crop_x)) * 3 + c;
-          int dst_idx = (y * 224 + x) * 3 + c;
-          processed_data[dst_idx] =
-              static_cast<float>(decoded_data[src_idx]) - vgg_mean[c];
-        }
-      }
-    }
-    stbi_image_free(decoded_data);
-    auto input_tensor = interpreter->getSessionInput(session, nullptr);
-    // std::vector<int> dims = {1, 224, 224, 3};
-    // interpreter->resizeTensor(input_tensor, dims);
-    // interpreter->resizeSession(session);
-    auto inputHost = input_tensor->host<float>();
-    memcpy(inputHost, processed_data.data(), 224 * 224 * 3 * sizeof(float));
-    interpreter->runSession(session);
-    auto output_tensor = interpreter->getSessionOutput(session, nullptr);
-    auto outputHost = output_tensor->host<float>();
-    nsfw_score = outputHost[1];
-    std::cout << "NSFW Score: " << nsfw_score << std::endl;
-    return true;
-  } catch (const std::exception &e) {
-    std::cerr << "Safety check error: " << e.what() << std::endl;
-    return false;
-  }
-}
+// safety_check() moved to safety/safety_checker.cpp (Phase 1.8)
 
-void decode_image(const std::vector<uint8_t> &image_binary,
+inline void decode_image(const std::vector<uint8_t> &image_binary,
                   std::vector<uint8_t> &output_pixels, int output_width,
                   int output_height) {
   int width, height, channels;
@@ -240,7 +179,7 @@ void decode_image(const std::vector<uint8_t> &image_binary,
 
   if (!decoded_data) {
     std::string error_msg = stbi_failure_reason();
-    std::cout << "Error decoding image: " << error_msg << std::endl;
+    SD_LOG_ERROR("[VAE] Error decoding image: %s", error_msg.c_str());
     output_pixels.clear();
     return;
     // throw std::runtime_error("Failed to decode image: " + error_msg);
@@ -288,13 +227,19 @@ void decode_image(const std::vector<uint8_t> &image_binary,
   }
 }
 
-void gaussianBlur(std::vector<uint8_t> &imageData, int width, int height,
+inline void gaussianBlur(std::vector<uint8_t> &imageData, int width, int height,
                   int radius) {
   if (width <= 0 || height <= 0 || radius <= 0 || imageData.empty()) {
     return;
   }
-  int channels = imageData.size() / (width * height);
+  size_t expected_pixels = static_cast<size_t>(width) * height;
+  if (expected_pixels == 0 || imageData.size() % expected_pixels != 0) {
+    SD_LOG_ERROR("gaussianBlur: size mismatch — data=%zu, %dx%d", imageData.size(), width, height);
+    return;
+  }
+  int channels = imageData.size() / expected_pixels;
   if (channels != 3 && channels != 4) {
+    SD_LOG_ERROR("gaussianBlur: unexpected channel count %d", channels);
     return;
   }
   int kernelSize = 2 * radius + 1;
@@ -348,12 +293,10 @@ void gaussianBlur(std::vector<uint8_t> &imageData, int width, int height,
 }
 
 inline void PrintEncodeResult(const std::vector<int> &ids) {
-  std::cout << "tokens=[";
-  for (size_t i = 0; i < ids.size(); ++i) {
-    if (i != 0) std::cout << ", ";
-    std::cout << ids[i];
+  if (ids.size() >= 4) {
+    SD_LOG_DEBUG("[CLIP] tokens=[%d, %d, %d, %d, ...] (%zu total)",
+                 ids[0], ids[1], ids[2], ids[3], ids.size());
   }
-  std::cout << "]" << std::endl;
 }
 
 // Encodes an RGB byte array into PNG format

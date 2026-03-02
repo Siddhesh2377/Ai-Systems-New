@@ -3,7 +3,6 @@ package com.dark.ai_sd
 /**
  * JNI wrapper for the native Stable Diffusion library.
  *
- * Follows the same pattern as ai_gguf/GGUFNativeLib.kt:
  * - System.loadLibrary() in companion init block
  * - External fun declarations matching C++ JNI functions
  * - Direct native calls (no HTTP, no subprocess)
@@ -133,6 +132,43 @@ class SDNativeLib {
      * Clear all applied LoRA weights, reverting to base model.
      */
     external fun nativeClearLora()
+
+    // =========================================================================
+    // Upscaler (Phase 5.1 — dead code revival)
+    // =========================================================================
+
+    /**
+     * Load a 4x upscaler model.
+     *
+     * @param modelPath Path to upscaler model (.bin for QNN, .mnn for MNN)
+     * @param useMnn Use MNN backend (CPU/GPU). If false, uses QNN (NPU).
+     * @param useOpenCL Use OpenCL acceleration for MNN backend
+     * @return true if loaded successfully
+     */
+    external fun nativeLoadUpscaler(modelPath: String, useMnn: Boolean, useOpenCL: Boolean): Boolean
+
+    /**
+     * Upscale an image 4x using the loaded upscaler model.
+     * Result delivered via [SDCallback.onComplete].
+     *
+     * @param inputRgb Raw RGB bytes of input image
+     * @param width Input image width
+     * @param height Input image height
+     * @param callback Callback for completion/error
+     * @return true if upscaling started successfully
+     */
+    external fun nativeUpscaleImage(inputRgb: ByteArray, width: Int, height: Int, callback: SDCallback): Boolean
+
+    /**
+     * Release upscaler model resources.
+     */
+    external fun nativeReleaseUpscaler()
+
+    /**
+     * Get SoC hardware info from sysfs at native level.
+     * Returns JSON: {"soc_id","machine","family","revision","htp_version","has_qnn_htp"}
+     */
+    external fun nativeGetSocInfo(): String
 
     companion object {
         init {

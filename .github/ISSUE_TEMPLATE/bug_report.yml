@@ -1,0 +1,46 @@
+name: Bug Report
+description: Report a crash, incorrect behavior, or build failure
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: module
+    attributes:
+      label: Module
+      options:
+        - gguf_lib (LLM)
+        - ai_sd (Image Generation)
+        - ai_supertonic_tts (TTS)
+        - Build / Gradle
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      placeholder: Describe the bug
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Load model X
+        2. Call generateImage()
+        3. Crash with ...
+  - type: textarea
+    id: logs
+    attributes:
+      label: Crash log / logcat output
+      render: shell
+  - type: input
+    id: device
+    attributes:
+      label: Device & SoC
+      placeholder: "e.g. Samsung S23 (Snapdragon 8 Gen 2)"
+  - type: input
+    id: android
+    attributes:
+      label: Android version
+      placeholder: "e.g. Android 14 (API 34)"
