@@ -1,8 +1,10 @@
 # Ai-Systems
 
-Android AI SDK monorepo — on-device LLM inference, image generation, and text-to-speech. All SDKs run entirely on-device with no cloud dependencies.
+On-device AI SDK for Android — LLM inference, image generation, image processing, and text-to-speech. No cloud, no internet, runs entirely on-device.
 
 Built for **Android** (ARMv8/ARMv9 via NDK) with JNI + native C++ backends.
+
+> **Note:** This repo is developed strictly for **[ToolNeuron](https://github.com/Siddhesh2377/ToolNeuron)**. If you want to use these SDKs in your own app, fork or clone this repo and integrate the modules you need.
 
 ---
 
@@ -10,7 +12,7 @@ Built for **Android** (ARMv8/ARMv9 via NDK) with JNI + native C++ backends.
 
 | Module | What it does | Backend | Package |
 |--------|-------------|---------|---------|
-| **[ai_gguf](ai_gguf/)** | LLM inference (chat, embeddings, tool calling) | llama.cpp (custom fork) | `com.mp.ai_gguf` |
+| **[gguf_lib](gguf_lib/)** | LLM inference (chat, embeddings, tool calling) | llama.cpp (custom fork) | `com.dark.gguf_lib` |
 | **[ai_sd](ai_sd/)** | Image generation (txt2img, img2img, inpaint) | QNN (Hexagon DSP) + MNN | `com.dark.ai_sd` |
 | **[ai_supertonic_tts](ai_supertonic_tts/)** | Text-to-speech (5 languages, 10 voices) | ONNX Runtime | `com.mp.ai_supertonic_tts` |
 
@@ -22,13 +24,13 @@ Built for **Android** (ARMv8/ARMv9 via NDK) with JNI + native C++ backends.
 
 ```kotlin
 // settings.gradle.kts
-include(":ai_gguf")
+include(":gguf_lib")
 include(":ai_sd")
 include(":ai_supertonic_tts")
 
 // app/build.gradle.kts
 dependencies {
-    implementation(project(":ai_gguf"))         // LLM
+    implementation(project(":gguf_lib"))         // LLM
     implementation(project(":ai_sd"))           // Image Gen
     implementation(project(":ai_supertonic_tts")) // TTS
 }
@@ -38,8 +40,8 @@ dependencies {
 
 - **Min SDK**: 27 (Android 8.1)
 - **Target SDK**: 36
-- **ABI**: `arm64-v8a` (all modules), `x86_64` (ai_gguf, ai_supertonic_tts)
-- **CMake**: 3.22.1
+- **ABI**: `arm64-v8a` (all modules)
+- **CMake**: 3.31.4
 - **JDK**: 17
 - **Gradle**: 9.3.1
 - **AGP**: 9.0.1
@@ -48,20 +50,20 @@ dependencies {
 
 ## Module Details
 
-### ai_gguf — LLM Inference
+### gguf_lib — LLM Inference
 
-On-device LLM inference powered by a [custom llama.cpp fork](https://github.com/Siddhesh2377/llama.cpp-custom) with 10 runtime intervention surfaces for personality/emotion control.
+On-device LLM inference powered by a [custom llama.cpp fork](https://github.com/Siddhesh2377/llama.cpp-custom) optimized for ARM CPU with KleidiAI micro-kernels.
 
 **Key features**:
-- Multi-turn chat with streaming tokens
+- Multi-turn chat with Flow-based streaming tokens
 - Model-agnostic tool calling with GBNF grammar constraints (STRICT/LAZY modes)
 - Text embeddings for semantic search
-- 7 CPU backend variants selected at runtime (dotprod, fp16, i8mm, sve, sme)
-- Character Intelligence Engine: control vectors, attention bias, head rescaling, attention temperature, fast weight memory, LayerNorm shift
-- KV cache persistence (save/load conversation state)
-- Speculative decoding, forward-only learning (SPSA)
+- Character personality engine: mood, emotion, uncensored mode via logit/sampling control
+- KV cache prefix reuse, context shifting, disk-backed prompt cache
+- Speculative decoding (ngram self-speculative)
+- CPU affinity pinning, zero-copy token delivery, JNI method ID caching
 
-See [ai_gguf/README.md](ai_gguf/README.md) for full API reference.
+See [gguf_lib/CLAUDE.md](gguf_lib/CLAUDE.md) for full API reference.
 
 ### ai_sd — Image Generation
 
@@ -100,7 +102,7 @@ See [ai_supertonic_tts/TTS_SDK_DOCS.md](ai_supertonic_tts/TTS_SDK_DOCS.md) for f
 ./gradlew assembleRelease
 
 # Single module
-./gradlew :ai_gguf:assembleRelease
+./gradlew :gguf_lib:assembleRelease
 ./gradlew :ai_sd:assembleRelease
 ./gradlew :ai_supertonic_tts:assembleRelease
 ```
@@ -113,7 +115,7 @@ Native C++ is built automatically via CMake during Gradle build. First build tak
 
 ```
 Ai-Systems/
-├── ai_gguf/           # LLM SDK
+├── gguf_lib/          # LLM SDK
 │   ├── src/main/cpp/  #   C++ (JNI → llama.cpp)
 │   └── src/main/java/ #   Kotlin API
 ├── ai_sd/             # Image Gen SDK
