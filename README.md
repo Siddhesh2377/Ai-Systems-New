@@ -15,6 +15,7 @@ Built for **Android** (ARMv8/ARMv9 via NDK) with JNI + native C++ backends.
 | **[gguf_lib](gguf_lib/)** | LLM inference (chat, embeddings, tool calling) | llama.cpp (custom fork) | `com.dark.gguf_lib` |
 | **[ai_sd](ai_sd/)** | Image generation (txt2img, img2img, inpaint) | QNN (Hexagon DSP) + MNN | `com.dark.ai_sd` |
 | **[ai_supertonic_tts](ai_supertonic_tts/)** | Text-to-speech (5 languages, 10 voices) | ONNX Runtime | `com.mp.ai_supertonic_tts` |
+| **[ai_chatterbox](ai_chatterbox/)** | Emotional TTS (voice cloning, expressive speech) | ONNX Runtime | `com.dark.ai_chatterbox` |
 
 ---
 
@@ -27,12 +28,14 @@ Built for **Android** (ARMv8/ARMv9 via NDK) with JNI + native C++ backends.
 include(":gguf_lib")
 include(":ai_sd")
 include(":ai_supertonic_tts")
+include(":ai_chatterbox")
 
 // app/build.gradle.kts
 dependencies {
     implementation(project(":gguf_lib"))         // LLM
     implementation(project(":ai_sd"))           // Image Gen
     implementation(project(":ai_supertonic_tts")) // TTS
+    implementation(project(":ai_chatterbox"))    // Emotional TTS
 }
 ```
 
@@ -93,6 +96,20 @@ On-device TTS using Supertonic v2 (66M params, ONNX Runtime). Produces 44.1 kHz 
 
 See [ai_supertonic_tts/TTS_SDK_DOCS.md](ai_supertonic_tts/TTS_SDK_DOCS.md) for full API reference.
 
+### ai_chatterbox — Emotional Text-to-Speech
+
+On-device emotional TTS via Chatterbox (MIT, [ResembleAI](https://github.com/resemble-ai/chatterbox)). Supports voice cloning from reference audio and emotion control.
+
+**Key features**:
+- Two model variants: Turbo (350M, fast) and Original (500M, emotional)
+- Voice cloning from 10s reference audio
+- Emotion exaggeration control (Original variant)
+- 24kHz mono PCM output
+- Greedy autoregressive generation with KV cache
+- Cancellation support via atomic stop flag
+
+See [ai_chatterbox/README.md](ai_chatterbox/README.md) for full API reference.
+
 ---
 
 ## Build
@@ -105,6 +122,7 @@ See [ai_supertonic_tts/TTS_SDK_DOCS.md](ai_supertonic_tts/TTS_SDK_DOCS.md) for f
 ./gradlew :gguf_lib:assembleRelease
 ./gradlew :ai_sd:assembleRelease
 ./gradlew :ai_supertonic_tts:assembleRelease
+./gradlew :ai_chatterbox:assembleRelease
 ```
 
 Native C++ is built automatically via CMake during Gradle build. First build takes longer due to llama.cpp compilation.
@@ -122,6 +140,9 @@ Ai-Systems/
 │   ├── src/main/cpp/  #   C++ (JNI → QNN/MNN)
 │   └── src/main/java/ #   Kotlin API
 ├── ai_supertonic_tts/ # TTS SDK
+│   ├── src/main/cpp/  #   C++ (JNI → ONNX Runtime)
+│   └── src/main/java/ #   Kotlin API
+├── ai_chatterbox/     # Emotional TTS SDK
 │   ├── src/main/cpp/  #   C++ (JNI → ONNX Runtime)
 │   └── src/main/java/ #   Kotlin API
 └── build.gradle.kts   # Root config
