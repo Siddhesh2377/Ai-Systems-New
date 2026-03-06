@@ -317,6 +317,91 @@ class GGMLEngine {
      */
     fun warmUp(): Boolean = if (loaded) GGUFNativeLib.nativeWarmUp() else false
 
+    // ---- VLM (Vision Language Model) ----
+
+    private var vlmLoaded = false
+
+    /**
+     * Load a vision projector (mmproj GGUF). Must be called after loading the text model.
+     * @param path Absolute path to the mmproj .gguf file
+     * @param threads Threads for vision encoding (0 = auto)
+     */
+    fun loadVlmProjector(path: String, threads: Int = 0): Boolean {
+        if (!loaded) return false
+        vlmLoaded = GGUFNativeLib.nativeVlmLoadProjector(path, threads)
+        return vlmLoaded
+    }
+
+    /**
+     * Load a vision projector from Android file descriptor.
+     */
+    fun loadVlmProjectorFromFd(fd: Int, threads: Int = 0): Boolean {
+        if (!loaded) return false
+        vlmLoaded = GGUFNativeLib.nativeVlmLoadProjectorFromFd(fd, threads)
+        return vlmLoaded
+    }
+
+    /**
+     * Load a vision projector from a content:// URI via SAF.
+     */
+    fun loadVlmProjector(context: Context, uri: Uri, threads: Int = 0): Boolean {
+        if (!loaded) return false
+        val pfd = context.contentResolver.openFileDescriptor(uri, "r") ?: return false
+        return try {
+            loadVlmProjectorFromFd(pfd.fd, threads)
+        } finally {
+            pfd.close()
+        }
+    }
+
+    fun releaseVlmProjector() {
+        if (vlmLoaded) {
+            GGUFNativeLib.nativeVlmRelease()
+            vlmLoaded = false
+        }
+    }
+
+    val isVlmLoaded: Boolean get() = vlmLoaded
+
+    /**
+     * Get VLM info as JSON string (supports_vision, supports_audio, default_marker).
+     */
+    fun getVlmInfoJson(): String? = if (vlmLoaded) GGUFNativeLib.nativeVlmGetInfo() else null
+
+    /**
+     * Get the default image marker to use in prompts (e.g. "<__image__>").
+     */
+    fun getVlmDefaultMarker(): String = GGUFNativeLib.nativeVlmGetDefaultMarker()
+
+    /**
+     * Stream generation with text + images.
+     * @param messagesJson JSON array of chat messages. User message content should
+     *                     contain the image marker where each image should appear.
+     * @param imageData List of raw image file bytes (JPEG/PNG)
+     */
+    fun generateVlmFlow(
+        messagesJson: String,
+        imageData: List<ByteArray>,
+        maxTokens: Int = 4096
+    ): Flow<GenerationEvent> = callbackFlow {
+        val job = launch(Dispatchers.IO) {
+            val cb = object : StreamCallback {
+                override fun onToken(token: String) { trySend(GenerationEvent.Token(token)) }
+                override fun onToolCall(name: String, argsJson: String) { trySend(GenerationEvent.ToolCall(name, argsJson)) }
+                override fun onDone() { trySend(GenerationEvent.Done); channel.close() }
+                override fun onError(message: String) { trySend(GenerationEvent.Error(message)); channel.close() }
+                override fun onProgress(progress: Float) { trySend(GenerationEvent.Progress(progress)) }
+                override fun onMetrics(tps: Float, ttftMs: Float, totalMs: Float, tokensEvaluated: Int, tokensPredicted: Int, modelMB: Float, ctxMB: Float, peakMB: Float, memPct: Float) {
+                    trySend(GenerationEvent.Metrics(DecodingMetrics(tps, ttftMs, totalMs, tokensEvaluated, tokensPredicted, modelMB, ctxMB, peakMB, memPct)))
+                }
+            }
+            GGUFNativeLib.nativeVlmGenerateStream(
+                messagesJson, imageData.toTypedArray(), maxTokens, cb
+            )
+        }
+        awaitClose { job.cancel(); GGUFNativeLib.nativeStopGeneration() }
+    }
+
     // ---- Device Tier ----
 
     companion object {

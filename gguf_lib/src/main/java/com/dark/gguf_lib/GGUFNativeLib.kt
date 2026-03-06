@@ -133,4 +133,26 @@ object GGUFNativeLib {
     external fun nativeRunAgentStep(userMessage: String, systemPrompt: String, maxRounds: Int)
     external fun nativeStopAgent()
     external fun nativeReleaseAgentSystem()
+
+    // ---- VLM (Vision Language Model) ----
+
+    external fun nativeVlmLoadProjector(path: String, nThreads: Int): Boolean
+    external fun nativeVlmLoadProjectorFromFd(fd: Int, nThreads: Int): Boolean
+    external fun nativeVlmRelease()
+    external fun nativeVlmIsLoaded(): Boolean
+    external fun nativeVlmGetInfo(): String?
+    external fun nativeVlmGetDefaultMarker(): String
+
+    /**
+     * Generate from text + images. The prompt (inside messagesJson) should contain
+     * image markers (from nativeVlmGetDefaultMarker()) where images should appear.
+     * @param messagesJson JSON array of chat messages
+     * @param imageData array of byte arrays — each is raw file bytes (JPEG/PNG)
+     */
+    external fun nativeVlmGenerateStream(
+        messagesJson: String,
+        imageData: Array<ByteArray>,
+        maxTokens: Int,
+        callback: StreamCallback
+    ): Boolean
 }

@@ -27,6 +27,8 @@
 #include "character-engine.h"
 #include "rag-engine.h"
 #include "ngram-cache.h"
+#include "mtmd.h"
+#include "mtmd-helper.h"
 
 #include <nlohmann/json.hpp>
 
@@ -3621,5 +3623,367 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeReleaseAgentSystem(JNIEnv * env, job
     g_agent.initialized = false;
 
     LOGI("Agent system released");
+}
+
+// ════════════════════════════════════════════
+//  VLM (Vision Language Model) JNI Bridge
+// ════════════════════════════════════════════
+
+static struct {
+    mtmd_context * ctx = nullptr;
+    std::mutex     mutex;
+} g_vlm;
+
+// ── JNI: nativeVlmLoadProjector ──
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmLoadProjector(
+        JNIEnv * env, jobject, jstring jpath, jint nThreads) {
+
+    std::lock_guard<std::mutex> lock(g_vlm.mutex);
+
+    if (!g_state.model) {
+        LOGE("VLM: text model must be loaded first");
+        return JNI_FALSE;
+    }
+
+    // release previous projector if any
+    if (g_vlm.ctx) {
+        mtmd_free(g_vlm.ctx);
+        g_vlm.ctx = nullptr;
+    }
+
+    const char * path = env->GetStringUTFChars(jpath, nullptr);
+
+    auto params = mtmd_context_params_default();
+    params.use_gpu       = false;  // CPU only on mobile
+    params.n_threads     = nThreads > 0 ? nThreads : g_state.n_threads_batch;
+    params.print_timings = false;
+    params.warmup        = true;
+
+    g_vlm.ctx = mtmd_init_from_file(path, g_state.model, params);
+    env->ReleaseStringUTFChars(jpath, path);
+
+    if (!g_vlm.ctx) {
+        LOGE("VLM: failed to load projector");
+        return JNI_FALSE;
+    }
+
+    LOGI("VLM: projector loaded (vision=%d, audio=%d)",
+         mtmd_support_vision(g_vlm.ctx), mtmd_support_audio(g_vlm.ctx));
+    return JNI_TRUE;
+}
+
+// ── JNI: nativeVlmLoadProjectorFromFd ──
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmLoadProjectorFromFd(
+        JNIEnv * env, jobject thiz, jint fd, jint nThreads) {
+
+    // Use /proc/self/fd/<fd> trick for file descriptor access
+    char fd_path[64];
+    snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", fd);
+    jstring jpath = env->NewStringUTF(fd_path);
+    jboolean result = Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmLoadProjector(
+        env, thiz, jpath, nThreads);
+    env->DeleteLocalRef(jpath);
+    return result;
+}
+
+// ── JNI: nativeVlmRelease ──
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmRelease(JNIEnv *, jobject) {
+    std::lock_guard<std::mutex> lock(g_vlm.mutex);
+    if (g_vlm.ctx) {
+        mtmd_free(g_vlm.ctx);
+        g_vlm.ctx = nullptr;
+        LOGI("VLM: projector released");
+    }
+}
+
+// ── JNI: nativeVlmIsLoaded ──
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmIsLoaded(JNIEnv *, jobject) {
+    return g_vlm.ctx != nullptr ? JNI_TRUE : JNI_FALSE;
+}
+
+// ── JNI: nativeVlmGetInfo ──
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGetInfo(JNIEnv * env, jobject) {
+    if (!g_vlm.ctx) return env->NewStringUTF("{}");
+
+    json info;
+    info["supports_vision"] = mtmd_support_vision(g_vlm.ctx);
+    info["supports_audio"]  = mtmd_support_audio(g_vlm.ctx);
+    info["default_marker"]  = mtmd_default_marker();
+
+    std::string s = info.dump();
+    return env->NewStringUTF(s.c_str());
+}
+
+// ── JNI: nativeVlmGetDefaultMarker ──
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGetDefaultMarker(JNIEnv * env, jobject) {
+    return env->NewStringUTF(mtmd_default_marker());
+}
+
+// ── JNI: nativeVlmGenerateStream ──
+//
+// Generates a response from text + images. The prompt should contain
+// image markers (from nativeVlmGetDefaultMarker) where images go.
+//
+// imageDataArray: array of byte[] — each is raw file bytes (JPEG/PNG)
+// This clears the KV cache and starts fresh (VLM doesn't support multi-turn context reuse).
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGenerateStream(
+        JNIEnv * env, jobject,
+        jstring jmessagesJson,
+        jobjectArray imageDataArray,
+        jint maxTokens,
+        jobject callback) {
+
+    std::lock_guard<std::mutex> lock(g_state.gen_mutex);
+
+    if (!g_state.model || !g_state.ctx) {
+        LOGE("VLM: text model not loaded");
+        return JNI_FALSE;
+    }
+    if (!g_vlm.ctx) {
+        LOGE("VLM: projector not loaded");
+        return JNI_FALSE;
+    }
+
+    g_state.cancel_flag = false;
+    g_utf8_buffer.clear();
+
+    if (!ensure_callback_methods(env, callback)) {
+        LOGE("VLM: failed to find callback methods");
+        return JNI_FALSE;
+    }
+
+    // Parse messages JSON and apply chat template
+    const char * msgs_cstr = env->GetStringUTFChars(jmessagesJson, nullptr);
+    std::string messages_json(msgs_cstr);
+    env->ReleaseStringUTFChars(jmessagesJson, msgs_cstr);
+
+    auto messages = parse_messages_json(messages_json);
+    if (!g_state.system_prompt.empty()) {
+        if (messages.empty() || messages[0].role != "system") {
+            messages.insert(messages.begin(), {"system", g_state.system_prompt});
+        }
+    }
+
+    chat_template_result tmpl_result;
+    try {
+        tmpl_result = apply_chat_template(messages, true);
+    } catch (const std::exception & e) {
+        std::string err = std::string("VLM chat template error: ") + e.what();
+        LOGE("%s", err.c_str());
+        jstring jerr = env->NewStringUTF(err.c_str());
+        env->CallVoidMethod(callback, g_onError, jerr);
+        env->DeleteLocalRef(jerr);
+        return JNI_FALSE;
+    }
+
+    // Collect image data from Java byte arrays
+    int n_images = imageDataArray ? env->GetArrayLength(imageDataArray) : 0;
+
+    struct image_buf {
+        std::vector<unsigned char> data;
+    };
+    std::vector<image_buf> image_bufs(n_images);
+
+    for (int i = 0; i < n_images; i++) {
+        auto jbytes = (jbyteArray)env->GetObjectArrayElement(imageDataArray, i);
+        int len = env->GetArrayLength(jbytes);
+        image_bufs[i].data.resize(len);
+        env->GetByteArrayRegion(jbytes, 0, len, (jbyte *)image_bufs[i].data.data());
+        env->DeleteLocalRef(jbytes);
+    }
+
+    // Create mtmd bitmaps from image data
+    std::vector<mtmd_bitmap *> bitmaps;
+    for (int i = 0; i < n_images; i++) {
+        mtmd_bitmap * bmp = mtmd_helper_bitmap_init_from_buf(
+            g_vlm.ctx, image_bufs[i].data.data(), image_bufs[i].data.size());
+        if (!bmp) {
+            LOGE("VLM: failed to decode image %d", i);
+            for (auto * b : bitmaps) mtmd_bitmap_free(b);
+            jstring jerr = env->NewStringUTF("Failed to decode image");
+            env->CallVoidMethod(callback, g_onError, jerr);
+            env->DeleteLocalRef(jerr);
+            return JNI_FALSE;
+        }
+        bitmaps.push_back(bmp);
+    }
+
+    // Build const pointer array for mtmd_tokenize
+    std::vector<const mtmd_bitmap *> bitmap_ptrs(bitmaps.begin(), bitmaps.end());
+
+    // Tokenize prompt + images into chunks
+    mtmd_input_chunks * chunks = mtmd_input_chunks_init();
+    mtmd_input_text input_text;
+    input_text.text         = tmpl_result.prompt.c_str();
+    input_text.add_special  = true;
+    input_text.parse_special = true;
+
+    int32_t tok_result = mtmd_tokenize(g_vlm.ctx, chunks,
+        &input_text, bitmap_ptrs.data(), bitmap_ptrs.size());
+
+    for (auto * b : bitmaps) mtmd_bitmap_free(b);
+
+    if (tok_result != 0) {
+        mtmd_input_chunks_free(chunks);
+        LOGE("VLM: tokenization failed");
+        jstring jerr = env->NewStringUTF("Failed to tokenize multimodal input");
+        env->CallVoidMethod(callback, g_onError, jerr);
+        env->DeleteLocalRef(jerr);
+        return JNI_FALSE;
+    }
+
+    // Clear KV cache — VLM always starts fresh
+    llama_memory_t mem = llama_get_memory(g_state.ctx);
+    if (mem) llama_memory_clear(mem, true);
+    g_state.n_past = 0;
+    g_state.prev_prompt_tokens.clear();
+
+    rebuild_sampler();
+
+    auto t_start = std::chrono::high_resolution_clock::now();
+
+    // Report progress for image encoding
+    if (g_onProgress) {
+        env->CallVoidMethod(callback, g_onProgress, 0.1f);
+    }
+
+    // Process all chunks: text decode + image encode + embedding injection
+    llama_pos new_n_past = 0;
+    int32_t eval_result = mtmd_helper_eval_chunks(
+        g_vlm.ctx, g_state.ctx, chunks,
+        0,    // n_past
+        0,    // seq_id
+        512,  // n_batch (smaller for mobile memory)
+        true, // logits_last
+        &new_n_past);
+
+    mtmd_input_chunks_free(chunks);
+
+    if (eval_result != 0) {
+        LOGE("VLM: chunk evaluation failed (%d)", eval_result);
+        jstring jerr = env->NewStringUTF("Failed to process multimodal input");
+        env->CallVoidMethod(callback, g_onError, jerr);
+        env->DeleteLocalRef(jerr);
+        return JNI_FALSE;
+    }
+
+    g_state.n_past = new_n_past;
+    int prompt_tokens = g_state.n_past;
+
+    if (g_onProgress) {
+        env->CallVoidMethod(callback, g_onProgress, 0.5f);
+    }
+
+    auto t_prompt_done = std::chrono::high_resolution_clock::now();
+
+    LOGI("VLM: prompt + images processed, %d tokens, starting generation", prompt_tokens);
+
+    // ── Autoregressive generation loop (reuses existing sampling infrastructure) ──
+
+    const llama_vocab * vocab = llama_model_get_vocab(g_state.model);
+    int n_generated = 0;
+    std::string generated_text;
+    generated_text.reserve(maxTokens * 4);
+    size_t sent_count = 0;
+
+    antiprompt_state antiprompt;
+    antiprompt.set_stops(tmpl_result.stops);
+
+    token_batcher batcher(env, callback, g_onToken);
+
+    while (n_generated < maxTokens && !g_state.cancel_flag.load()) {
+        if (!g_state.sampler) break;
+
+        llama_token id = common_sampler_sample(g_state.sampler, g_state.ctx, -1);
+        common_sampler_accept(g_state.sampler, id, true);
+
+        if (llama_vocab_is_eog(vocab, id)) break;
+
+        char buf[256];
+        int n = llama_token_to_piece(vocab, id, buf, sizeof(buf) - 1, 0, true);
+        if (n > 0) {
+            buf[n] = '\0';
+            generated_text.append(buf, n);
+
+            size_t unsent_start = std::min(sent_count, generated_text.size());
+            size_t unsent_len = generated_text.size() - unsent_start;
+            std::string unsent(generated_text.data() + unsent_start, unsent_len);
+
+            size_t stop_pos = antiprompt.find_stop(unsent, (size_t)n, STOP_FULL);
+            if (stop_pos != std::string::npos) {
+                generated_text.resize(unsent_start + stop_pos);
+                if (sent_count < generated_text.size()) {
+                    batcher.add(generated_text.data() + sent_count, generated_text.size() - sent_count);
+                }
+                batcher.flush();
+                break;
+            }
+
+            stop_pos = antiprompt.find_stop(unsent, (size_t)n, STOP_PARTIAL);
+            if (stop_pos == std::string::npos) {
+                if (sent_count < generated_text.size()) {
+                    batcher.add(generated_text.data() + sent_count, generated_text.size() - sent_count);
+                    sent_count = generated_text.size();
+                }
+            }
+
+            if (env->ExceptionCheck()) { env->ExceptionClear(); break; }
+        }
+
+        if (g_state.n_past >= (int)llama_n_ctx(g_state.ctx) - 1) {
+            if (!try_context_shift()) break;
+        }
+
+        llama_batch & sb = get_single_batch();
+        common_batch_clear(sb);
+        common_batch_add(sb, id, g_state.n_past, {0}, true);
+        if (llama_decode(g_state.ctx, sb) != 0) break;
+        g_state.n_past++;
+        n_generated++;
+    }
+
+    // Flush remaining tokens
+    if (sent_count < generated_text.size()) {
+        batcher.add(generated_text.data() + sent_count, generated_text.size() - sent_count);
+    }
+    batcher.flush();
+    if (!g_utf8_buffer.empty()) {
+        batcher.buf = std::move(g_utf8_buffer);
+        g_utf8_buffer.clear();
+        batcher.flush();
+    }
+
+    auto t_end = std::chrono::high_resolution_clock::now();
+
+    float prompt_ms = std::chrono::duration<float, std::milli>(t_prompt_done - t_start).count();
+    float gen_ms = std::chrono::duration<float, std::milli>(t_end - t_prompt_done).count();
+    float total_ms = std::chrono::duration<float, std::milli>(t_end - t_start).count();
+    float tps = gen_ms > 0 ? (n_generated / (gen_ms / 1000.0f)) : 0;
+
+    if (g_onMetrics) {
+        env->CallVoidMethod(callback, g_onMetrics,
+            tps, prompt_ms, total_ms,
+            prompt_tokens, n_generated,
+            0.0f, 0.0f, 0.0f, 0.0f);
+    }
+
+    env->CallVoidMethod(callback, g_onDone);
+
+    LOGI("VLM: generation complete — %d tokens, %.1f t/s, prompt %.0fms", n_generated, tps, prompt_ms);
+    return JNI_TRUE;
 }
 
