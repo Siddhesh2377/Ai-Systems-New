@@ -94,7 +94,7 @@ class DiffusionManager(private val context: Context) {
 
                 if (config.safetyCheckerEnabled) {
                     updateSetupState(RuntimeSetupState.CopyingSafetyChecker)
-                    prepareSafetyChecker()
+                    prepareSafetyChecker(config)
                 }
 
                 // Initialize QNN runtime with the extracted library directory
@@ -150,6 +150,17 @@ class DiffusionManager(private val context: Context) {
             val unetFilename = if (model.runOnCpu) "unet.mnn" else "unet.bin"
             val vaeDecoderFilename = if (model.runOnCpu) "vae_decoder.mnn" else "vae_decoder.bin"
             val vaeEncoderFilename = if (model.runOnCpu) "vae_encoder.mnn" else "vae_encoder.bin"
+
+            // Early validation: fail fast if UNET file is missing
+            val unetFile = File(modelsDir, unetFilename)
+            if (!unetFile.exists()) {
+                val msg = "UNET file not found: ${unetFile.absolutePath} — CPU mode requires .mnn model files"
+                Log.e(TAG, msg)
+                synchronized(stateLock) {
+                    _backendState.value = DiffusionBackendState.Error(msg)
+                }
+                return false
+            }
 
             val vaeEncoderFile = File(modelsDir, vaeEncoderFilename)
             val vaeEncoderPath = if (vaeEncoderFile.exists()) vaeEncoderFile.absolutePath else ""
@@ -512,8 +523,249 @@ class DiffusionManager(private val context: Context) {
     }
 
     // ========================================================================
+    // Segmenter (Phase 5.3 — MobileSAM)
+    // ========================================================================
+
+    private val _segmenterState = MutableStateFlow<SegmenterState>(SegmenterState.Idle)
+    val segmenterState: StateFlow<SegmenterState> = _segmenterState.asStateFlow()
+
+    fun loadSegmenter(encoderPath: String, decoderPath: String, useOpenCL: Boolean = false): Boolean {
+        return nativeLib.nativeLoadSegmenter(encoderPath, decoderPath, useOpenCL)
+    }
+
+    fun segmenterEncodeImage(inputBitmap: Bitmap): Boolean {
+        val width = inputBitmap.width
+        val height = inputBitmap.height
+        val rgbBytes = bitmapToRgbBytes(inputBitmap)
+        return nativeLib.nativeSegmenterEncodeImage(rgbBytes, width, height)
+    }
+
+    fun segmentAtPoint(x: Float, y: Float) {
+        Thread {
+            try {
+                synchronized(stateLock) { _segmenterState.value = SegmenterState.Processing }
+                val callback = object : SDCallback {
+                    override fun onProgress(step: Int, totalSteps: Int) {}
+                    override fun onImageProgress(step: Int, totalSteps: Int, rgbData: ByteArray, width: Int, height: Int) {}
+                    override fun onComplete(rgbData: ByteArray, width: Int, height: Int, seed: Long, generationTimeMs: Int) {
+                        val mask = createMaskBitmap(rgbData, width, height)
+                        val score = seed / 10000f  // Score was packed into seed field
+                        synchronized(stateLock) {
+                            _segmenterState.value = SegmenterState.Complete(mask, score, width, height, generationTimeMs)
+                        }
+                    }
+                    override fun onError(message: String) {
+                        synchronized(stateLock) { _segmenterState.value = SegmenterState.Error(message) }
+                    }
+                }
+                nativeLib.nativeSegmentAtPoint(x, y, callback)
+            } catch (e: Exception) {
+                Log.e(TAG, "Segment at point failed", e)
+                synchronized(stateLock) { _segmenterState.value = SegmenterState.Error(e.message ?: "Unknown error") }
+            }
+        }.start()
+    }
+
+    fun segmentWithBox(x1: Float, y1: Float, x2: Float, y2: Float) {
+        Thread {
+            try {
+                synchronized(stateLock) { _segmenterState.value = SegmenterState.Processing }
+                val callback = object : SDCallback {
+                    override fun onProgress(step: Int, totalSteps: Int) {}
+                    override fun onImageProgress(step: Int, totalSteps: Int, rgbData: ByteArray, width: Int, height: Int) {}
+                    override fun onComplete(rgbData: ByteArray, width: Int, height: Int, seed: Long, generationTimeMs: Int) {
+                        val mask = createMaskBitmap(rgbData, width, height)
+                        val score = seed / 10000f
+                        synchronized(stateLock) {
+                            _segmenterState.value = SegmenterState.Complete(mask, score, width, height, generationTimeMs)
+                        }
+                    }
+                    override fun onError(message: String) {
+                        synchronized(stateLock) { _segmenterState.value = SegmenterState.Error(message) }
+                    }
+                }
+                nativeLib.nativeSegmentWithBox(x1, y1, x2, y2, callback)
+            } catch (e: Exception) {
+                Log.e(TAG, "Segment with box failed", e)
+                synchronized(stateLock) { _segmenterState.value = SegmenterState.Error(e.message ?: "Unknown error") }
+            }
+        }.start()
+    }
+
+    fun releaseSegmenter() {
+        nativeLib.nativeReleaseSegmenter()
+        synchronized(stateLock) { _segmenterState.value = SegmenterState.Idle }
+    }
+
+    // ========================================================================
+    // LaMa Inpainter (Phase 5.4)
+    // ========================================================================
+
+    private val _lamaState = MutableStateFlow<LamaState>(LamaState.Idle)
+    val lamaState: StateFlow<LamaState> = _lamaState.asStateFlow()
+
+    fun loadLamaInpainter(modelPath: String, useOpenCL: Boolean = false): Boolean {
+        return nativeLib.nativeLoadLamaInpainter(modelPath, useOpenCL)
+    }
+
+    fun lamaInpaint(inputBitmap: Bitmap, maskBitmap: Bitmap) {
+        Thread {
+            try {
+                synchronized(stateLock) { _lamaState.value = LamaState.Processing }
+                val width = inputBitmap.width
+                val height = inputBitmap.height
+                val rgbBytes = bitmapToRgbBytes(inputBitmap)
+                val maskBytes = bitmapToRgbBytes(maskBitmap)
+
+                val callback = object : SDCallback {
+                    override fun onProgress(step: Int, totalSteps: Int) {}
+                    override fun onImageProgress(step: Int, totalSteps: Int, rgbData: ByteArray, width: Int, height: Int) {}
+                    override fun onComplete(rgbData: ByteArray, width: Int, height: Int, seed: Long, generationTimeMs: Int) {
+                        val bitmap = createBitmapFromRgb(rgbData, width, height)
+                        synchronized(stateLock) {
+                            _lamaState.value = LamaState.Complete(bitmap, generationTimeMs)
+                        }
+                    }
+                    override fun onError(message: String) {
+                        synchronized(stateLock) { _lamaState.value = LamaState.Error(message) }
+                    }
+                }
+                nativeLib.nativeLamaInpaint(rgbBytes, maskBytes, width, height, callback)
+            } catch (e: Exception) {
+                Log.e(TAG, "LaMa inpaint failed", e)
+                synchronized(stateLock) { _lamaState.value = LamaState.Error(e.message ?: "Unknown error") }
+            }
+        }.start()
+    }
+
+    fun releaseLamaInpainter() {
+        nativeLib.nativeReleaseLamaInpainter()
+        synchronized(stateLock) { _lamaState.value = LamaState.Idle }
+    }
+
+    // ========================================================================
+    // Depth Estimator (Phase 5.5)
+    // ========================================================================
+
+    private val _depthState = MutableStateFlow<DepthState>(DepthState.Idle)
+    val depthState: StateFlow<DepthState> = _depthState.asStateFlow()
+
+    fun loadDepthEstimator(modelPath: String, useOpenCL: Boolean = false): Boolean {
+        return nativeLib.nativeLoadDepthEstimator(modelPath, useOpenCL)
+    }
+
+    fun estimateDepth(inputBitmap: Bitmap) {
+        Thread {
+            try {
+                synchronized(stateLock) { _depthState.value = DepthState.Processing }
+                val width = inputBitmap.width
+                val height = inputBitmap.height
+                val rgbBytes = bitmapToRgbBytes(inputBitmap)
+
+                val callback = object : SDCallback {
+                    override fun onProgress(step: Int, totalSteps: Int) {}
+                    override fun onImageProgress(step: Int, totalSteps: Int, rgbData: ByteArray, width: Int, height: Int) {}
+                    override fun onComplete(rgbData: ByteArray, width: Int, height: Int, seed: Long, generationTimeMs: Int) {
+                        val bitmap = createBitmapFromRgb(rgbData, width, height)
+                        synchronized(stateLock) {
+                            _depthState.value = DepthState.Complete(bitmap, generationTimeMs)
+                        }
+                    }
+                    override fun onError(message: String) {
+                        synchronized(stateLock) { _depthState.value = DepthState.Error(message) }
+                    }
+                }
+                nativeLib.nativeEstimateDepthColorized(rgbBytes, width, height, callback)
+            } catch (e: Exception) {
+                Log.e(TAG, "Depth estimation failed", e)
+                synchronized(stateLock) { _depthState.value = DepthState.Error(e.message ?: "Unknown error") }
+            }
+        }.start()
+    }
+
+    fun releaseDepthEstimator() {
+        nativeLib.nativeReleaseDepthEstimator()
+        synchronized(stateLock) { _depthState.value = DepthState.Idle }
+    }
+
+    // ========================================================================
+    // Style Transfer (Phase 5.6)
+    // ========================================================================
+
+    private val _styleState = MutableStateFlow<StyleState>(StyleState.Idle)
+    val styleState: StateFlow<StyleState> = _styleState.asStateFlow()
+
+    fun loadStyleTransfer(modelPath: String, useOpenCL: Boolean = false): Boolean {
+        return nativeLib.nativeLoadStyleTransfer(modelPath, useOpenCL)
+    }
+
+    fun stylize(contentBitmap: Bitmap, styleBitmap: Bitmap, strength: Float = 1.0f) {
+        Thread {
+            try {
+                synchronized(stateLock) { _styleState.value = StyleState.Processing }
+                val contentRgb = bitmapToRgbBytes(contentBitmap)
+                val styleRgb = bitmapToRgbBytes(styleBitmap)
+
+                val callback = object : SDCallback {
+                    override fun onProgress(step: Int, totalSteps: Int) {}
+                    override fun onImageProgress(step: Int, totalSteps: Int, rgbData: ByteArray, width: Int, height: Int) {}
+                    override fun onComplete(rgbData: ByteArray, width: Int, height: Int, seed: Long, generationTimeMs: Int) {
+                        val bitmap = createBitmapFromRgb(rgbData, width, height)
+                        synchronized(stateLock) {
+                            _styleState.value = StyleState.Complete(bitmap, generationTimeMs)
+                        }
+                    }
+                    override fun onError(message: String) {
+                        synchronized(stateLock) { _styleState.value = StyleState.Error(message) }
+                    }
+                }
+                nativeLib.nativeStylize(
+                    contentRgb, contentBitmap.width, contentBitmap.height,
+                    styleRgb, styleBitmap.width, styleBitmap.height,
+                    strength, callback
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Style transfer failed", e)
+                synchronized(stateLock) { _styleState.value = StyleState.Error(e.message ?: "Unknown error") }
+            }
+        }.start()
+    }
+
+    fun releaseStyleTransfer() {
+        nativeLib.nativeReleaseStyleTransfer()
+        synchronized(stateLock) { _styleState.value = StyleState.Idle }
+    }
+
+    // ========================================================================
     // Private helpers
     // ========================================================================
+
+    private fun bitmapToRgbBytes(bitmap: Bitmap): ByteArray {
+        val width = bitmap.width
+        val height = bitmap.height
+        val pixels = IntArray(width * height)
+        bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+        val rgbBytes = ByteArray(width * height * 3)
+        for (i in pixels.indices) {
+            rgbBytes[i * 3] = ((pixels[i] shr 16) and 0xFF).toByte()
+            rgbBytes[i * 3 + 1] = ((pixels[i] shr 8) and 0xFF).toByte()
+            rgbBytes[i * 3 + 2] = (pixels[i] and 0xFF).toByte()
+        }
+        return rgbBytes
+    }
+
+    private fun createMaskBitmap(maskData: ByteArray, width: Int, height: Int): Bitmap {
+        val bitmap = createBitmap(width, height)
+        val pixels = IntArray(width * height)
+        for (i in 0 until width * height) {
+            if (i < maskData.size) {
+                val v = maskData[i].toInt() and 0xFF
+                pixels[i] = (0xFF shl 24) or (v shl 16) or (v shl 8) or v
+            }
+        }
+        bitmap.setPixels(pixels, 0, width, 0, 0, width, height)
+        return bitmap
+    }
 
     private fun prepareRuntimeDirectory(config: DiffusionRuntimeConfig) {
         runtimeDir = File(context.filesDir, config.runtimeDir).apply {
@@ -538,27 +790,37 @@ class DiffusionManager(private val context: Context) {
             val bufferSize = getAdaptiveBufferSize(context)
             Log.i(TAG, "Adaptive buffer size: ${bufferSize / 1024}KB")
 
-            val tarXzAssetPath = "${config.qnnLibsAssetPath}/qnnlibs.tar.xz"
             val tarXzFile = File(context.cacheDir, "qnnlibs.tar.xz")
 
-            // Phase 1: Copy asset to cache with progress
-            Log.i(TAG, "Copying QNN libraries from assets")
+            // Phase 1: Get tar.xz — from pre-downloaded file or bundled assets
+            val externalSource = config.tarXzSourcePath?.let { File(it) }
+            if (externalSource != null && externalSource.exists()) {
+                // Use pre-downloaded file (e.g. from HuggingFace)
+                Log.i(TAG, "Using pre-downloaded QNN archive: ${externalSource.absolutePath}")
+                updateSetupState(RuntimeSetupState.CopyingAsset(externalSource.length(), externalSource.length()))
+                if (externalSource.absolutePath != tarXzFile.absolutePath) {
+                    externalSource.copyTo(tarXzFile, overwrite = true)
+                }
+            } else {
+                // Fall back to bundled assets
+                val tarXzAssetPath = "${config.qnnLibsAssetPath}/qnnlibs.tar.xz"
+                Log.i(TAG, "Copying QNN libraries from assets")
 
-            // openFd() fails on AAPT-compressed assets — fall back to unknown size
-            val totalAssetBytes = try {
-                context.assets.openFd(tarXzAssetPath).use { it.length }
-            } catch (_: Exception) {
-                -1L
-            }
+                val totalAssetBytes = try {
+                    context.assets.openFd(tarXzAssetPath).use { it.length }
+                } catch (_: Exception) {
+                    -1L
+                }
 
-            context.assets.open(tarXzAssetPath).use { input ->
-                FileOutputStream(tarXzFile).use { output ->
-                    input.copyToWithProgress(output, bufferSize, totalAssetBytes) { written, total ->
-                        updateSetupState(RuntimeSetupState.CopyingAsset(written, total))
+                context.assets.open(tarXzAssetPath).use { input ->
+                    FileOutputStream(tarXzFile).use { output ->
+                        input.copyToWithProgress(output, bufferSize, totalAssetBytes) { written, total ->
+                            updateSetupState(RuntimeSetupState.CopyingAsset(written, total))
+                        }
                     }
                 }
             }
-            Log.i(TAG, "Asset copied: ${tarXzFile.length()} bytes")
+            Log.i(TAG, "Archive ready: ${tarXzFile.length()} bytes")
 
             // Phase 2: Extract tar.xz with progress
             Log.i(TAG, "Extracting QNN libraries from tar.xz")
@@ -580,26 +842,39 @@ class DiffusionManager(private val context: Context) {
         } catch (e: Exception) {
             Log.e(TAG, "Failed to prepare QNN libraries", e)
             updateSetupState(RuntimeSetupState.Error("Failed to prepare QNN libraries: ${e.message}"))
-            throw RuntimeException("Failed to prepare QNN libraries from assets", e)
+            throw RuntimeException("Failed to prepare QNN libraries", e)
         }
     }
 
-    private fun prepareSafetyChecker(assetPath: String = "safety_checker.mnn") {
+    private fun prepareSafetyChecker(config: DiffusionRuntimeConfig) {
         try {
+            if (safetyCheckerFile.exists()) {
+                Log.i(TAG, "Safety checker already exists, skipping")
+                return
+            }
+
             safetyCheckerFile.parentFile?.let { parent ->
                 if (!parent.exists()) parent.mkdirs()
             }
 
-            context.assets.open(assetPath).use { input ->
-                safetyCheckerFile.outputStream().use { output ->
-                    input.copyTo(output)
+            val externalSource = config.safetyCheckerSourcePath?.let { File(it) }
+            if (externalSource != null && externalSource.exists()) {
+                // Use pre-downloaded file
+                Log.i(TAG, "Using pre-downloaded safety checker: ${externalSource.absolutePath}")
+                externalSource.copyTo(safetyCheckerFile, overwrite = true)
+            } else {
+                // Fall back to bundled asset
+                context.assets.open(config.safetyCheckerAssetPath).use { input ->
+                    safetyCheckerFile.outputStream().use { output ->
+                        input.copyTo(output)
+                    }
                 }
             }
             safetyCheckerFile.setReadable(true, true)
-            Log.i(TAG, "Safety checker copied to: ${safetyCheckerFile.absolutePath}")
+            Log.i(TAG, "Safety checker ready at: ${safetyCheckerFile.absolutePath}")
         } catch (e: IOException) {
-            Log.e(TAG, "Failed to copy safety checker model", e)
-            throw RuntimeException("Failed to copy safety checker model", e)
+            Log.e(TAG, "Failed to prepare safety checker model", e)
+            throw RuntimeException("Failed to prepare safety checker model", e)
         }
     }
 

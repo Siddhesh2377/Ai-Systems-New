@@ -54,7 +54,7 @@ void UNetRunner::init(bool use_mnn, bool use_opencl,
     if (use_mnn_) {
         mnn_interpreter_ = MNN::Interpreter::createFromFile(unet_path.c_str());
         if (!mnn_interpreter_)
-            throw std::runtime_error("Failed to create MNN UNET interpreter");
+            throw std::runtime_error("Failed to create MNN UNET interpreter from: " + unet_path);
 
         MNN::ScheduleConfig cfg_unet;
         MNN::BackendConfig bkCfg_unet;

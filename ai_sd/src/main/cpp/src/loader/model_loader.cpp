@@ -390,6 +390,18 @@ bool initialize_models(const SDModelConfig& config) {
         }
     }
 
+    // MNN CPU mode — validate that required MNN model files exist
+    if (use_mnn) {
+        // UNET is loaded lazily in UNetRunner::initIfNeeded(), but we validate now
+        // to fail fast with a clear message instead of crashing during generation
+        std::ifstream unetTest(unetPath);
+        if (!unetTest.good()) {
+            QNN_ERROR("CPU mode requires unet.mnn but file not found: %s", unetPath.c_str());
+            return false;
+        }
+        QNN_INFO("MNN CPU mode: validated unet exists at %s", unetPath.c_str());
+    }
+
     // QNN models — log SoC info before attempting HTP init
     if (!use_mnn) {
         // Read SoC info from sysfs for diagnostics

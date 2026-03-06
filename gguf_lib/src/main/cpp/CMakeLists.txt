@@ -40,13 +40,18 @@ set(LLAMA_OPENSSL OFF CACHE BOOL "" FORCE)
 set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
-# Enable GGML CPU optimizations for ARM
+# Enable GGML CPU optimizations
 set(GGML_CPU ON CACHE BOOL "" FORCE)
-# armv8.6-a enables dotprod + i8mm + fp16 — required for KleidiAI fast paths
-# without this, NDK defaults to baseline armv8-a and KleidiAI kernels are unreachable
-set(GGML_CPU_ARM_ARCH "armv8.6-a+i8mm+dotprod+fp16" CACHE STRING "" FORCE)
-set(GGML_CPU_KLEIDIAI ON CACHE BOOL "" FORCE)
 set(GGML_LTO ON CACHE BOOL "" FORCE)
+
+if(ANDROID_ABI STREQUAL "arm64-v8a")
+    # armv8.6-a enables dotprod + i8mm + fp16 — required for KleidiAI fast paths
+    # without this, NDK defaults to baseline armv8-a and KleidiAI kernels are unreachable
+    set(GGML_CPU_ARM_ARCH "armv8.6-a+i8mm+dotprod+fp16" CACHE STRING "" FORCE)
+    set(GGML_CPU_KLEIDIAI ON CACHE BOOL "" FORCE)
+else()
+    set(GGML_CPU_KLEIDIAI OFF CACHE BOOL "" FORCE)
+endif()
 
 # Linker optimizations:
 # --gc-sections: strip unreferenced functions/data (works with -ffunction-sections)

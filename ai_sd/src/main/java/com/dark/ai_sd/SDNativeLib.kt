@@ -170,9 +170,43 @@ class SDNativeLib {
      */
     external fun nativeGetSocInfo(): String
 
+    // ── Segmenter (Phase 5.3 — MobileSAM) ──
+
+    external fun nativeLoadSegmenter(encoderPath: String, decoderPath: String, useOpenCL: Boolean): Boolean
+    external fun nativeSegmenterEncodeImage(rgbBytes: ByteArray, width: Int, height: Int): Boolean
+    external fun nativeSegmentAtPoint(x: Float, y: Float, callback: SDCallback): Boolean
+    external fun nativeSegmentWithBox(x1: Float, y1: Float, x2: Float, y2: Float, callback: SDCallback): Boolean
+    external fun nativeReleaseSegmenter()
+
+    // ── LaMa Inpainter (Phase 5.4) ──
+
+    external fun nativeLoadLamaInpainter(modelPath: String, useOpenCL: Boolean): Boolean
+    external fun nativeLamaInpaint(rgbBytes: ByteArray, maskBytes: ByteArray, width: Int, height: Int, callback: SDCallback): Boolean
+    external fun nativeReleaseLamaInpainter()
+
+    // ── Depth Estimator (Phase 5.5) ──
+
+    external fun nativeLoadDepthEstimator(modelPath: String, useOpenCL: Boolean): Boolean
+    external fun nativeEstimateDepthColorized(rgbBytes: ByteArray, width: Int, height: Int, callback: SDCallback): Boolean
+    external fun nativeReleaseDepthEstimator()
+
+    // ── Style Transfer (Phase 5.6) ──
+
+    external fun nativeLoadStyleTransfer(modelPath: String, useOpenCL: Boolean): Boolean
+    external fun nativeStylize(contentRgb: ByteArray, contentW: Int, contentH: Int, styleRgb: ByteArray, styleW: Int, styleH: Int, strength: Float, callback: SDCallback): Boolean
+    external fun nativeReleaseStyleTransfer()
+
     companion object {
+        /** Whether the native library loaded successfully (false on unsupported ABIs like x86_64). */
+        val isAvailable: Boolean
+
         init {
-            System.loadLibrary("ai_sd")
+            isAvailable = try {
+                System.loadLibrary("ai_sd")
+                true
+            } catch (_: UnsatisfiedLinkError) {
+                false
+            }
         }
     }
 }

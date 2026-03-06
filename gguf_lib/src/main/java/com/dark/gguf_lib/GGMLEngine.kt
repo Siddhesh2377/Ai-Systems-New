@@ -135,6 +135,10 @@ class GGMLEngine {
      */
     fun supportsThinking(): Boolean = loaded && GGUFNativeLib.nativeSupportsThinking()
 
+    fun setThinkingEnabled(enabled: Boolean) {
+        GGUFNativeLib.nativeSetThinkingEnabled(enabled)
+    }
+
     // ---- Sampling Configuration ----
 
     /**

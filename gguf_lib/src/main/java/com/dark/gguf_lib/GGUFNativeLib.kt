@@ -1,5 +1,6 @@
 package com.dark.gguf_lib
 
+import com.dark.gguf_lib.models.AgentCallback
 import com.dark.gguf_lib.models.EmbeddingCallback
 import com.dark.gguf_lib.models.StreamCallback
 
@@ -84,6 +85,7 @@ object GGUFNativeLib {
     external fun nativeSetUncensored(enabled: Boolean)
     external fun nativeGetUncensored(): Boolean
     external fun nativeSupportsThinking(): Boolean
+    external fun nativeSetThinkingEnabled(enabled: Boolean)
 
     // ---- Optimization Controls ----
 
@@ -124,4 +126,11 @@ object GGUFNativeLib {
     external fun nativeRagInfo(): String?
 
     external fun nativeReleaseRagEngine()
+
+    // ---- Agent Engine ----
+
+    external fun nativeInitAgentSystem(callback: AgentCallback, toolSchemasJson: String): Boolean
+    external fun nativeRunAgentStep(userMessage: String, systemPrompt: String, maxRounds: Int)
+    external fun nativeStopAgent()
+    external fun nativeReleaseAgentSystem()
 }
