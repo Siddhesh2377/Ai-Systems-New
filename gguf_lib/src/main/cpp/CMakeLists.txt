@@ -48,9 +48,10 @@ set(GGML_CPU ON CACHE BOOL "" FORCE)
 set(GGML_LTO ON CACHE BOOL "" FORCE)
 
 if(ANDROID_ABI STREQUAL "arm64-v8a")
-    # armv8.6-a enables dotprod + i8mm + fp16 — required for KleidiAI fast paths
-    # without this, NDK defaults to baseline armv8-a and KleidiAI kernels are unreachable
-    set(GGML_CPU_ARM_ARCH "armv8.6-a+i8mm+dotprod+fp16" CACHE STRING "" FORCE)
+    # Use baseline armv8-a for maximum device compatibility.
+    # KleidiAI handles runtime dispatch to dotprod/i8mm/SVE kernels on capable devices.
+    # armv8.6-a caused SIGILL crashes on devices without i8mm/dotprod (Cortex-A76, A77, etc.)
+    set(GGML_CPU_ARM_ARCH "armv8-a" CACHE STRING "" FORCE)
     set(GGML_CPU_KLEIDIAI ON CACHE BOOL "" FORCE)
 else()
     set(GGML_CPU_KLEIDIAI OFF CACHE BOOL "" FORCE)

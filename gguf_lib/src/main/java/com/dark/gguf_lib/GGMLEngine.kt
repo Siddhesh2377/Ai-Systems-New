@@ -8,10 +8,21 @@ import com.dark.gguf_lib.models.StreamCallback
 import com.dark.gguf_lib.toolcalling.GrammarMode
 import com.dark.gguf_lib.toolcalling.ToolCallingConfig
 import com.dark.gguf_lib.toolcalling.ToolDefinitionBuilder
+import com.dark.unified_inference.capability.SamplerConfigurable
+import com.dark.unified_inference.capability.StatePersistable
+import com.dark.unified_inference.capability.ThinkingCapable
+import com.dark.unified_inference.capability.ToolCallingCapable
+import com.dark.unified_inference.capability.VisionCapable
+import com.dark.unified_inference.model.ModelDescriptor
+import com.dark.unified_inference.model.ModelFormat
+import com.dark.unified_inference.model.ModelSource
+import com.dark.unified_inference.text.TextEngine
+import com.dark.unified_inference.text.TextEvent
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -35,11 +46,11 @@ import org.json.JSONArray
  * // Stream generation
  * engine.generateFlow("Hello!", maxTokens = 512).collect { event ->
  *     when (event) {
- *         is GenerationEvent.Token -> print(event.text)
- *         is GenerationEvent.Done -> println("\nDone")
- *         is GenerationEvent.Metrics -> println("${event.metrics.tokensPerSecond} t/s")
- *         is GenerationEvent.ToolCall -> handleTool(event.name, event.argsJson)
- *         is GenerationEvent.Error -> println("Error: ${event.message}")
+ *         is TextEvent.Token -> print(event.text)
+ *         is TextEvent.Done -> println("\nDone")
+ *         is TextEvent.Metrics -> println("${event.tokensPerSecond} t/s")
+ *         is TextEvent.ToolCall -> handleTool(event.name, event.argsJson)
+ *         is TextEvent.Error -> println("Error: ${event.message}")
  *     }
  * }
  *
@@ -47,9 +58,32 @@ import org.json.JSONArray
  * engine.unload()
  * ```
  */
-class GGMLEngine {
+class GGMLEngine : TextEngine,
+    ToolCallingCapable,
+    VisionCapable,
+    ThinkingCapable,
+    SamplerConfigurable,
+    StatePersistable {
 
     private var loaded = false
+
+    // ── UIS: InferenceEngine ──
+
+    override val engineId: String = "gguf"
+    override val displayName: String = "llama.cpp"
+    override val providerTag: String = "Tool Neuron"
+    override val supportedFormats: List<ModelFormat> = listOf(ModelFormat.GGUF)
+
+    override fun isModelLoaded(): Boolean = loaded
+
+    override suspend fun loadModel(descriptor: ModelDescriptor, params: String?): Boolean {
+        return when (val source = descriptor.source) {
+            is ModelSource.FilePath -> load(source.path)
+            is ModelSource.FileDescriptor -> loadFromFd(source.fd)
+            is ModelSource.ContentUri -> false
+            is ModelSource.Directory -> false
+        }
+    }
 
     // ---- Model Loading ----
 
@@ -113,7 +147,7 @@ class GGMLEngine {
     /**
      * Release the loaded model and free all resources.
      */
-    fun unload() {
+    override suspend fun unload() {
         if (loaded) {
             GGUFNativeLib.nativeRelease()
             loaded = false
@@ -133,9 +167,9 @@ class GGMLEngine {
     /**
      * Check if the loaded model supports thinking/reasoning blocks.
      */
-    fun supportsThinking(): Boolean = loaded && GGUFNativeLib.nativeSupportsThinking()
+    override fun supportsThinking(): Boolean = loaded && GGUFNativeLib.nativeSupportsThinking()
 
-    fun setThinkingEnabled(enabled: Boolean) {
+    override fun setThinkingEnabled(enabled: Boolean) {
         GGUFNativeLib.nativeSetThinkingEnabled(enabled)
     }
 
@@ -165,14 +199,17 @@ class GGMLEngine {
      * dryMultiplier, dryBase, dryAllowedLength, dryPenaltyLastN,
      * xtcProbability, xtcThreshold, mirostat, mirostatTau, mirostatEta, seed
      */
-    fun updateSamplerParams(paramsJson: String): Boolean =
+    override fun updateSamplerParams(paramsJson: String): Boolean =
         GGUFNativeLib.nativeUpdateSamplerParams(paramsJson)
 
     /**
      * Set per-token logit biases.
      * @param biasJson JSON object {"token_id": bias} or array [{"token": id, "bias": val}]
      */
-    fun setLogitBias(biasJson: String) = GGUFNativeLib.nativeSetLogitBias(biasJson)
+    override fun setLogitBias(biasJson: String): Boolean {
+        GGUFNativeLib.nativeSetLogitBias(biasJson)
+        return true
+    }
 
     fun setSystemPrompt(prompt: String) = GGUFNativeLib.nativeSetSystemPrompt(prompt)
     fun setChatTemplate(template: String) = GGUFNativeLib.nativeSetChatTemplate(template)
@@ -180,9 +217,9 @@ class GGMLEngine {
     // ---- Generation ----
 
     /**
-     * Single-turn streaming generation as a Flow.
+     * Single-turn streaming generation as a Flow (raw library events).
      */
-    fun generateFlow(prompt: String, maxTokens: Int = 4096): Flow<GenerationEvent> = callbackFlow {
+    fun generateRawFlow(prompt: String, maxTokens: Int = 4096): Flow<GenerationEvent> = callbackFlow {
         val job = launch(Dispatchers.IO) {
             val cb = object : StreamCallback {
                 override fun onToken(token: String) { trySend(GenerationEvent.Token(token)) }
@@ -200,10 +237,10 @@ class GGMLEngine {
     }
 
     /**
-     * Multi-turn streaming generation as a Flow.
+     * Multi-turn streaming generation as a Flow (raw library events).
      * @param messagesJson JSON array of messages: [{"role":"user","content":"..."},...]
      */
-    fun generateMultiTurnFlow(messagesJson: String, maxTokens: Int = 4096): Flow<GenerationEvent> = callbackFlow {
+    fun generateMultiTurnRawFlow(messagesJson: String, maxTokens: Int = 4096): Flow<GenerationEvent> = callbackFlow {
         val job = launch(Dispatchers.IO) {
             val cb = object : StreamCallback {
                 override fun onToken(token: String) { trySend(GenerationEvent.Token(token)) }
@@ -219,6 +256,14 @@ class GGMLEngine {
         }
         awaitClose { job.cancel(); GGUFNativeLib.nativeStopGeneration() }
     }
+
+    // ── UIS: TextEngine ──
+
+    override fun generateFlow(prompt: String, maxTokens: Int): Flow<TextEvent> =
+        generateRawFlow(prompt, maxTokens).map { it.toTextEvent() }
+
+    override fun generateMultiTurnFlow(messagesJson: String, maxTokens: Int): Flow<TextEvent> =
+        generateMultiTurnRawFlow(messagesJson, maxTokens).map { it.toTextEvent() }
 
     /**
      * Simple non-streaming generation. Returns the complete text.
@@ -242,12 +287,12 @@ class GGMLEngine {
         GenerationResult(text = text.toString(), success = ok && error == null, metrics = metrics, error = error)
     }
 
-    fun stopGeneration() = GGUFNativeLib.nativeStopGeneration()
+    override fun stopGeneration() = GGUFNativeLib.nativeStopGeneration()
 
     // ---- Tool Calling ----
 
     /**
-     * Enable tool calling with a list of tool definitions.
+     * Enable tool calling with a list of tool definitions (convenience overload).
      */
     fun enableToolCalling(
         tools: List<ToolDefinitionBuilder.ToolDefinition>,
@@ -260,6 +305,15 @@ class GGMLEngine {
         GGUFNativeLib.nativeSetTypedGrammar(config.useTypedGrammar)
     }
 
+    // ── UIS: ToolCallingCapable ──
+
+    override fun enableToolCalling(toolsJson: String, grammarMode: Int, useTypedGrammar: Boolean): Boolean {
+        GGUFNativeLib.nativeSetToolsJson(toolsJson)
+        GGUFNativeLib.nativeSetGrammarMode(grammarMode)
+        GGUFNativeLib.nativeSetTypedGrammar(useTypedGrammar)
+        return true
+    }
+
     /**
      * Set tools from raw OpenAI-format JSON string.
      */
@@ -268,9 +322,9 @@ class GGMLEngine {
     /**
      * Disable tool calling.
      */
-    fun clearTools() = GGUFNativeLib.nativeSetToolsJson("")
+    override fun clearTools() = GGUFNativeLib.nativeSetToolsJson("")
 
-    fun isToolCallingSupported(): Boolean = loaded && GGUFNativeLib.nativeIsToolCallingSupported()
+    override fun isToolCallingSupported(): Boolean = loaded && GGUFNativeLib.nativeIsToolCallingSupported()
 
     // ---- Control Vectors ----
 
@@ -283,11 +337,11 @@ class GGMLEngine {
 
     fun clearControlVector() = GGUFNativeLib.nativeClearControlVector()
 
-    // ---- KV Cache State ----
+    // ── UIS: StatePersistable ──
 
-    fun getStateSize(): Long = if (loaded) GGUFNativeLib.nativeGetStateSize() else 0
-    fun stateSaveToFile(path: String): Boolean = GGUFNativeLib.nativeStateSaveToFile(path)
-    fun stateLoadFromFile(path: String): Boolean = GGUFNativeLib.nativeStateLoadFromFile(path)
+    override fun getStateSize(): Long = if (loaded) GGUFNativeLib.nativeGetStateSize() else 0
+    override fun stateSaveToFile(path: String): Boolean = GGUFNativeLib.nativeStateSaveToFile(path)
+    override fun stateLoadFromFile(path: String): Boolean = GGUFNativeLib.nativeStateLoadFromFile(path)
 
     // get current KV cache utilization (0.0 = empty, 1.0 = full)
     fun getContextUsage(): Float = if (loaded) GGUFNativeLib.nativeGetContextUsage() else 0f
@@ -374,7 +428,7 @@ class GGMLEngine {
     fun getVlmDefaultMarker(): String = GGUFNativeLib.nativeVlmGetDefaultMarker()
 
     /**
-     * Stream generation with text + images.
+     * Stream generation with text + images (raw library events).
      * @param messagesJson JSON array of chat messages. User message content should
      *                     contain the image marker where each image should appear.
      * @param imageData List of raw image file bytes (JPEG/PNG)
@@ -401,6 +455,21 @@ class GGMLEngine {
         }
         awaitClose { job.cancel(); GGUFNativeLib.nativeStopGeneration() }
     }
+
+    // ── UIS: VisionCapable ──
+
+    override fun loadVisionProjector(descriptor: ModelDescriptor): Boolean {
+        return when (val source = descriptor.source) {
+            is ModelSource.FilePath -> loadVlmProjector(source.path)
+            is ModelSource.FileDescriptor -> loadVlmProjectorFromFd(source.fd)
+            else -> false
+        }
+    }
+
+    override fun releaseVisionProjector() = releaseVlmProjector()
+
+    override fun generateVisionFlow(messagesJson: String, imageData: List<ByteArray>, maxTokens: Int): Flow<TextEvent> =
+        generateVlmFlow(messagesJson, imageData, maxTokens).map { it.toTextEvent() }
 
     // ---- Device Tier ----
 
@@ -431,6 +500,23 @@ class GGMLEngine {
             }
         }
     }
+}
+
+// ---- Mapper ----
+
+private fun GenerationEvent.toTextEvent(): TextEvent = when (this) {
+    is GenerationEvent.Token -> TextEvent.Token(text)
+    is GenerationEvent.ToolCall -> TextEvent.ToolCall(name, argsJson)
+    is GenerationEvent.Done -> TextEvent.Done
+    is GenerationEvent.Error -> TextEvent.Error(message)
+    is GenerationEvent.Progress -> TextEvent.Progress(progress)
+    is GenerationEvent.Metrics -> TextEvent.Metrics(
+        tokensPerSecond = metrics.tokensPerSecond,
+        timeToFirstTokenMs = metrics.timeToFirstTokenMs,
+        totalTimeMs = metrics.totalTimeMs,
+        tokensEvaluated = metrics.tokensEvaluated,
+        tokensPredicted = metrics.tokensPredicted
+    )
 }
 
 // ---- Data classes ----

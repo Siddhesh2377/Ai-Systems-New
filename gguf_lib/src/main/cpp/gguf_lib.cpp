@@ -1198,6 +1198,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModelFromFd(
     env->DeleteLocalRef(jpath);
 
     close(owned_fd);
+    close(fd);  // close the original fd — llama.cpp has its own via /proc/self/fd
     return result;
 }
 
