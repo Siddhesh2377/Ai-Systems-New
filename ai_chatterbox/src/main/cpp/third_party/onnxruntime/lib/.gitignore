@@ -1,4 +1,0 @@
-# ONNX Runtime .so files extracted from the Gradle AAR cache.
-# Do NOT commit these — they're ~25MB each and are derived from the AAR dependency.
-# Run the extract script or build once to populate: the AAR jni/ will be used at runtime.
-*.so

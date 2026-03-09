@@ -40,8 +40,6 @@ android {
 }
 
 dependencies {
-    implementation(project(":ai_chatterbox"))
-
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
