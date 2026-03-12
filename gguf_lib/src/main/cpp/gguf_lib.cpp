@@ -314,10 +314,6 @@ static void sync_vlm_bridge_from_state() {
     g_vlm.bridge.response.clear();
 }
 
-static void sync_state_from_vlm_bridge() {
-    g_state.n_past = g_vlm.bridge.n_past;
-}
-
 // Helper: Rebuild sampler from current params.
 // force=false skips rebuild if only simple params changed (preserves repetition penalty history).
 // force=true always rebuilds (needed when grammar, logit bias, or structural params change).
@@ -2151,13 +2147,15 @@ static std::string ensure_vlm_markers(const std::string & prompt, size_t media_c
         return prompt;
     }
 
-    if (count_marker_occurrences(prompt, marker) >= media_count) {
+    const size_t existing_markers = count_marker_occurrences(prompt, marker);
+    if (existing_markers >= media_count) {
         return prompt;
     }
 
+    const size_t missing_markers = media_count - existing_markers;
     std::string prefixed;
-    prefixed.reserve(prompt.size() + media_count * (marker.size() + 1));
-    for (size_t i = 0; i < media_count; ++i) {
+    prefixed.reserve(prompt.size() + missing_markers * (marker.size() + 1));
+    for (size_t i = 0; i < missing_markers; ++i) {
         if (!prefixed.empty()) prefixed += '\n';
         prefixed += marker;
     }
@@ -2268,6 +2266,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmRelease(JNIEnv *, jobject) {
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmIsLoaded(JNIEnv *, jobject) {
+    std::lock_guard<std::mutex> lock(g_state.gen_mutex);
     return ggml_engine_vlm_is_loaded(g_vlm.projector) ? JNI_TRUE : JNI_FALSE;
 }
 
@@ -2275,11 +2274,16 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmIsLoaded(JNIEnv *, jobject) {
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGetInfo(JNIEnv * env, jobject) {
-    if (!ggml_engine_vlm_is_loaded(g_vlm.projector)) {
-        return nullptr;
+    char * info_json = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_state.gen_mutex);
+        if (!ggml_engine_vlm_is_loaded(g_vlm.projector)) {
+            return nullptr;
+        }
+
+        info_json = ggml_engine_vlm_info_json(g_vlm.projector);
     }
 
-    char * info_json = ggml_engine_vlm_info_json(g_vlm.projector);
     if (!info_json) {
         return nullptr;
     }
