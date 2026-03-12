@@ -27,8 +27,14 @@ add_compile_options(
     -fdata-sections
 )
 
-# Path to llama.cpp
-set(LLAMA_DIR "/home/home/dev/include/llama.cpp")
+# Path to llama.cpp-android checkout
+set(LLAMA_DIR_DEFAULT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../llama.cpp-android")
+set(LLAMA_DIR "${LLAMA_DIR_DEFAULT}" CACHE PATH "Path to llama.cpp-android checkout")
+get_filename_component(LLAMA_DIR "${LLAMA_DIR}" ABSOLUTE)
+
+if (NOT EXISTS "${LLAMA_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR "LLAMA_DIR must point to llama.cpp-android. Got: ${LLAMA_DIR}")
+endif()
 
 # Build llama.cpp as static libraries
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -40,12 +46,18 @@ set(LLAMA_OPENSSL OFF CACHE BOOL "" FORCE)
 set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
-# Enable GGML CPU optimizations for ARM
+# Enable GGML CPU optimizations.
 set(GGML_CPU ON CACHE BOOL "" FORCE)
-# armv8.6-a enables dotprod + i8mm + fp16 — required for KleidiAI fast paths
-# without this, NDK defaults to baseline armv8-a and KleidiAI kernels are unreachable
-set(GGML_CPU_ARM_ARCH "armv8.6-a+i8mm+dotprod+fp16" CACHE STRING "" FORCE)
-set(GGML_CPU_KLEIDIAI ON CACHE BOOL "" FORCE)
+if (ANDROID_ABI STREQUAL "arm64-v8a")
+    # armv8.6-a enables dotprod + i8mm + fp16 — required for KleidiAI fast paths
+    # without this, NDK defaults to baseline armv8-a and KleidiAI kernels are unreachable
+    set(GGML_CPU_ARM_ARCH "armv8.6-a+i8mm+dotprod+fp16" CACHE STRING "" FORCE)
+    set(GGML_CPU_KLEIDIAI ON CACHE BOOL "" FORCE)
+else()
+    # KleidiAI is ARM-only and fails to compile for emulator x86_64 builds.
+    set(GGML_CPU_ARM_ARCH "" CACHE STRING "" FORCE)
+    set(GGML_CPU_KLEIDIAI OFF CACHE BOOL "" FORCE)
+endif()
 set(GGML_LTO ON CACHE BOOL "" FORCE)
 
 # Linker optimizations:
@@ -56,12 +68,39 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--gc-sections -W
 
 add_subdirectory(${LLAMA_DIR} ${CMAKE_CURRENT_BINARY_DIR}/llama)
 
+set(VLM_SOURCES
+    ${LLAMA_DIR}/engine/ggml-engine-vlm.cpp
+    ${LLAMA_DIR}/engine/vlm/clip.cpp
+    ${LLAMA_DIR}/engine/vlm/mtmd.cpp
+    ${LLAMA_DIR}/engine/vlm/mtmd-helper.cpp
+    ${LLAMA_DIR}/engine/vlm/mtmd-audio.cpp
+    ${LLAMA_DIR}/engine/vlm/models/cogvlm.cpp
+    ${LLAMA_DIR}/engine/vlm/models/conformer.cpp
+    ${LLAMA_DIR}/engine/vlm/models/glm4v.cpp
+    ${LLAMA_DIR}/engine/vlm/models/internvl.cpp
+    ${LLAMA_DIR}/engine/vlm/models/kimik25.cpp
+    ${LLAMA_DIR}/engine/vlm/models/kimivl.cpp
+    ${LLAMA_DIR}/engine/vlm/models/llama4.cpp
+    ${LLAMA_DIR}/engine/vlm/models/llava.cpp
+    ${LLAMA_DIR}/engine/vlm/models/minicpmv.cpp
+    ${LLAMA_DIR}/engine/vlm/models/mobilenetv5.cpp
+    ${LLAMA_DIR}/engine/vlm/models/nemotron-v2-vl.cpp
+    ${LLAMA_DIR}/engine/vlm/models/paddleocr.cpp
+    ${LLAMA_DIR}/engine/vlm/models/pixtral.cpp
+    ${LLAMA_DIR}/engine/vlm/models/qwen2vl.cpp
+    ${LLAMA_DIR}/engine/vlm/models/qwen3vl.cpp
+    ${LLAMA_DIR}/engine/vlm/models/siglip.cpp
+    ${LLAMA_DIR}/engine/vlm/models/whisper-enc.cpp
+    ${LLAMA_DIR}/engine/vlm/models/youtuvl.cpp
+)
+
 # JNI bridge + engine libraries
 add_library(${CMAKE_PROJECT_NAME} SHARED
     gguf_lib.cpp
     ${LLAMA_DIR}/engine/tool-manager.cpp
     ${LLAMA_DIR}/engine/character-engine.cpp
-    ${LLAMA_DIR}/engine/rag-engine.cpp)
+    ${LLAMA_DIR}/engine/rag-engine.cpp
+    ${VLM_SOURCES})
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     ${LLAMA_DIR}/include
@@ -69,15 +108,17 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     ${LLAMA_DIR}/ggml/include
     ${LLAMA_DIR}/vendor
     ${LLAMA_DIR}/engine
+    ${LLAMA_DIR}/engine/vlm
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
 # JNI bridge flags (inherits global C/CXX flags)
 # Can't use -fno-exceptions or -fno-rtti — nlohmann::json and JNI error handling need them
-target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE -O3 -DNDEBUG)
+target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE -O3 -DNDEBUG -Wno-cast-qual)
 
 target_link_libraries(${CMAKE_PROJECT_NAME}
     llama
     common
+    ggml
     android
     log)

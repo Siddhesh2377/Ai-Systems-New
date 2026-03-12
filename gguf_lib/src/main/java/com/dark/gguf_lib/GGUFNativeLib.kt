@@ -42,8 +42,24 @@ object GGUFNativeLib {
 
     external fun nativeSetSystemPrompt(prompt: String)
     external fun nativeSetChatTemplate(template: String)
+    external fun nativeSetThinkingEnabled(enabled: Boolean)
     external fun nativeUpdateSamplerParams(paramsJson: String): Boolean
     external fun nativeSetLogitBias(biasJson: String)
+
+    // ---- VLM ----
+
+    external fun nativeVlmLoadProjector(path: String, nThreads: Int): Boolean
+    external fun nativeVlmLoadProjectorFromFd(fd: Int, nThreads: Int): Boolean
+    external fun nativeVlmRelease()
+    external fun nativeVlmIsLoaded(): Boolean
+    external fun nativeVlmGetInfo(): String?
+    external fun nativeVlmGetDefaultMarker(): String
+    external fun nativeVlmGenerateStream(
+        prompt: String,
+        media: Array<ByteArray>,
+        maxTokens: Int,
+        callback: StreamCallback
+    ): Boolean
 
     // ---- Generation ----
 

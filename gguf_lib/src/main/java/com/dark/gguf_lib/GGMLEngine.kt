@@ -115,6 +115,9 @@ class GGMLEngine {
      */
     fun unload() {
         if (loaded) {
+            if (GGUFNativeLib.nativeVlmIsLoaded()) {
+                GGUFNativeLib.nativeVlmRelease()
+            }
             GGUFNativeLib.nativeRelease()
             loaded = false
         }
@@ -134,6 +137,41 @@ class GGMLEngine {
      * Check if the loaded model supports thinking/reasoning blocks.
      */
     fun supportsThinking(): Boolean = loaded && GGUFNativeLib.nativeSupportsThinking()
+
+    fun setThinkingEnabled(enabled: Boolean) {
+        if (loaded) {
+            GGUFNativeLib.nativeSetThinkingEnabled(enabled)
+        }
+    }
+
+    // ---- VLM ----
+
+    fun loadVlmProjector(path: String, threads: Int = 0): Boolean =
+        loaded && GGUFNativeLib.nativeVlmLoadProjector(path, threads)
+
+    fun loadVlmProjectorFromFd(fd: Int, threads: Int = 0): Boolean =
+        loaded && GGUFNativeLib.nativeVlmLoadProjectorFromFd(fd, threads)
+
+    fun loadVlmProjector(context: Context, uri: Uri, threads: Int = 0): Boolean {
+        val pfd = context.contentResolver.openFileDescriptor(uri, "r") ?: return false
+        return try {
+            loadVlmProjectorFromFd(pfd.fd, threads)
+        } finally {
+            pfd.close()
+        }
+    }
+
+    fun releaseVlmProjector() {
+        if (loaded && GGUFNativeLib.nativeVlmIsLoaded()) {
+            GGUFNativeLib.nativeVlmRelease()
+        }
+    }
+
+    fun isVlmLoaded(): Boolean = loaded && GGUFNativeLib.nativeVlmIsLoaded()
+
+    fun getVlmInfoJson(): String? = if (isVlmLoaded()) GGUFNativeLib.nativeVlmGetInfo() else null
+
+    fun getVlmDefaultMarker(): String = GGUFNativeLib.nativeVlmGetDefaultMarker()
 
     // ---- Sampling Configuration ----
 
@@ -212,6 +250,27 @@ class GGMLEngine {
                 }
             }
             GGUFNativeLib.nativeGenerateStreamMultiTurn(messagesJson, maxTokens, cb)
+        }
+        awaitClose { job.cancel(); GGUFNativeLib.nativeStopGeneration() }
+    }
+
+    fun generateVlmFlow(
+        prompt: String,
+        media: List<ByteArray>,
+        maxTokens: Int = 4096,
+    ): Flow<GenerationEvent> = callbackFlow {
+        val job = launch(Dispatchers.IO) {
+            val cb = object : StreamCallback {
+                override fun onToken(token: String) { trySend(GenerationEvent.Token(token)) }
+                override fun onToolCall(name: String, argsJson: String) { trySend(GenerationEvent.ToolCall(name, argsJson)) }
+                override fun onDone() { trySend(GenerationEvent.Done); channel.close() }
+                override fun onError(message: String) { trySend(GenerationEvent.Error(message)); channel.close() }
+                override fun onProgress(progress: Float) { trySend(GenerationEvent.Progress(progress)) }
+                override fun onMetrics(tps: Float, ttftMs: Float, totalMs: Float, tokensEvaluated: Int, tokensPredicted: Int, modelMB: Float, ctxMB: Float, peakMB: Float, memPct: Float) {
+                    trySend(GenerationEvent.Metrics(DecodingMetrics(tps, ttftMs, totalMs, tokensEvaluated, tokensPredicted, modelMB, ctxMB, peakMB, memPct)))
+                }
+            }
+            GGUFNativeLib.nativeVlmGenerateStream(prompt, media.toTypedArray(), maxTokens, cb)
         }
         awaitClose { job.cancel(); GGUFNativeLib.nativeStopGeneration() }
     }

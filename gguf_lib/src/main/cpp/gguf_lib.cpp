@@ -22,6 +22,7 @@
 #include "common.h"
 #include "sampling.h"
 #include "chat.h"
+#include "ggml-engine-internal.h"
 
 #include "tool-manager.h"
 #include "character-engine.h"
@@ -109,6 +110,8 @@ static struct {
     // Config
     std::string system_prompt;
     std::string chat_template_override;
+    bool thinking_enabled = true;
+    bool flash_attn = false;
 
     // Tool calling
     std::string tools_json;
@@ -160,6 +163,11 @@ static struct {
     std::string prompt_cache_dir;
 
 } g_state;
+
+static struct {
+    ggml_engine bridge{};
+    ggml_engine_vlm_t * projector = nullptr;
+} g_vlm;
 
 // Helper: GGML type string to enum
 
@@ -270,6 +278,44 @@ static int batch_thread_count() {
 static int auto_thread_count() {
     int n = std::thread::hardware_concurrency();
     return std::max(1, (n * 3) / 4);
+}
+
+static void reset_vlm_bridge_engine() {
+    g_vlm.bridge.params = {};
+    g_vlm.bridge.model = nullptr;
+    g_vlm.bridge.ctx = nullptr;
+    g_vlm.bridge.vocab = nullptr;
+    g_vlm.bridge.response.clear();
+    g_vlm.bridge.cancelled.store(false);
+    g_vlm.bridge.perf = {};
+    g_vlm.bridge.n_past = 0;
+}
+
+static void release_vlm_projector_locked() {
+    if (g_vlm.projector) {
+        ggml_engine_vlm_free(g_vlm.projector);
+        g_vlm.projector = nullptr;
+    }
+    reset_vlm_bridge_engine();
+}
+
+static void sync_vlm_bridge_from_state() {
+    reset_vlm_bridge_engine();
+    g_vlm.bridge.params.n_ctx = g_state.ctx ? llama_n_ctx(g_state.ctx) : 0;
+    g_vlm.bridge.params.n_batch = 512;
+    g_vlm.bridge.params.n_threads = g_state.n_threads_decode > 0 ? g_state.n_threads_decode : 1;
+    g_vlm.bridge.params.n_threads_batch = g_state.n_threads_batch > 0 ? g_state.n_threads_batch : g_vlm.bridge.params.n_threads;
+    g_vlm.bridge.params.flash_attn = g_state.flash_attn;
+    g_vlm.bridge.model = g_state.model;
+    g_vlm.bridge.ctx = g_state.ctx;
+    g_vlm.bridge.vocab = g_state.model ? llama_model_get_vocab(g_state.model) : nullptr;
+    g_vlm.bridge.n_past = g_state.n_past;
+    g_vlm.bridge.cancelled.store(g_state.cancel_flag.load());
+    g_vlm.bridge.response.clear();
+}
+
+static void sync_state_from_vlm_bridge() {
+    g_state.n_past = g_vlm.bridge.n_past;
 }
 
 // Helper: Rebuild sampler from current params.
@@ -389,6 +435,7 @@ static chat_template_result apply_chat_template(const std::vector<common_chat_ms
     common_chat_templates_inputs inputs;
     inputs.messages = messages;
     inputs.add_generation_prompt = add_generation_prompt;
+    inputs.enable_thinking = g_state.thinking_enabled;
     inputs.use_jinja = true;
 
     // Add tools if configured
@@ -439,6 +486,7 @@ static chat_template_result apply_chat_template(const std::vector<common_chat_ms
             common_chat_templates_inputs aug_inputs;
             aug_inputs.messages = augmented;
             aug_inputs.add_generation_prompt = add_generation_prompt;
+            aug_inputs.enable_thinking = g_state.thinking_enabled;
             aug_inputs.use_jinja = true;
             auto aug_result = common_chat_templates_apply(g_state.chat_templates.get(), aug_inputs);
             out.prompt = aug_result.prompt;
@@ -698,6 +746,112 @@ struct token_batcher {
         return true;
     }
 };
+
+static void send_stream_error(JNIEnv * env, jobject callback, const std::string & message) {
+    if (!g_onError || !callback) return;
+    jstring jerr = env->NewStringUTF(message.c_str());
+    if (!jerr) {
+        env->ExceptionClear();
+        return;
+    }
+    env->CallVoidMethod(callback, g_onError, jerr);
+    env->DeleteLocalRef(jerr);
+}
+
+static bool copy_media_payloads(
+        JNIEnv * env,
+        jobjectArray media_array,
+        std::vector<std::vector<unsigned char>> & payloads,
+        std::string & error) {
+    if (!media_array) {
+        error = "Media payload is null";
+        return false;
+    }
+
+    const jsize count = env->GetArrayLength(media_array);
+    if (count <= 0) {
+        error = "Media payload is empty";
+        return false;
+    }
+
+    payloads.reserve((size_t) count);
+    for (jsize i = 0; i < count; ++i) {
+        auto * media = reinterpret_cast<jbyteArray>(env->GetObjectArrayElement(media_array, i));
+        if (!media) {
+            error = "Media payload contains a null item";
+            return false;
+        }
+
+        const jsize len = env->GetArrayLength(media);
+        if (len <= 0) {
+            env->DeleteLocalRef(media);
+            error = "Media payload contains an empty item";
+            return false;
+        }
+
+        auto & blob = payloads.emplace_back((size_t) len);
+        env->GetByteArrayRegion(media, 0, len, reinterpret_cast<jbyte *>(blob.data()));
+        env->DeleteLocalRef(media);
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            error = "Failed to read media payload";
+            return false;
+        }
+    }
+
+    return true;
+}
+
+struct vlm_sampling_bundle {
+    ggml_engine_sampling params{};
+    std::vector<std::string> stop_storage;
+};
+
+static vlm_sampling_bundle build_vlm_sampling(
+        const chat_template_result & tmpl_result,
+        int max_tokens) {
+    vlm_sampling_bundle bundle;
+    auto & sampling = bundle.params;
+    sampling.n_predict = max_tokens;
+    sampling.temperature = g_state.sampling_params.temp;
+    sampling.top_k = g_state.sampling_params.top_k;
+    sampling.top_p = g_state.sampling_params.top_p;
+    sampling.min_p = g_state.sampling_params.min_p;
+    sampling.repeat_penalty = g_state.sampling_params.penalty_repeat;
+    sampling.repeat_last_n = g_state.sampling_params.penalty_last_n;
+    sampling.frequency_penalty = g_state.sampling_params.penalty_freq;
+    sampling.presence_penalty = g_state.sampling_params.penalty_present;
+    sampling.seed = g_state.sampling_params.seed;
+
+    const size_t stop_capacity = sizeof(sampling.stop_sequences) / sizeof(sampling.stop_sequences[0]);
+    const size_t stop_count = std::min(tmpl_result.stops.size(), stop_capacity);
+    bundle.stop_storage.reserve(stop_count);
+    for (size_t i = 0; i < stop_count; ++i) {
+        bundle.stop_storage.push_back(tmpl_result.stops[i]);
+        sampling.stop_sequences[i] = bundle.stop_storage.back().c_str();
+    }
+    sampling.stop_sequence_count = (int) stop_count;
+
+    return bundle;
+}
+
+struct vlm_stream_callback_ctx {
+    JNIEnv * env;
+    jobject callback;
+    token_batcher batcher;
+
+    vlm_stream_callback_ctx(JNIEnv * e, jobject cb)
+        : env(e), callback(cb), batcher(e, cb, g_onToken) {}
+};
+
+static bool jni_vlm_token_callback(const char * token_text, void * user_data) {
+    auto * cb = static_cast<vlm_stream_callback_ctx *>(user_data);
+    if (!cb->batcher.add(token_text, strlen(token_text))) {
+        cb->env->ExceptionClear();
+        return false;
+    }
+    return !g_vlm.bridge.cancelled.load();
+}
 
 // Helper: Tokenize a string
 
@@ -1024,6 +1178,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModel(
     std::lock_guard<std::mutex> lock(g_state.gen_mutex);
 
     // Clean up any existing model
+    release_vlm_projector_locked();
     if (g_state.sampler) { common_sampler_free(g_state.sampler); g_state.sampler = nullptr; }
     if (g_state.ctx) { llama_free(g_state.ctx); g_state.ctx = nullptr; }
     if (g_state.model) { llama_model_free(g_state.model); g_state.model = nullptr; }
@@ -1038,6 +1193,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModel(
     const char * cacheV = env->GetStringUTFChars(jCacheTypeV, nullptr);
 
     LOGI("Loading model: %s (ctx=%d threads=%d flash=%d)", path, nCtx, nThreads, flashAttn);
+    g_state.flash_attn = flashAttn;
 
     // Model params
     auto mparams = llama_model_default_params();
@@ -1866,11 +2022,432 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStreamMultiTurn(
     return JNI_TRUE;
 }
 
+enum class vlm_media_kind {
+    unknown,
+    image,
+    audio,
+};
+
+static vlm_media_kind detect_vlm_media_kind(const std::vector<unsigned char> & data) {
+    if (data.size() >= 8 &&
+        data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G' &&
+        data[4] == 0x0d && data[5] == 0x0a && data[6] == 0x1a && data[7] == 0x0a) {
+        return vlm_media_kind::image;
+    }
+    if (data.size() >= 3 && data[0] == 0xff && data[1] == 0xd8 && data[2] == 0xff) {
+        return vlm_media_kind::image;
+    }
+    if (data.size() >= 6 &&
+        ((memcmp(data.data(), "GIF87a", 6) == 0) || (memcmp(data.data(), "GIF89a", 6) == 0))) {
+        return vlm_media_kind::image;
+    }
+    if (data.size() >= 12 &&
+        memcmp(data.data(), "RIFF", 4) == 0 &&
+        memcmp(data.data() + 8, "WEBP", 4) == 0) {
+        return vlm_media_kind::image;
+    }
+    if (data.size() >= 2 && data[0] == 'B' && data[1] == 'M') {
+        return vlm_media_kind::image;
+    }
+
+    if (data.size() >= 12 &&
+        memcmp(data.data(), "RIFF", 4) == 0 &&
+        memcmp(data.data() + 8, "WAVE", 4) == 0) {
+        return vlm_media_kind::audio;
+    }
+    if (data.size() >= 4 && memcmp(data.data(), "fLaC", 4) == 0) {
+        return vlm_media_kind::audio;
+    }
+    if (data.size() >= 4 && memcmp(data.data(), "OggS", 4) == 0) {
+        return vlm_media_kind::audio;
+    }
+    if (data.size() >= 3 && memcmp(data.data(), "ID3", 3) == 0) {
+        return vlm_media_kind::audio;
+    }
+    if (data.size() >= 8 && memcmp(data.data() + 4, "ftyp", 4) == 0) {
+        return vlm_media_kind::audio;
+    }
+    if (data.size() >= 2 && data[0] == 0xff && (data[1] & 0xe0) == 0xe0) {
+        return vlm_media_kind::audio;
+    }
+
+    return vlm_media_kind::unknown;
+}
+
+static bool infer_vlm_media_mode(
+        const ggml_engine_vlm_t * projector,
+        const std::vector<std::vector<unsigned char>> & payloads,
+        bool & use_audio,
+        std::string & error) {
+    const bool supports_audio = ggml_engine_vlm_supports_audio(projector);
+    const bool supports_vision = ggml_engine_vlm_supports_vision(projector);
+
+    bool saw_audio = false;
+    bool saw_image = false;
+    for (const auto & payload : payloads) {
+        switch (detect_vlm_media_kind(payload)) {
+            case vlm_media_kind::audio:
+                saw_audio = true;
+                break;
+            case vlm_media_kind::image:
+                saw_image = true;
+                break;
+            case vlm_media_kind::unknown:
+                break;
+        }
+    }
+
+    if (saw_audio && saw_image) {
+        error = "Mixed image and audio inputs are not supported in one request";
+        return false;
+    }
+
+    if (saw_audio) {
+        if (!supports_audio) {
+            error = "Loaded projector does not support audio inputs";
+            return false;
+        }
+        use_audio = true;
+        return true;
+    }
+
+    if (saw_image) {
+        if (!supports_vision) {
+            error = "Loaded projector does not support image inputs";
+            return false;
+        }
+        use_audio = false;
+        return true;
+    }
+
+    if (supports_audio && !supports_vision) {
+        use_audio = true;
+        return true;
+    }
+
+    if (supports_vision && !supports_audio) {
+        use_audio = false;
+        return true;
+    }
+
+    error = "Unable to infer whether the provided media payload is audio or image";
+    return false;
+}
+
+static size_t count_marker_occurrences(const std::string & text, const std::string & marker) {
+    if (marker.empty()) return 0;
+    size_t count = 0;
+    size_t pos = 0;
+    while ((pos = text.find(marker, pos)) != std::string::npos) {
+        ++count;
+        pos += marker.size();
+    }
+    return count;
+}
+
+static std::string ensure_vlm_markers(const std::string & prompt, size_t media_count) {
+    const std::string marker = ggml_engine_vlm_default_marker();
+    if (media_count == 0 || marker.empty()) {
+        return prompt;
+    }
+
+    if (count_marker_occurrences(prompt, marker) >= media_count) {
+        return prompt;
+    }
+
+    std::string prefixed;
+    prefixed.reserve(prompt.size() + media_count * (marker.size() + 1));
+    for (size_t i = 0; i < media_count; ++i) {
+        if (!prefixed.empty()) prefixed += '\n';
+        prefixed += marker;
+    }
+    if (!prompt.empty()) {
+        prefixed += '\n';
+        prefixed += prompt;
+    }
+    return prefixed;
+}
+
+static void reset_text_session_after_vlm() {
+    if (g_state.ctx) {
+        llama_memory_t mem = llama_get_memory(g_state.ctx);
+        if (mem) {
+            llama_memory_clear(mem, true);
+        }
+    }
+    g_state.n_past = 0;
+    g_state.session_tokens.clear();
+    g_state.prev_prompt_tokens.clear();
+    g_state.n_system_tokens = 0;
+}
+
+// JNI: nativeVlmLoadProjector
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmLoadProjector(
+        JNIEnv * env, jobject, jstring jpath, jint nThreads) {
+    std::lock_guard<std::mutex> lock(g_state.gen_mutex);
+
+    if (!g_state.model || !g_state.ctx) {
+        LOGE("Cannot load projector before loading a base model");
+        return JNI_FALSE;
+    }
+
+    const char * path = env->GetStringUTFChars(jpath, nullptr);
+    if (!path) {
+        return JNI_FALSE;
+    }
+
+    release_vlm_projector_locked();
+    sync_vlm_bridge_from_state();
+
+    ggml_engine_vlm_params params = ggml_engine_vlm_default_params();
+    params.n_threads = nThreads > 0 ? nThreads : g_vlm.bridge.params.n_threads_batch;
+
+    g_vlm.projector = ggml_engine_vlm_load(&g_vlm.bridge, path, params);
+    env->ReleaseStringUTFChars(jpath, path);
+
+    if (!g_vlm.projector) {
+        LOGE("Failed to load VLM projector");
+        release_vlm_projector_locked();
+        return JNI_FALSE;
+    }
+
+    LOGI("VLM projector loaded");
+    return JNI_TRUE;
+}
+
+// JNI: nativeVlmLoadProjectorFromFd
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmLoadProjectorFromFd(
+        JNIEnv *, jobject, jint fd, jint nThreads) {
+    std::lock_guard<std::mutex> lock(g_state.gen_mutex);
+
+    if (fd < 0 || !g_state.model || !g_state.ctx) {
+        LOGE("Cannot load projector from invalid fd or without a base model");
+        return JNI_FALSE;
+    }
+
+    int owned_fd = dup(fd);
+    if (owned_fd < 0) {
+        LOGE("dup() failed for projector fd %d: %s", fd, strerror(errno));
+        return JNI_FALSE;
+    }
+
+    release_vlm_projector_locked();
+    sync_vlm_bridge_from_state();
+
+    ggml_engine_vlm_params params = ggml_engine_vlm_default_params();
+    params.n_threads = nThreads > 0 ? nThreads : g_vlm.bridge.params.n_threads_batch;
+
+    g_vlm.projector = ggml_engine_vlm_load_from_fd(&g_vlm.bridge, owned_fd, params);
+    close(owned_fd);
+
+    if (!g_vlm.projector) {
+        LOGE("Failed to load VLM projector from fd");
+        release_vlm_projector_locked();
+        return JNI_FALSE;
+    }
+
+    LOGI("VLM projector loaded from fd");
+    return JNI_TRUE;
+}
+
+// JNI: nativeVlmRelease
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmRelease(JNIEnv *, jobject) {
+    std::lock_guard<std::mutex> lock(g_state.gen_mutex);
+    release_vlm_projector_locked();
+    reset_text_session_after_vlm();
+    LOGI("VLM projector released");
+}
+
+// JNI: nativeVlmIsLoaded
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmIsLoaded(JNIEnv *, jobject) {
+    return ggml_engine_vlm_is_loaded(g_vlm.projector) ? JNI_TRUE : JNI_FALSE;
+}
+
+// JNI: nativeVlmGetInfo
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGetInfo(JNIEnv * env, jobject) {
+    if (!ggml_engine_vlm_is_loaded(g_vlm.projector)) {
+        return nullptr;
+    }
+
+    char * info_json = ggml_engine_vlm_info_json(g_vlm.projector);
+    if (!info_json) {
+        return nullptr;
+    }
+
+    jstring result = env->NewStringUTF(info_json);
+    free(info_json);
+    return result;
+}
+
+// JNI: nativeVlmGetDefaultMarker
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGetDefaultMarker(JNIEnv * env, jobject) {
+    return env->NewStringUTF(ggml_engine_vlm_default_marker());
+}
+
+// JNI: nativeVlmGenerateStream
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGenerateStream(
+        JNIEnv * env, jobject, jstring jprompt, jobjectArray jmedia, jint maxTokens, jobject callback) {
+    std::lock_guard<std::mutex> lock(g_state.gen_mutex);
+
+    if (!ensure_callback_methods(env, callback)) {
+        LOGE("Failed to find callback methods for VLM generation");
+        return JNI_FALSE;
+    }
+    if (!g_state.model || !g_state.ctx) {
+        LOGE("Base model not loaded for VLM generation");
+        send_stream_error(env, callback, "Base model is not loaded");
+        return JNI_FALSE;
+    }
+    if (!ggml_engine_vlm_is_loaded(g_vlm.projector)) {
+        LOGE("VLM projector not loaded");
+        send_stream_error(env, callback, "VLM projector is not loaded");
+        return JNI_FALSE;
+    }
+
+    const char * prompt_cstr = env->GetStringUTFChars(jprompt, nullptr);
+    if (!prompt_cstr) {
+        send_stream_error(env, callback, "Prompt is null");
+        return JNI_FALSE;
+    }
+    std::string user_prompt(prompt_cstr);
+    env->ReleaseStringUTFChars(jprompt, prompt_cstr);
+
+    std::vector<std::vector<unsigned char>> payloads;
+    std::string error;
+    if (!copy_media_payloads(env, jmedia, payloads, error)) {
+        LOGE("%s", error.c_str());
+        send_stream_error(env, callback, error);
+        return JNI_FALSE;
+    }
+
+    bool use_audio = false;
+    if (!infer_vlm_media_mode(g_vlm.projector, payloads, use_audio, error)) {
+        LOGE("%s", error.c_str());
+        send_stream_error(env, callback, error);
+        return JNI_FALSE;
+    }
+
+    std::vector<common_chat_msg> messages;
+    if (!g_state.system_prompt.empty()) {
+        messages.push_back({"system", g_state.system_prompt});
+    }
+    messages.push_back({"user", ensure_vlm_markers(user_prompt, payloads.size())});
+
+    auto tmpl_result = apply_chat_template(messages, true);
+    if (tmpl_result.prompt.empty()) {
+        send_stream_error(env, callback, "Failed to apply chat template for VLM prompt");
+        return JNI_FALSE;
+    }
+
+    auto sampling = build_vlm_sampling(tmpl_result, maxTokens);
+
+    g_state.cancel_flag = false;
+    g_utf8_buffer.clear();
+    sync_vlm_bridge_from_state();
+    g_vlm.bridge.cancelled.store(false);
+
+    vlm_stream_callback_ctx cb_ctx(env, callback);
+    ggml_engine_status status = GGML_ENGINE_ERROR_VLM_ENCODE;
+
+    if (use_audio) {
+        std::vector<ggml_engine_audio> audio_inputs;
+        audio_inputs.reserve(payloads.size());
+        for (const auto & payload : payloads) {
+            audio_inputs.push_back({payload.data(), payload.size()});
+        }
+        status = ggml_engine_vlm_generate_audio(
+            &g_vlm.bridge,
+            g_vlm.projector,
+            tmpl_result.prompt.c_str(),
+            audio_inputs.data(),
+            (int32_t) audio_inputs.size(),
+            sampling.params,
+            jni_vlm_token_callback,
+            &cb_ctx);
+    } else {
+        std::vector<ggml_engine_image> image_inputs;
+        image_inputs.reserve(payloads.size());
+        for (const auto & payload : payloads) {
+            image_inputs.push_back({payload.data(), payload.size(), 0, 0});
+        }
+        status = ggml_engine_vlm_generate(
+            &g_vlm.bridge,
+            g_vlm.projector,
+            tmpl_result.prompt.c_str(),
+            image_inputs.data(),
+            (int32_t) image_inputs.size(),
+            sampling.params,
+            jni_vlm_token_callback,
+            &cb_ctx);
+    }
+
+    if (!cb_ctx.batcher.flush()) {
+        env->ExceptionClear();
+        send_stream_error(env, callback, "Failed to flush generated output");
+        reset_text_session_after_vlm();
+        return JNI_FALSE;
+    }
+    if (!g_utf8_buffer.empty()) {
+        cb_ctx.batcher.buf = std::move(g_utf8_buffer);
+        g_utf8_buffer.clear();
+        if (!cb_ctx.batcher.flush()) {
+            env->ExceptionClear();
+            send_stream_error(env, callback, "Failed to flush generated output");
+            reset_text_session_after_vlm();
+            return JNI_FALSE;
+        }
+    }
+
+    const bool cancelled = status == GGML_ENGINE_ERROR_CANCELLED || g_state.cancel_flag.load();
+
+    if (status != GGML_ENGINE_OK && !cancelled) {
+        error = use_audio
+            ? "Audio generation failed"
+            : "VLM generation failed";
+        LOGE("%s (status=%d)", error.c_str(), (int) status);
+        send_stream_error(env, callback, error);
+        reset_text_session_after_vlm();
+        return JNI_FALSE;
+    }
+
+    if (g_onMetrics) {
+        const int generated_tokens = g_vlm.bridge.perf.generated_tokens;
+        const float total_ms = (float) (g_vlm.bridge.perf.prompt_eval_ms + g_vlm.bridge.perf.generation_ms);
+        const float tps = (float) g_vlm.bridge.perf.generation_tokens_per_sec;
+        env->CallVoidMethod(callback, g_onMetrics,
+            tps,
+            (jfloat) g_vlm.bridge.perf.prompt_eval_ms,
+            total_ms,
+            (jint) g_vlm.bridge.perf.prompt_tokens,
+            (jint) generated_tokens,
+            0.0f, 0.0f, 0.0f, 0.0f);
+    }
+
+    env->CallVoidMethod(callback, g_onDone);
+    reset_text_session_after_vlm();
+    return JNI_TRUE;
+}
+
 // JNI: nativeStopGeneration
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeStopGeneration(JNIEnv *, jobject) {
     g_state.cancel_flag = true;
+    g_vlm.bridge.cancelled.store(true);
     LOGI("Generation stop requested");
 }
 
@@ -1879,6 +2456,8 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeStopGeneration(JNIEnv *, jobject) {
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRelease(JNIEnv *, jobject) {
     std::lock_guard<std::mutex> lock(g_state.gen_mutex);
+
+    release_vlm_projector_locked();
 
     if (g_state.sampler) {
         common_sampler_free(g_state.sampler);
@@ -1899,6 +2478,8 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRelease(JNIEnv *, jobject) {
     g_state.n_system_tokens = 0;
     g_state.system_prompt.clear();
     g_state.chat_template_override.clear();
+    g_state.thinking_enabled = true;
+    g_state.flash_attn = false;
     g_state.tools_json.clear();
 
     // clean up persona and optimization state
@@ -2713,6 +3294,16 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGetUncensored(JNIEnv *, jobject) {
     return character_engine_get_uncensored(g_state.char_eng) ? JNI_TRUE : JNI_FALSE;
 }
 
+// JNI: nativeSetThinkingEnabled
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetThinkingEnabled(
+        JNIEnv *, jobject, jboolean enabled) {
+    std::lock_guard<std::mutex> lock(g_state.gen_mutex);
+    g_state.thinking_enabled = enabled;
+    LOGI("Thinking mode %s", enabled ? "enabled" : "disabled");
+}
+
 // JNI: nativeSupportsThinking — detect from chat template
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -3007,4 +3598,3 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeReleaseRagEngine(JNIEnv *, jobject) 
     }
     LOGI("RAG engine released");
 }
-
