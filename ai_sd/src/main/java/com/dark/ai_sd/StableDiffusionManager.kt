@@ -90,6 +90,27 @@ class StableDiffusionManager private constructor(context: Context) {
         diffusionManager.stopBackend()
     }
 
+    // LoRA state
+    val loraState: StateFlow<LoRAState> = diffusionManager.loraState
+
+    /**
+     * Apply a LoRA to the currently loaded model.
+     * Requires MNN/CPU mode. The model directory must contain the base .safetensors file.
+     *
+     * @param config LoRA configuration (path to .safetensors + weight)
+     * @return true if successfully applied
+     */
+    fun applyLora(config: LoRAConfig): Boolean {
+        return diffusionManager.applyLora(config)
+    }
+
+    /**
+     * Remove all active LoRAs and restore original model weights.
+     */
+    fun clearLora() {
+        diffusionManager.clearLora()
+    }
+
     /**
      * Generate an image asynchronously.
      * Monitor progress through [diffusionGenerationState] flow.

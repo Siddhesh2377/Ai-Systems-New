@@ -197,6 +197,9 @@ set(AI_SD_SOURCES
     # Core inference pipeline (ported from xororz, refactored Phase 1.10)
     src/core/pipeline_orchestrator.cpp
 
+    # LoRA runtime engine
+    src/lora/lora_engine.cpp
+
     # Phase 5 feature modules
     src/segmentation/segmenter.cpp
     src/inpainting/lama_inpainter.cpp

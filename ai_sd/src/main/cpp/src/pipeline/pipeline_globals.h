@@ -104,4 +104,6 @@ extern bool clip_skip_2;
 // Defined in pipeline_orchestrator.cpp, called by model_loader cleanup()
 namespace sd_pipeline {
     void cleanup_persistent_sessions();
+    void recreateClipSession();
+    void recreateUNetSession();
 }

@@ -516,6 +516,83 @@ bool initialize_models(const SDModelConfig& config) {
     return true;
 }
 
+void recreateClipSession() {
+    // Tear down existing CLIP session
+    if (clipSession && clipInterpreter) {
+        clipInterpreter->releaseSession(clipSession);
+        clipSession = nullptr;
+    }
+    delete clipInterpreter;
+    clipInterpreter = nullptr;
+
+    if (!use_mnn_clip) {
+        SD_LOG_WARN("[LORA] CLIP session recreation only supported in MNN/CPU mode");
+        return;
+    }
+
+    // Recreate from (potentially LoRA-modified) file
+    clipInterpreter = MNN::Interpreter::createFromFile(clipPath.c_str());
+    if (!clipInterpreter) {
+        SD_LOG_ERROR("[LORA] Failed to recreate MNN CLIP interpreter");
+        return;
+    }
+
+    MNN::ScheduleConfig cfg;
+    cfg.type = MNN_FORWARD_CPU;
+    cfg.numThread = 4;
+    MNN::BackendConfig bkCfg;
+    bkCfg.memory = MNN::BackendConfig::Memory_Low;
+    bkCfg.power = MNN::BackendConfig::Power_High;
+    cfg.backendConfig = &bkCfg;
+
+    clipSession = clipInterpreter->createSession(cfg);
+    if (clipSession) {
+        if (use_clip_v2) {
+            auto input = clipInterpreter->getSessionInput(clipSession, "input_embedding");
+            clipInterpreter->resizeTensor(input, {1, 77, 768});
+        } else {
+            auto input = clipInterpreter->getSessionInput(clipSession, "input_ids");
+            clipInterpreter->resizeTensor(input, {1, 77});
+        }
+        clipInterpreter->resizeSession(clipSession);
+        clipInterpreter->releaseModel();
+    }
+
+    // Reload pos_emb and token_emb if clip_v2 (LoRA regeneration rewrites these)
+    if (use_clip_v2) {
+        std::string posEmbPath = std::string(modelDir) + "/pos_emb.bin";
+        std::string tokenEmbPath = std::string(modelDir) + "/token_emb.bin";
+
+        std::ifstream posFile(posEmbPath, std::ios::binary);
+        if (posFile.good()) {
+            posFile.seekg(0, std::ios::end);
+            size_t posSize = posFile.tellg() / sizeof(float);
+            posFile.seekg(0, std::ios::beg);
+            pos_emb.resize(posSize);
+            posFile.read(reinterpret_cast<char*>(pos_emb.data()), posSize * sizeof(float));
+        }
+
+        std::ifstream tokenFile(tokenEmbPath, std::ios::binary);
+        if (tokenFile.good()) {
+            tokenFile.seekg(0, std::ios::end);
+            size_t fileSize = tokenFile.tellg();
+            tokenFile.seekg(0, std::ios::beg);
+            size_t tokenSize = fileSize / sizeof(uint16_t);
+            token_emb.resize(tokenSize);
+            tokenFile.read(reinterpret_cast<char*>(token_emb.data()), fileSize);
+        }
+    }
+
+    SD_LOG_INFO("[LORA] CLIP session recreated");
+}
+
+void recreateUNetSession() {
+    // Just cleanup the persistent UNet runner — it will auto-recreate
+    // on the next generation call via initIfNeeded()
+    cleanup_persistent_sessions();
+    SD_LOG_INFO("[LORA] UNet session invalidated (will recreate on next generation)");
+}
+
 void cleanup() {
     QNN_INFO("Cleaning up pipeline resources");
 

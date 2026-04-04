@@ -1269,18 +1269,37 @@ SDGenerationResult run_generation(PipelineContext& ctx,
   return sdResult;
 }
 
+// ============================================================================
+// LoRA — runtime weight patching (MNN-only)
+// ============================================================================
+#include "../lora/lora_engine.h"
+
+static LoRAEngine g_lora_engine;
+
 bool apply_lora(const std::string& path, float weight) {
-  // LoRA application uses the SafeTensor2MNN utilities
-  // This is model-format dependent and will be implemented
-  // when the full LoRA pipeline is tested
-  QNN_INFO("LoRA apply requested: %s (weight=%.2f)", path.c_str(), weight);
-  // TODO: Implement LoRA application using generateMNNModels with lora params
+  if (!use_mnn) {
+    SD_LOG_ERROR("[LORA] LoRA requires MNN/CPU mode — QNN uses pre-compiled contexts");
+    return false;
+  }
+
+  if (!g_lora_engine.apply(path, weight, modelDir, use_clip_v2)) {
+    return false;
+  }
+
+  // Recreate sessions to pick up modified weights
+  recreateClipSession();
+  recreateUNetSession();
   return true;
 }
 
 void clear_lora() {
-  QNN_INFO("LoRA clear requested");
-  // TODO: Reload base weights
+  if (!g_lora_engine.has_active()) return;
+
+  g_lora_engine.clear(modelDir, use_clip_v2);
+
+  // Recreate sessions with restored original weights
+  recreateClipSession();
+  recreateUNetSession();
 }
 
 // cleanup() moved to loader/model_loader.cpp (Phase 1.2)
@@ -1306,6 +1325,7 @@ void cleanup_persistent_sessions() {
     g_vae_dec_sample_h = 0;
     g_vae_enc_out_w = 0;
     g_vae_enc_out_h = 0;
+    g_lora_engine.reset();
 }
 
 } // namespace sd_pipeline

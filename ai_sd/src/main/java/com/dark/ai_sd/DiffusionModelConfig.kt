@@ -153,6 +153,27 @@ sealed class StyleState {
 }
 
 /**
+ * Configuration for applying a LoRA to the loaded model.
+ *
+ * @param path Absolute path to the .safetensors LoRA file
+ * @param weight LoRA strength multiplier (typically 0.5-1.5, negative inverts)
+ */
+data class LoRAConfig(
+    val path: String,
+    val weight: Float = 1.0f
+)
+
+/**
+ * Sealed class representing the state of LoRA operations
+ */
+sealed class LoRAState {
+    object None : LoRAState()
+    object Applying : LoRAState()
+    data class Applied(val loras: List<LoRAConfig>) : LoRAState()
+    data class Error(val message: String) : LoRAState()
+}
+
+/**
  * Configuration for the runtime environment.
  *
  * When [tarXzSourcePath] or [safetyCheckerSourcePath] are set, the manager

@@ -190,8 +190,6 @@ std::vector<float> applyLoRA(
 
       if (!lora_reader->has_tensor(lora_down_key) ||
           !lora_reader->has_tensor(lora_up_key)) {
-        // std::cout << "Missing LoRA tensors for weight: " << weight_name
-        //           << std::endl;
         continue;
       }
 
@@ -247,8 +245,11 @@ void generateModel(const std::string &dir, const std::string &safetensor_file,
   std::vector<SafeTensorReader *> lora_readers;
   std::vector<std::unique_ptr<SafeTensorReader>> lora_reader_holders;
   for (const auto &lora_file : loras) {
+    // Support both relative (dir + "/" + file) and absolute paths
+    std::string lora_path = (!lora_file.empty() && lora_file[0] == '/')
+        ? lora_file : (dir + "/" + lora_file);
     auto lora_reader =
-        std::make_unique<SafeTensorReader>(dir + "/" + lora_file);
+        std::make_unique<SafeTensorReader>(lora_path);
     lora_readers.push_back(lora_reader.get());
     lora_reader_holders.push_back(std::move(lora_reader));
   }

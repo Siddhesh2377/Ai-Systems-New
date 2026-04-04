@@ -70,6 +70,11 @@ class DiffusionManager(private val context: Context) {
         synchronized(stateLock) { _runtimeSetupState.value = state }
     }
 
+    // LoRA state
+    private val _loraState = MutableStateFlow<LoRAState>(LoRAState.None)
+    val loraState: StateFlow<LoRAState> = _loraState.asStateFlow()
+    private val activeLoras = mutableListOf<LoRAConfig>()
+
     // Runtime configuration
     private lateinit var runtimeDir: File
     private var currentModel: DiffusionModelConfig? = null
@@ -224,12 +229,33 @@ class DiffusionManager(private val context: Context) {
      * Generate an image. Progress and results delivered via state flows.
      */
     fun generateImage(params: DiffusionGenerationParams) {
+        // Input validation — fail fast before hitting JNI
+        if (params.width % 8 != 0 || params.height % 8 != 0) {
+            updateGenerationState(DiffusionGenerationState.Error(
+                "Width and height must be divisible by 8 (got ${params.width}x${params.height})"))
+            return
+        }
+        if (params.steps !in 1..150) {
+            updateGenerationState(DiffusionGenerationState.Error(
+                "Steps must be 1-150 (got ${params.steps})"))
+            return
+        }
+        if (params.cfgScale < 0f) {
+            updateGenerationState(DiffusionGenerationState.Error(
+                "CFG scale must be >= 0 (got ${params.cfgScale})"))
+            return
+        }
+        if (params.prompt.isBlank()) {
+            updateGenerationState(DiffusionGenerationState.Error("Prompt cannot be empty"))
+            return
+        }
+
         if (!_isGenerating.compareAndSet(false, true)) {
             Log.w(TAG, "Generation already in progress")
             return
         }
 
-        Thread {
+        Thread({
             try {
                 updateGenerationState(DiffusionGenerationState.Progress(0f))
 
@@ -315,8 +341,7 @@ class DiffusionManager(private val context: Context) {
             } finally {
                 _isGenerating.value = false
             }
-        }.apply {
-            name = "SDGeneration"
+        }, "SD-Generate").apply {
             isDaemon = true
             start()
         }
@@ -447,8 +472,82 @@ class DiffusionManager(private val context: Context) {
      */
     fun cleanup() {
         cancelGeneration()
+        clearLora()
         stopBackend()
         isRuntimePrepared = false
+    }
+
+    // ========================================================================
+    // LoRA
+    // ========================================================================
+
+    /**
+     * Apply a LoRA to the currently loaded model.
+     * Requires MNN/CPU mode — QNN mode does not support runtime LoRA.
+     *
+     * @param config LoRA configuration (path + weight)
+     * @return true if successfully applied
+     */
+    fun applyLora(config: LoRAConfig): Boolean {
+        if (_backendState.value !is DiffusionBackendState.Running) {
+            synchronized(stateLock) {
+                _loraState.value = LoRAState.Error("No model loaded")
+            }
+            return false
+        }
+        if (currentModel?.runOnCpu != true) {
+            synchronized(stateLock) {
+                _loraState.value = LoRAState.Error("LoRA requires CPU/MNN mode")
+            }
+            return false
+        }
+        if (!File(config.path).exists()) {
+            synchronized(stateLock) {
+                _loraState.value = LoRAState.Error("LoRA file not found: ${config.path}")
+            }
+            return false
+        }
+        if (!config.path.endsWith(".safetensors")) {
+            synchronized(stateLock) {
+                _loraState.value = LoRAState.Error("LoRA must be a .safetensors file")
+            }
+            return false
+        }
+        if (config.weight !in -2f..2f) {
+            synchronized(stateLock) {
+                _loraState.value = LoRAState.Error("LoRA weight must be between -2.0 and 2.0")
+            }
+            return false
+        }
+
+        synchronized(stateLock) { _loraState.value = LoRAState.Applying }
+
+        val success = nativeLib.nativeApplyLora(config.path, config.weight)
+        if (success) {
+            activeLoras.add(config)
+            synchronized(stateLock) {
+                _loraState.value = LoRAState.Applied(activeLoras.toList())
+            }
+            Log.i(TAG, "LoRA applied: ${config.path} (weight=${config.weight})")
+        } else {
+            synchronized(stateLock) {
+                _loraState.value = if (activeLoras.isEmpty()) LoRAState.None
+                    else LoRAState.Applied(activeLoras.toList())
+            }
+            Log.e(TAG, "Failed to apply LoRA: ${config.path}")
+        }
+        return success
+    }
+
+    /**
+     * Remove all active LoRAs and restore original model weights.
+     */
+    fun clearLora() {
+        if (activeLoras.isEmpty()) return
+        nativeLib.nativeClearLora()
+        activeLoras.clear()
+        synchronized(stateLock) { _loraState.value = LoRAState.None }
+        Log.i(TAG, "All LoRAs cleared")
     }
 
     // ========================================================================
@@ -476,21 +575,13 @@ class DiffusionManager(private val context: Context) {
      * @param inputBitmap Bitmap to upscale
      */
     fun upscaleImage(inputBitmap: Bitmap) {
-        Thread {
+        Thread({
             try {
                 synchronized(stateLock) { _upscaleState.value = UpscaleState.Processing }
 
-                // Convert Bitmap to RGB byte array
                 val width = inputBitmap.width
                 val height = inputBitmap.height
-                val pixels = IntArray(width * height)
-                inputBitmap.getPixels(pixels, 0, width, 0, 0, width, height)
-                val rgbBytes = ByteArray(width * height * 3)
-                for (i in pixels.indices) {
-                    rgbBytes[i * 3] = ((pixels[i] shr 16) and 0xFF).toByte()
-                    rgbBytes[i * 3 + 1] = ((pixels[i] shr 8) and 0xFF).toByte()
-                    rgbBytes[i * 3 + 2] = (pixels[i] and 0xFF).toByte()
-                }
+                val rgbBytes = bitmapToRgbBytes(inputBitmap)
 
                 val callback = object : SDCallback {
                     override fun onProgress(step: Int, totalSteps: Int) {}
@@ -512,7 +603,7 @@ class DiffusionManager(private val context: Context) {
                 Log.e(TAG, "Upscale failed", e)
                 synchronized(stateLock) { _upscaleState.value = UpscaleState.Error(e.message ?: "Unknown error") }
             }
-        }.start()
+        }, "SD-Upscale").start()
     }
 
     /**
@@ -541,7 +632,7 @@ class DiffusionManager(private val context: Context) {
     }
 
     fun segmentAtPoint(x: Float, y: Float) {
-        Thread {
+        Thread({
             try {
                 synchronized(stateLock) { _segmenterState.value = SegmenterState.Processing }
                 val callback = object : SDCallback {
@@ -563,11 +654,11 @@ class DiffusionManager(private val context: Context) {
                 Log.e(TAG, "Segment at point failed", e)
                 synchronized(stateLock) { _segmenterState.value = SegmenterState.Error(e.message ?: "Unknown error") }
             }
-        }.start()
+        }, "SD-SegmentPoint").start()
     }
 
     fun segmentWithBox(x1: Float, y1: Float, x2: Float, y2: Float) {
-        Thread {
+        Thread({
             try {
                 synchronized(stateLock) { _segmenterState.value = SegmenterState.Processing }
                 val callback = object : SDCallback {
@@ -589,7 +680,7 @@ class DiffusionManager(private val context: Context) {
                 Log.e(TAG, "Segment with box failed", e)
                 synchronized(stateLock) { _segmenterState.value = SegmenterState.Error(e.message ?: "Unknown error") }
             }
-        }.start()
+        }, "SD-SegmentBox").start()
     }
 
     fun releaseSegmenter() {
@@ -609,7 +700,7 @@ class DiffusionManager(private val context: Context) {
     }
 
     fun lamaInpaint(inputBitmap: Bitmap, maskBitmap: Bitmap) {
-        Thread {
+        Thread({
             try {
                 synchronized(stateLock) { _lamaState.value = LamaState.Processing }
                 val width = inputBitmap.width
@@ -635,7 +726,7 @@ class DiffusionManager(private val context: Context) {
                 Log.e(TAG, "LaMa inpaint failed", e)
                 synchronized(stateLock) { _lamaState.value = LamaState.Error(e.message ?: "Unknown error") }
             }
-        }.start()
+        }, "SD-LamaInpaint").start()
     }
 
     fun releaseLamaInpainter() {
@@ -655,7 +746,7 @@ class DiffusionManager(private val context: Context) {
     }
 
     fun estimateDepth(inputBitmap: Bitmap) {
-        Thread {
+        Thread({
             try {
                 synchronized(stateLock) { _depthState.value = DepthState.Processing }
                 val width = inputBitmap.width
@@ -680,7 +771,7 @@ class DiffusionManager(private val context: Context) {
                 Log.e(TAG, "Depth estimation failed", e)
                 synchronized(stateLock) { _depthState.value = DepthState.Error(e.message ?: "Unknown error") }
             }
-        }.start()
+        }, "SD-Depth").start()
     }
 
     fun releaseDepthEstimator() {
@@ -700,7 +791,7 @@ class DiffusionManager(private val context: Context) {
     }
 
     fun stylize(contentBitmap: Bitmap, styleBitmap: Bitmap, strength: Float = 1.0f) {
-        Thread {
+        Thread({
             try {
                 synchronized(stateLock) { _styleState.value = StyleState.Processing }
                 val contentRgb = bitmapToRgbBytes(contentBitmap)
@@ -728,7 +819,7 @@ class DiffusionManager(private val context: Context) {
                 Log.e(TAG, "Style transfer failed", e)
                 synchronized(stateLock) { _styleState.value = StyleState.Error(e.message ?: "Unknown error") }
             }
-        }.start()
+        }, "SD-Style").start()
     }
 
     fun releaseStyleTransfer() {
