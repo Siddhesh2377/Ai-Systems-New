@@ -13,8 +13,20 @@ static void ReadEndpointRule(JNIEnv *env, jobject rule, jclass cls,
   out->min_utterance_length = GetFloatField(env, rule, cls, "minUtteranceLength");
 }
 
-static SherpaOnnxOnlineRecognizerConfig ReadOnlineConfig(JNIEnv *env, jobject jconfig) {
+struct OnlineCfg {
+  std::string decoding_method, hotwords_file, rule_fsts, rule_fars;
+  std::string tokens, provider, model_type, modeling_unit, bpe_vocab;
+  std::string trans_enc, trans_dec, trans_joi;
+  std::string para_enc, para_dec;
+  std::string zf_model, nemo_model;
+  std::string lm_model;
+  std::string ctc_graph;
+  std::string hr_lexicon, hr_rule_fsts;
   SherpaOnnxOnlineRecognizerConfig cfg{};
+};
+
+static OnlineCfg ReadOnlineConfig(JNIEnv *env, jobject jconfig) {
+  OnlineCfg h;
 
   jclass cfg_cls = env->GetObjectClass(jconfig);
 
@@ -23,9 +35,9 @@ static SherpaOnnxOnlineRecognizerConfig ReadOnlineConfig(JNIEnv *env, jobject jc
                                "Lcom/dark/ai_sherpa/FeatureConfig;");
   if (jfeat) {
     jclass fc = env->GetObjectClass(jfeat);
-    cfg.feat_config.sample_rate = GetIntField(env, jfeat, fc, "sampleRate");
-    cfg.feat_config.feature_dim = GetIntField(env, jfeat, fc, "featureDim");
-    cfg.feat_config.dither = GetFloatField(env, jfeat, fc, "dither");
+    h.cfg.feat_config.sample_rate = GetIntField(env, jfeat, fc, "sampleRate");
+    h.cfg.feat_config.feature_dim = GetIntField(env, jfeat, fc, "featureDim");
+    h.cfg.feat_config.dither = GetFloatField(env, jfeat, fc, "dither");
     env->DeleteLocalRef(fc);
     env->DeleteLocalRef(jfeat);
   }
@@ -40,12 +52,12 @@ static SherpaOnnxOnlineRecognizerConfig ReadOnlineConfig(JNIEnv *env, jobject jc
                                   "Lcom/dark/ai_sherpa/OnlineTransducerModelConfig;");
     if (jtrans) {
       jclass tc = env->GetObjectClass(jtrans);
-      static std::string enc = GetStringField(env, jtrans, tc, "encoder");
-      static std::string dec = GetStringField(env, jtrans, tc, "decoder");
-      static std::string joi = GetStringField(env, jtrans, tc, "joiner");
-      cfg.model_config.transducer.encoder = enc.c_str();
-      cfg.model_config.transducer.decoder = dec.c_str();
-      cfg.model_config.transducer.joiner = joi.c_str();
+      h.trans_enc = GetStringField(env, jtrans, tc, "encoder");
+      h.trans_dec = GetStringField(env, jtrans, tc, "decoder");
+      h.trans_joi = GetStringField(env, jtrans, tc, "joiner");
+      h.cfg.model_config.transducer.encoder = h.trans_enc.c_str();
+      h.cfg.model_config.transducer.decoder = h.trans_dec.c_str();
+      h.cfg.model_config.transducer.joiner = h.trans_joi.c_str();
       env->DeleteLocalRef(tc);
       env->DeleteLocalRef(jtrans);
     }
@@ -54,10 +66,10 @@ static SherpaOnnxOnlineRecognizerConfig ReadOnlineConfig(JNIEnv *env, jobject jc
                                  "Lcom/dark/ai_sherpa/OnlineParaformerModelConfig;");
     if (jpara) {
       jclass pc = env->GetObjectClass(jpara);
-      static std::string enc = GetStringField(env, jpara, pc, "encoder");
-      static std::string dec = GetStringField(env, jpara, pc, "decoder");
-      cfg.model_config.paraformer.encoder = enc.c_str();
-      cfg.model_config.paraformer.decoder = dec.c_str();
+      h.para_enc = GetStringField(env, jpara, pc, "encoder");
+      h.para_dec = GetStringField(env, jpara, pc, "decoder");
+      h.cfg.model_config.paraformer.encoder = h.para_enc.c_str();
+      h.cfg.model_config.paraformer.decoder = h.para_dec.c_str();
       env->DeleteLocalRef(pc);
       env->DeleteLocalRef(jpara);
     }
@@ -66,8 +78,8 @@ static SherpaOnnxOnlineRecognizerConfig ReadOnlineConfig(JNIEnv *env, jobject jc
                                "Lcom/dark/ai_sherpa/OnlineZipformer2CtcModelConfig;");
     if (jzf) {
       jclass zc = env->GetObjectClass(jzf);
-      static std::string m = GetStringField(env, jzf, zc, "model");
-      cfg.model_config.zipformer2_ctc.model = m.c_str();
+      h.zf_model = GetStringField(env, jzf, zc, "model");
+      h.cfg.model_config.zipformer2_ctc.model = h.zf_model.c_str();
       env->DeleteLocalRef(zc);
       env->DeleteLocalRef(jzf);
     }
@@ -76,24 +88,24 @@ static SherpaOnnxOnlineRecognizerConfig ReadOnlineConfig(JNIEnv *env, jobject jc
                                  "Lcom/dark/ai_sherpa/OnlineNeMoCtcModelConfig;");
     if (jnemo) {
       jclass nc = env->GetObjectClass(jnemo);
-      static std::string m = GetStringField(env, jnemo, nc, "model");
-      cfg.model_config.nemo_ctc.model = m.c_str();
+      h.nemo_model = GetStringField(env, jnemo, nc, "model");
+      h.cfg.model_config.nemo_ctc.model = h.nemo_model.c_str();
       env->DeleteLocalRef(nc);
       env->DeleteLocalRef(jnemo);
     }
 
-    static std::string tokens = GetStringField(env, jmodel, mc, "tokens");
-    static std::string provider = GetStringField(env, jmodel, mc, "provider");
-    static std::string model_type = GetStringField(env, jmodel, mc, "modelType");
-    static std::string modeling_unit = GetStringField(env, jmodel, mc, "modelingUnit");
-    static std::string bpe_vocab = GetStringField(env, jmodel, mc, "bpeVocab");
-    cfg.model_config.tokens = tokens.c_str();
-    cfg.model_config.num_threads = GetIntField(env, jmodel, mc, "numThreads");
-    cfg.model_config.debug = GetBoolField(env, jmodel, mc, "debug") ? 1 : 0;
-    cfg.model_config.provider = provider.c_str();
-    cfg.model_config.model_type = model_type.c_str();
-    cfg.model_config.modeling_unit = modeling_unit.c_str();
-    cfg.model_config.bpe_vocab = bpe_vocab.c_str();
+    h.tokens = GetStringField(env, jmodel, mc, "tokens");
+    h.provider = GetStringField(env, jmodel, mc, "provider");
+    h.model_type = GetStringField(env, jmodel, mc, "modelType");
+    h.modeling_unit = GetStringField(env, jmodel, mc, "modelingUnit");
+    h.bpe_vocab = GetStringField(env, jmodel, mc, "bpeVocab");
+    h.cfg.model_config.tokens = h.tokens.c_str();
+    h.cfg.model_config.num_threads = GetIntField(env, jmodel, mc, "numThreads");
+    h.cfg.model_config.debug = GetBoolField(env, jmodel, mc, "debug") ? 1 : 0;
+    h.cfg.model_config.provider = h.provider.c_str();
+    h.cfg.model_config.model_type = h.model_type.c_str();
+    h.cfg.model_config.modeling_unit = h.modeling_unit.c_str();
+    h.cfg.model_config.bpe_vocab = h.bpe_vocab.c_str();
 
     env->DeleteLocalRef(mc);
     env->DeleteLocalRef(jmodel);
@@ -104,9 +116,9 @@ static SherpaOnnxOnlineRecognizerConfig ReadOnlineConfig(JNIEnv *env, jobject jc
                               "Lcom/dark/ai_sherpa/OnlineLMConfig;");
   if (jlm) {
     jclass lc = env->GetObjectClass(jlm);
-    static std::string m = GetStringField(env, jlm, lc, "model");
-    cfg.lm_config.model = m.c_str();
-    cfg.lm_config.scale = GetFloatField(env, jlm, lc, "scale");
+    h.lm_model = GetStringField(env, jlm, lc, "model");
+    h.cfg.lm_config.model = h.lm_model.c_str();
+    h.cfg.lm_config.scale = GetFloatField(env, jlm, lc, "scale");
     env->DeleteLocalRef(lc);
     env->DeleteLocalRef(jlm);
   }
@@ -122,9 +134,9 @@ static SherpaOnnxOnlineRecognizerConfig ReadOnlineConfig(JNIEnv *env, jobject jc
     jobject jr3 = GetObjField(env, jep, ec, "rule3", "Lcom/dark/ai_sherpa/EndpointRule;");
     if (jr1) {
       jclass rc = env->GetObjectClass(jr1);
-      ReadEndpointRule(env, jr1, rc, &cfg.endpoint_config.rule1);
-      if (jr2) ReadEndpointRule(env, jr2, rc, &cfg.endpoint_config.rule2);
-      if (jr3) ReadEndpointRule(env, jr3, rc, &cfg.endpoint_config.rule3);
+      ReadEndpointRule(env, jr1, rc, &h.cfg.endpoint_config.rule1);
+      if (jr2) ReadEndpointRule(env, jr2, rc, &h.cfg.endpoint_config.rule2);
+      if (jr3) ReadEndpointRule(env, jr3, rc, &h.cfg.endpoint_config.rule3);
       env->DeleteLocalRef(rc);
     }
     if (jr1) env->DeleteLocalRef(jr1);
@@ -139,9 +151,9 @@ static SherpaOnnxOnlineRecognizerConfig ReadOnlineConfig(JNIEnv *env, jobject jc
                               "Lcom/dark/ai_sherpa/OnlineCtcFstDecoderConfig;");
   if (jctc) {
     jclass cc = env->GetObjectClass(jctc);
-    static std::string graph = GetStringField(env, jctc, cc, "graph");
-    cfg.ctc_fst_decoder_config.graph = graph.c_str();
-    cfg.ctc_fst_decoder_config.max_active = GetIntField(env, jctc, cc, "maxActive");
+    h.ctc_graph = GetStringField(env, jctc, cc, "graph");
+    h.cfg.ctc_fst_decoder_config.graph = h.ctc_graph.c_str();
+    h.cfg.ctc_fst_decoder_config.max_active = GetIntField(env, jctc, cc, "maxActive");
     env->DeleteLocalRef(cc);
     env->DeleteLocalRef(jctc);
   }
@@ -151,29 +163,29 @@ static SherpaOnnxOnlineRecognizerConfig ReadOnlineConfig(JNIEnv *env, jobject jc
                              "Lcom/dark/ai_sherpa/HomophoneReplacerConfig;");
   if (jhr) {
     jclass hc = env->GetObjectClass(jhr);
-    static std::string lex = GetStringField(env, jhr, hc, "lexicon");
-    static std::string rfsts = GetStringField(env, jhr, hc, "ruleFsts");
-    cfg.hr.lexicon = lex.c_str();
-    cfg.hr.rule_fsts = rfsts.c_str();
+    h.hr_lexicon = GetStringField(env, jhr, hc, "lexicon");
+    h.hr_rule_fsts = GetStringField(env, jhr, hc, "ruleFsts");
+    h.cfg.hr.lexicon = h.hr_lexicon.c_str();
+    h.cfg.hr.rule_fsts = h.hr_rule_fsts.c_str();
     env->DeleteLocalRef(hc);
     env->DeleteLocalRef(jhr);
   }
 
-  static std::string decoding_method = GetStringField(env, jconfig, cfg_cls, "decodingMethod");
-  static std::string hotwords_file = GetStringField(env, jconfig, cfg_cls, "hotwordsFile");
-  static std::string rule_fsts = GetStringField(env, jconfig, cfg_cls, "ruleFsts");
-  static std::string rule_fars = GetStringField(env, jconfig, cfg_cls, "ruleFars");
-  cfg.decoding_method = decoding_method.c_str();
-  cfg.max_active_paths = GetIntField(env, jconfig, cfg_cls, "maxActivePaths");
-  cfg.hotwords_file = hotwords_file.c_str();
-  cfg.hotwords_score = GetFloatField(env, jconfig, cfg_cls, "hotwordsScore");
-  cfg.rule_fsts = rule_fsts.c_str();
-  cfg.rule_fars = rule_fars.c_str();
-  cfg.blank_penalty = GetFloatField(env, jconfig, cfg_cls, "blankPenalty");
-  cfg.enable_endpoint = GetBoolField(env, jconfig, cfg_cls, "enableEndpoint") ? 1 : 0;
+  h.decoding_method = GetStringField(env, jconfig, cfg_cls, "decodingMethod");
+  h.hotwords_file = GetStringField(env, jconfig, cfg_cls, "hotwordsFile");
+  h.rule_fsts = GetStringField(env, jconfig, cfg_cls, "ruleFsts");
+  h.rule_fars = GetStringField(env, jconfig, cfg_cls, "ruleFars");
+  h.cfg.decoding_method = h.decoding_method.c_str();
+  h.cfg.max_active_paths = GetIntField(env, jconfig, cfg_cls, "maxActivePaths");
+  h.cfg.hotwords_file = h.hotwords_file.c_str();
+  h.cfg.hotwords_score = GetFloatField(env, jconfig, cfg_cls, "hotwordsScore");
+  h.cfg.rule_fsts = h.rule_fsts.c_str();
+  h.cfg.rule_fars = h.rule_fars.c_str();
+  h.cfg.blank_penalty = GetFloatField(env, jconfig, cfg_cls, "blankPenalty");
+  h.cfg.enable_endpoint = GetBoolField(env, jconfig, cfg_cls, "enableEndpoint") ? 1 : 0;
 
   env->DeleteLocalRef(cfg_cls);
-  return cfg;
+  return h;
 }
 
 extern "C" {
@@ -181,8 +193,8 @@ extern "C" {
 JNIEXPORT jlong JNICALL
 Java_com_dark_ai_1sherpa_OnlineRecognizer_newFromFile(
     JNIEnv *env, jobject, jobject jconfig) {
-  SherpaOnnxOnlineRecognizerConfig cfg = ReadOnlineConfig(env, jconfig);
-  const SherpaOnnxOnlineRecognizer *p = SherpaOnnxCreateOnlineRecognizer(&cfg);
+  auto h = ReadOnlineConfig(env, jconfig);
+  const SherpaOnnxOnlineRecognizer *p = SherpaOnnxCreateOnlineRecognizer(&h.cfg);
   if (!p) {
     jclass ex = env->FindClass("java/lang/IllegalStateException");
     env->ThrowNew(ex, "Failed to create OnlineRecognizer");
@@ -195,10 +207,10 @@ Java_com_dark_ai_1sherpa_OnlineRecognizer_newFromFile(
 JNIEXPORT jlong JNICALL
 Java_com_dark_ai_1sherpa_OnlineRecognizer_newFromAsset(
     JNIEnv *env, jobject, jobject asset_manager, jobject jconfig) {
-  SherpaOnnxOnlineRecognizerConfig cfg = ReadOnlineConfig(env, jconfig);
+  auto h = ReadOnlineConfig(env, jconfig);
   AAssetManager *mgr = AAssetManager_fromJava(env, asset_manager);
   const SherpaOnnxOnlineRecognizer *p =
-      SherpaOnnxCreateOnlineRecognizerFromAsset(mgr, &cfg);
+      SherpaOnnxCreateOnlineRecognizerFromAsset(mgr, &h.cfg);
   if (!p) {
     jclass ex = env->FindClass("java/lang/IllegalStateException");
     env->ThrowNew(ex, "Failed to create OnlineRecognizer from asset");

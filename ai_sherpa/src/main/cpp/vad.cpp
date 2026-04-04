@@ -5,30 +5,13 @@
 #include <android/asset_manager.h>
 #include <android/asset_manager_jni.h>
 
-static void ReadSileroVadConfig(JNIEnv *env, jobject jobj, jclass cls,
-                                 SherpaOnnxSileroVadModelConfig *out) {
-  static std::string model = GetStringField(env, jobj, cls, "model");
-  out->model = model.c_str();
-  out->threshold = GetFloatField(env, jobj, cls, "threshold");
-  out->min_silence_duration = GetFloatField(env, jobj, cls, "minSilenceDuration");
-  out->min_speech_duration = GetFloatField(env, jobj, cls, "minSpeechDuration");
-  out->max_speech_duration = GetFloatField(env, jobj, cls, "maxSpeechDuration");
-  out->window_size = GetIntField(env, jobj, cls, "windowSize");
-}
-
-static void ReadTenVadConfig(JNIEnv *env, jobject jobj, jclass cls,
-                               SherpaOnnxTenVadModelConfig *out) {
-  static std::string model = GetStringField(env, jobj, cls, "model");
-  out->model = model.c_str();
-  out->threshold = GetFloatField(env, jobj, cls, "threshold");
-  out->min_silence_duration = GetFloatField(env, jobj, cls, "minSilenceDuration");
-  out->min_speech_duration = GetFloatField(env, jobj, cls, "minSpeechDuration");
-  out->max_speech_duration = GetFloatField(env, jobj, cls, "maxSpeechDuration");
-  out->window_size = GetIntField(env, jobj, cls, "windowSize");
-}
-
-static SherpaOnnxVadModelConfig ReadVadConfig(JNIEnv *env, jobject jconfig) {
+struct VadCfg {
+  std::string silero_model, ten_model, provider;
   SherpaOnnxVadModelConfig cfg{};
+};
+
+static VadCfg ReadVadConfig(JNIEnv *env, jobject jconfig) {
+  VadCfg h;
 
   jclass cfg_cls = env->GetObjectClass(jconfig);
 
@@ -36,7 +19,13 @@ static SherpaOnnxVadModelConfig ReadVadConfig(JNIEnv *env, jobject jconfig) {
                                  "Lcom/dark/ai_sherpa/SileroVadModelConfig;");
   if (jsilero) {
     jclass sc = env->GetObjectClass(jsilero);
-    ReadSileroVadConfig(env, jsilero, sc, &cfg.silero_vad);
+    h.silero_model = GetStringField(env, jsilero, sc, "model");
+    h.cfg.silero_vad.model = h.silero_model.c_str();
+    h.cfg.silero_vad.threshold = GetFloatField(env, jsilero, sc, "threshold");
+    h.cfg.silero_vad.min_silence_duration = GetFloatField(env, jsilero, sc, "minSilenceDuration");
+    h.cfg.silero_vad.min_speech_duration = GetFloatField(env, jsilero, sc, "minSpeechDuration");
+    h.cfg.silero_vad.max_speech_duration = GetFloatField(env, jsilero, sc, "maxSpeechDuration");
+    h.cfg.silero_vad.window_size = GetIntField(env, jsilero, sc, "windowSize");
     env->DeleteLocalRef(sc);
     env->DeleteLocalRef(jsilero);
   }
@@ -45,19 +34,25 @@ static SherpaOnnxVadModelConfig ReadVadConfig(JNIEnv *env, jobject jconfig) {
                               "Lcom/dark/ai_sherpa/TenVadModelConfig;");
   if (jten) {
     jclass tc = env->GetObjectClass(jten);
-    ReadTenVadConfig(env, jten, tc, &cfg.ten_vad);
+    h.ten_model = GetStringField(env, jten, tc, "model");
+    h.cfg.ten_vad.model = h.ten_model.c_str();
+    h.cfg.ten_vad.threshold = GetFloatField(env, jten, tc, "threshold");
+    h.cfg.ten_vad.min_silence_duration = GetFloatField(env, jten, tc, "minSilenceDuration");
+    h.cfg.ten_vad.min_speech_duration = GetFloatField(env, jten, tc, "minSpeechDuration");
+    h.cfg.ten_vad.max_speech_duration = GetFloatField(env, jten, tc, "maxSpeechDuration");
+    h.cfg.ten_vad.window_size = GetIntField(env, jten, tc, "windowSize");
     env->DeleteLocalRef(tc);
     env->DeleteLocalRef(jten);
   }
 
-  static std::string provider = GetStringField(env, jconfig, cfg_cls, "provider");
-  cfg.sample_rate = GetIntField(env, jconfig, cfg_cls, "sampleRate");
-  cfg.num_threads = GetIntField(env, jconfig, cfg_cls, "numThreads");
-  cfg.provider = provider.c_str();
-  cfg.debug = GetBoolField(env, jconfig, cfg_cls, "debug") ? 1 : 0;
+  h.provider = GetStringField(env, jconfig, cfg_cls, "provider");
+  h.cfg.sample_rate = GetIntField(env, jconfig, cfg_cls, "sampleRate");
+  h.cfg.num_threads = GetIntField(env, jconfig, cfg_cls, "numThreads");
+  h.cfg.provider = h.provider.c_str();
+  h.cfg.debug = GetBoolField(env, jconfig, cfg_cls, "debug") ? 1 : 0;
 
   env->DeleteLocalRef(cfg_cls);
-  return cfg;
+  return h;
 }
 
 extern "C" {
@@ -65,9 +60,9 @@ extern "C" {
 JNIEXPORT jlong JNICALL
 Java_com_dark_ai_1sherpa_Vad_newFromFile(
     JNIEnv *env, jobject, jobject jconfig, jint buffer_size_in_seconds) {
-  SherpaOnnxVadModelConfig cfg = ReadVadConfig(env, jconfig);
+  auto h = ReadVadConfig(env, jconfig);
   SherpaOnnxVoiceActivityDetector *p =
-      SherpaOnnxCreateVoiceActivityDetector(&cfg, static_cast<float>(buffer_size_in_seconds));
+      SherpaOnnxCreateVoiceActivityDetector(&h.cfg, static_cast<float>(buffer_size_in_seconds));
   if (!p) {
     jclass ex = env->FindClass("java/lang/IllegalStateException");
     env->ThrowNew(ex, "Failed to create VoiceActivityDetector");
@@ -81,11 +76,11 @@ JNIEXPORT jlong JNICALL
 Java_com_dark_ai_1sherpa_Vad_newFromAsset(
     JNIEnv *env, jobject, jobject asset_manager, jobject jconfig,
     jint buffer_size_in_seconds) {
-  SherpaOnnxVadModelConfig cfg = ReadVadConfig(env, jconfig);
+  auto h = ReadVadConfig(env, jconfig);
   AAssetManager *mgr = AAssetManager_fromJava(env, asset_manager);
   SherpaOnnxVoiceActivityDetector *p =
       SherpaOnnxCreateVoiceActivityDetectorFromAsset(
-          mgr, &cfg, static_cast<float>(buffer_size_in_seconds));
+          mgr, &h.cfg, static_cast<float>(buffer_size_in_seconds));
   if (!p) {
     jclass ex = env->FindClass("java/lang/IllegalStateException");
     env->ThrowNew(ex, "Failed to create VoiceActivityDetector from asset");

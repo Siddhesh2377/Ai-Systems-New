@@ -5,8 +5,15 @@
 #include <android/asset_manager.h>
 #include <android/asset_manager_jni.h>
 
-static SherpaOnnxOfflineTtsConfig ReadTtsConfig(JNIEnv *env, jobject jconfig) {
+struct TtsCfg {
+  std::string vits_model, vits_lexicon, vits_tokens, vits_data_dir, vits_dict_dir;
+  std::string kokoro_model, kokoro_voices, kokoro_tokens, kokoro_data_dir, kokoro_dict_dir;
+  std::string provider, rule_fsts, rule_fars;
   SherpaOnnxOfflineTtsConfig cfg{};
+};
+
+static TtsCfg ReadTtsConfig(JNIEnv *env, jobject jconfig) {
+  TtsCfg h;
 
   jclass cfg_cls = env->GetObjectClass(jconfig);
 
@@ -19,19 +26,19 @@ static SherpaOnnxOfflineTtsConfig ReadTtsConfig(JNIEnv *env, jobject jconfig) {
                                  "Lcom/dark/ai_sherpa/OfflineTtsVitsModelConfig;");
     if (jvits) {
       jclass vc = env->GetObjectClass(jvits);
-      static std::string model = GetStringField(env, jvits, vc, "model");
-      static std::string lexicon = GetStringField(env, jvits, vc, "lexicon");
-      static std::string tokens = GetStringField(env, jvits, vc, "tokens");
-      static std::string data_dir = GetStringField(env, jvits, vc, "dataDir");
-      static std::string dict_dir = GetStringField(env, jvits, vc, "dictDir");
-      cfg.model.vits.model = model.c_str();
-      cfg.model.vits.lexicon = lexicon.c_str();
-      cfg.model.vits.tokens = tokens.c_str();
-      cfg.model.vits.data_dir = data_dir.c_str();
-      cfg.model.vits.dict_dir = dict_dir.c_str();
-      cfg.model.vits.noise_scale = GetFloatField(env, jvits, vc, "noiseScale");
-      cfg.model.vits.noise_scale_w = GetFloatField(env, jvits, vc, "noiseScaleW");
-      cfg.model.vits.length_scale = GetFloatField(env, jvits, vc, "lengthScale");
+      h.vits_model = GetStringField(env, jvits, vc, "model");
+      h.vits_lexicon = GetStringField(env, jvits, vc, "lexicon");
+      h.vits_tokens = GetStringField(env, jvits, vc, "tokens");
+      h.vits_data_dir = GetStringField(env, jvits, vc, "dataDir");
+      h.vits_dict_dir = GetStringField(env, jvits, vc, "dictDir");
+      h.cfg.model.vits.model = h.vits_model.c_str();
+      h.cfg.model.vits.lexicon = h.vits_lexicon.c_str();
+      h.cfg.model.vits.tokens = h.vits_tokens.c_str();
+      h.cfg.model.vits.data_dir = h.vits_data_dir.c_str();
+      h.cfg.model.vits.dict_dir = h.vits_dict_dir.c_str();
+      h.cfg.model.vits.noise_scale = GetFloatField(env, jvits, vc, "noiseScale");
+      h.cfg.model.vits.noise_scale_w = GetFloatField(env, jvits, vc, "noiseScaleW");
+      h.cfg.model.vits.length_scale = GetFloatField(env, jvits, vc, "lengthScale");
       env->DeleteLocalRef(vc);
       env->DeleteLocalRef(jvits);
     }
@@ -40,38 +47,38 @@ static SherpaOnnxOfflineTtsConfig ReadTtsConfig(JNIEnv *env, jobject jconfig) {
                                    "Lcom/dark/ai_sherpa/OfflineTtsKokoroModelConfig;");
     if (jkokoro) {
       jclass kc = env->GetObjectClass(jkokoro);
-      static std::string model = GetStringField(env, jkokoro, kc, "model");
-      static std::string voices = GetStringField(env, jkokoro, kc, "voices");
-      static std::string tokens = GetStringField(env, jkokoro, kc, "tokens");
-      static std::string data_dir = GetStringField(env, jkokoro, kc, "dataDir");
-      static std::string dict_dir = GetStringField(env, jkokoro, kc, "dictDir");
-      cfg.model.kokoro.model = model.c_str();
-      cfg.model.kokoro.voices = voices.c_str();
-      cfg.model.kokoro.tokens = tokens.c_str();
-      cfg.model.kokoro.data_dir = data_dir.c_str();
-      cfg.model.kokoro.dict_dir = dict_dir.c_str();
-      cfg.model.kokoro.length_scale = GetFloatField(env, jkokoro, kc, "lengthScale");
+      h.kokoro_model = GetStringField(env, jkokoro, kc, "model");
+      h.kokoro_voices = GetStringField(env, jkokoro, kc, "voices");
+      h.kokoro_tokens = GetStringField(env, jkokoro, kc, "tokens");
+      h.kokoro_data_dir = GetStringField(env, jkokoro, kc, "dataDir");
+      h.kokoro_dict_dir = GetStringField(env, jkokoro, kc, "dictDir");
+      h.cfg.model.kokoro.model = h.kokoro_model.c_str();
+      h.cfg.model.kokoro.voices = h.kokoro_voices.c_str();
+      h.cfg.model.kokoro.tokens = h.kokoro_tokens.c_str();
+      h.cfg.model.kokoro.data_dir = h.kokoro_data_dir.c_str();
+      h.cfg.model.kokoro.dict_dir = h.kokoro_dict_dir.c_str();
+      h.cfg.model.kokoro.length_scale = GetFloatField(env, jkokoro, kc, "lengthScale");
       env->DeleteLocalRef(kc);
       env->DeleteLocalRef(jkokoro);
     }
 
-    static std::string provider = GetStringField(env, jmodel, mc, "provider");
-    cfg.model.num_threads = GetIntField(env, jmodel, mc, "numThreads");
-    cfg.model.debug = GetBoolField(env, jmodel, mc, "debug") ? 1 : 0;
-    cfg.model.provider = provider.c_str();
+    h.provider = GetStringField(env, jmodel, mc, "provider");
+    h.cfg.model.num_threads = GetIntField(env, jmodel, mc, "numThreads");
+    h.cfg.model.debug = GetBoolField(env, jmodel, mc, "debug") ? 1 : 0;
+    h.cfg.model.provider = h.provider.c_str();
 
     env->DeleteLocalRef(mc);
     env->DeleteLocalRef(jmodel);
   }
 
-  static std::string rule_fsts = GetStringField(env, jconfig, cfg_cls, "ruleFsts");
-  static std::string rule_fars = GetStringField(env, jconfig, cfg_cls, "ruleFars");
-  cfg.rule_fsts = rule_fsts.c_str();
-  cfg.rule_fars = rule_fars.c_str();
-  cfg.max_num_sentences = GetIntField(env, jconfig, cfg_cls, "maxNumSentences");
+  h.rule_fsts = GetStringField(env, jconfig, cfg_cls, "ruleFsts");
+  h.rule_fars = GetStringField(env, jconfig, cfg_cls, "ruleFars");
+  h.cfg.rule_fsts = h.rule_fsts.c_str();
+  h.cfg.rule_fars = h.rule_fars.c_str();
+  h.cfg.max_num_sentences = GetIntField(env, jconfig, cfg_cls, "maxNumSentences");
 
   env->DeleteLocalRef(cfg_cls);
-  return cfg;
+  return h;
 }
 
 extern "C" {
@@ -79,8 +86,8 @@ extern "C" {
 JNIEXPORT jlong JNICALL
 Java_com_dark_ai_1sherpa_OfflineTts_newFromFile(
     JNIEnv *env, jobject, jobject jconfig) {
-  SherpaOnnxOfflineTtsConfig cfg = ReadTtsConfig(env, jconfig);
-  const SherpaOnnxOfflineTts *p = SherpaOnnxCreateOfflineTts(&cfg);
+  auto h = ReadTtsConfig(env, jconfig);
+  const SherpaOnnxOfflineTts *p = SherpaOnnxCreateOfflineTts(&h.cfg);
   if (!p) {
     jclass ex = env->FindClass("java/lang/IllegalStateException");
     env->ThrowNew(ex, "Failed to create OfflineTts");
@@ -93,9 +100,9 @@ Java_com_dark_ai_1sherpa_OfflineTts_newFromFile(
 JNIEXPORT jlong JNICALL
 Java_com_dark_ai_1sherpa_OfflineTts_newFromAsset(
     JNIEnv *env, jobject, jobject asset_manager, jobject jconfig) {
-  SherpaOnnxOfflineTtsConfig cfg = ReadTtsConfig(env, jconfig);
+  auto h = ReadTtsConfig(env, jconfig);
   AAssetManager *mgr = AAssetManager_fromJava(env, asset_manager);
-  const SherpaOnnxOfflineTts *p = SherpaOnnxCreateOfflineTtsFromAsset(mgr, &cfg);
+  const SherpaOnnxOfflineTts *p = SherpaOnnxCreateOfflineTtsFromAsset(mgr, &h.cfg);
   if (!p) {
     jclass ex = env->FindClass("java/lang/IllegalStateException");
     env->ThrowNew(ex, "Failed to create OfflineTts from asset");
