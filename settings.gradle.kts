@@ -23,4 +23,4 @@ rootProject.name = "Ai-Systems"
 include(":ai_sd")
 include(":ai_supertonic_tts")
 include(":gguf_lib")
-include(":unified_inference")
+include(":ai_sherpa")

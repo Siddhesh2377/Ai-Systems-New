@@ -10,10 +10,9 @@
         <option name="modules">
           <set>
             <option value="$PROJECT_DIR$" />
-            <option value="$PROJECT_DIR$/ai_chatterbox" />
             <option value="$PROJECT_DIR$/ai_sd" />
+            <option value="$PROJECT_DIR$/ai_sherpa" />
             <option value="$PROJECT_DIR$/ai_supertonic_tts" />
-            <option value="$PROJECT_DIR$/app" />
             <option value="$PROJECT_DIR$/gguf_lib" />
           </set>
         </option>
