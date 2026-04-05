@@ -24,9 +24,8 @@
 #include "chat.h"
 
 #include "tool-manager.h"
-#include "character-engine.h"
+#include "thread-engine.h"
 #include "rag-engine.h"
-#include "ngram-cache.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -149,7 +148,9 @@ static struct {
 
     // Engine subsystems
     tool_manager_t     * tool_mgr  = nullptr;
-    character_engine_t * char_eng  = nullptr;
+
+    // Thread mode (0=power_saving, 1=balanced, 2=performance)
+    int thread_mode = 1;
 
     // Control vectors
     std::vector<llama_adapter_lora *> lora_adapters;
@@ -177,17 +178,6 @@ static struct {
     std::vector<int32_t> cached_refusal_ids;
     bool refusal_ids_scanned = false;
 
-    // Thread counts (split for prefill vs decode)
-    int n_threads_decode = 0; // fewer threads for memory-bound single-token decode
-    int n_threads_batch  = 0; // more threads for compute-bound batch prefill
-
-    // Speculative decoding (ngram self-speculative)
-    bool speculative_enabled = false;
-    int  speculative_n_draft = 4; // max tokens to draft per step
-    int  speculative_ngram   = 4; // ngram size for lookup
-    common_ngram_cache ngram_context;   // ngram cache built from generation history
-    std::vector<llama_token> gen_history; // running token history for ngram lookup
-
     // Disk-backed prompt cache directory (set via nativeSetPromptCacheDir)
     std::string prompt_cache_dir;
 
@@ -209,102 +199,30 @@ static ggml_type cache_type_from_string(const std::string & s) {
     return GGML_TYPE_Q8_0; // default
 }
 
-// Helper: Detect performance core count by reading CPU max frequencies from sysfs.
-// On big.LITTLE SoCs (Snapdragon, Exynos, Dimensity), performance cores have higher
-// max frequency than efficiency cores. Returns total cores if detection fails.
-static int detect_perf_core_count() {
-    int n_total = (int)std::thread::hardware_concurrency();
-    if (n_total <= 0) return 4;
+// Helper: Apply thread config from thread-engine to llama context.
+// mode: 0=power_saving, 1=balanced, 2=performance
+static void apply_thread_mode(int mode) {
+    tn_thread_config cfg = tn_thread_config_for_mode((tn_thread_mode)mode);
+    g_state.thread_mode = mode;
 
-    std::vector<long> freqs(n_total, 0);
-    for (int i = 0; i < n_total; i++) {
-        char path[128];
-        snprintf(path, sizeof(path),
-                 "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i);
-        FILE * f = fopen(path, "r");
-        if (f) {
-            fscanf(f, "%ld", &freqs[i]);
-            fclose(f);
+    if (g_state.ctx) {
+        llama_set_n_threads(g_state.ctx,
+            cfg.n_threads_generation,
+            cfg.n_threads_batch);
+    }
+
+    if (cfg.pin_to_perf_cores && cfg.n_perf_core_ids > 0) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        for (int i = 0; i < cfg.n_perf_core_ids; i++) {
+            CPU_SET(cfg.perf_core_ids[i], &set);
+        }
+        if (sched_setaffinity(0, sizeof(set), &set) == 0) {
+            LOGI("Pinned to %d performance cores (mode=%d)", cfg.n_perf_core_ids, mode);
+        } else {
+            LOGW("sched_setaffinity failed: %s", strerror(errno));
         }
     }
-
-    // find the median frequency — cores above median are "performance" cores
-    std::vector<long> sorted = freqs;
-    std::sort(sorted.begin(), sorted.end());
-    long median = sorted[n_total / 2];
-    if (median <= 0) return std::max(1, (n_total * 3) / 4); // fallback
-
-    int n_perf = 0;
-    for (int i = 0; i < n_total; i++) {
-        if (freqs[i] >= median) n_perf++;
-    }
-    return std::max(1, n_perf);
-}
-
-// Helper: Get performance core IDs for CPU affinity pinning.
-// Returns core IDs sorted by max frequency (highest first).
-static std::vector<int> get_perf_core_ids() {
-    int n_total = (int)std::thread::hardware_concurrency();
-    if (n_total <= 0) return {};
-
-    std::vector<std::pair<long, int>> freq_core; // (freq, core_id)
-    for (int i = 0; i < n_total; i++) {
-        char path[128];
-        snprintf(path, sizeof(path),
-                 "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i);
-        long freq = 0;
-        FILE * f = fopen(path, "r");
-        if (f) { fscanf(f, "%ld", &freq); fclose(f); }
-        freq_core.push_back({freq, i});
-    }
-
-    std::sort(freq_core.begin(), freq_core.end(),
-              [](auto & a, auto & b) { return a.first > b.first; });
-
-    // take top half as "performance" cores
-    long median = freq_core[n_total / 2].first;
-    std::vector<int> perf_ids;
-    for (auto & [freq, id] : freq_core) {
-        if (freq >= median) perf_ids.push_back(id);
-    }
-    return perf_ids;
-}
-
-// Helper: Pin current process threads to performance cores.
-// Prevents Android scheduler from migrating inference threads to efficiency cores.
-// This eliminates the speed variance (e.g. 12.8-16.0 t/s → stable 15+ t/s).
-static void pin_to_perf_cores() {
-    auto perf_ids = get_perf_core_ids();
-    if (perf_ids.empty()) return;
-
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    for (int id : perf_ids) CPU_SET(id, &set);
-    if (sched_setaffinity(0, sizeof(set), &set) == 0) {
-        LOGI("Pinned to %zu performance cores", perf_ids.size());
-    } else {
-        LOGW("sched_setaffinity failed: %s", strerror(errno));
-    }
-}
-
-// Helper: Thread count for single-token decode (memory-bandwidth bound).
-// Fewer threads avoids cache thrashing on the shared L3.
-static int decode_thread_count() {
-    int n_perf = detect_perf_core_count();
-    // for decode, use min(4, n_perf) — diminishing returns beyond 4 threads
-    return std::max(1, std::min(4, n_perf));
-}
-
-// Helper: Thread count for batch prompt evaluation (compute bound).
-// Use all performance cores for maximum parallelism.
-static int batch_thread_count() {
-    return std::max(1, detect_perf_core_count());
-}
-
-// Legacy helper — used when caller doesn't distinguish decode vs batch
-static int auto_thread_count() {
-    int n = std::thread::hardware_concurrency();
-    return std::max(1, (n * 3) / 4);
 }
 
 // Helper: Rebuild sampler from current params.
@@ -657,7 +575,9 @@ static jstring safe_new_string_utf(JNIEnv * env, const char * text) {
 // Batched token sender: accumulates text and only crosses JNI boundary
 // when the buffer reaches a threshold or on explicit flush.
 // This dramatically reduces per-token JNI overhead.
-static constexpr size_t TOKEN_BATCH_THRESHOLD = 64; // bytes before flushing to JNI
+// Batch threshold before flushing to JNI/AIDL. Larger = fewer Binder transactions.
+// 64 for direct in-process JNI, 256+ for AIDL service (Binder IPC ~20-50µs per call).
+static size_t g_token_batch_threshold = 256;
 
 // Pre-allocated byte array for zero-copy token delivery.
 // Reused across all flushes — avoids per-flush jstring alloc/free overhead.
@@ -687,7 +607,7 @@ struct token_batcher {
     // Add text to the batch. Flushes to JNI if threshold reached.
     bool add(const char * text, size_t len) {
         buf.append(text, len);
-        if (buf.size() >= TOKEN_BATCH_THRESHOLD) {
+        if (buf.size() >= g_token_batch_threshold) {
             return flush();
         }
         return true;
@@ -897,107 +817,6 @@ static float get_context_usage() {
     return (float)g_state.n_past / (float)n_ctx;
 }
 
-// Simple self-speculative decoding: look up the last ngram_size tokens in generation
-// history to predict the next n_draft tokens. Returns empty if no match found.
-// This avoids the overhead of a separate draft model — the model's own history IS the draft.
-static std::vector<llama_token> ngram_draft_tokens(
-    const std::vector<llama_token> & history,
-    int n_draft, int ngram_size) {
-
-    std::vector<llama_token> draft;
-    int n = (int)history.size();
-    if (n < ngram_size + 1) return draft;
-
-    // query = last ngram_size tokens in history
-    const llama_token * query = history.data() + n - ngram_size;
-
-    // search backwards from most recent occurrence (better prediction quality)
-    for (int i = n - ngram_size - 1; i >= ngram_size - 1; i--) {
-        bool match = true;
-        for (int j = 0; j < ngram_size; j++) {
-            if (history[i - (ngram_size - 1) + j] != query[j]) {
-                match = false;
-                break;
-            }
-        }
-        if (match) {
-            int start = i + 1;
-            for (int k = 0; k < n_draft && start + k < n - ngram_size; k++) {
-                draft.push_back(history[start + k]);
-            }
-            if (!draft.empty()) return draft;
-        }
-    }
-    return draft;
-}
-
-// Verify draft tokens against the model. Evaluates all draft tokens in a single batch,
-// then checks each position's top prediction against the draft. Accepts tokens until
-// the first mismatch, returning the number of tokens accepted (0 = draft rejected).
-static int verify_draft_tokens(
-    const std::vector<llama_token> & draft,
-    std::string & generated_text,
-    const llama_vocab * vocab) {
-
-    if (draft.empty() || !g_state.ctx || !g_state.sampler) return 0;
-
-    int n_ctx = (int)llama_n_ctx(g_state.ctx);
-    int max_draft = std::min((int)draft.size(), n_ctx - g_state.n_past - 1);
-    if (max_draft <= 0) return 0;
-
-    // build batch with all draft tokens, logits=true for each so we can verify
-    const int n_batch = llama_n_batch(g_state.ctx);
-    int n_eval = std::min(max_draft, n_batch);
-
-    if (g_prompt_batch_cap < n_batch) {
-        if (g_prompt_batch_cap > 0) llama_batch_free(g_prompt_batch);
-        g_prompt_batch = llama_batch_init(n_batch, 0, 1);
-        g_prompt_batch_cap = n_batch;
-    }
-
-    common_batch_clear(g_prompt_batch);
-    for (int i = 0; i < n_eval; i++) {
-        common_batch_add(g_prompt_batch, draft[i], g_state.n_past + i, {0}, true);
-    }
-
-    if (llama_decode(g_state.ctx, g_prompt_batch) != 0) return 0;
-
-    // verify each draft token against the model's prediction
-    int n_accepted = 0;
-    for (int i = 0; i < n_eval; i++) {
-        llama_token model_token = common_sampler_sample(g_state.sampler, g_state.ctx, i);
-        if (model_token == draft[i]) {
-            common_sampler_accept(g_state.sampler, draft[i], true);
-            // detokenize accepted token
-            char buf[256];
-            int len = llama_token_to_piece(vocab, draft[i], buf, sizeof(buf) - 1, 0, true);
-            if (len > 0) {
-                buf[len] = '\0';
-                generated_text.append(buf, len);
-            }
-            g_state.n_past++;
-            n_accepted++;
-        } else {
-            // mismatch — accept the model's token instead
-            common_sampler_accept(g_state.sampler, model_token, true);
-            char buf[256];
-            int len = llama_token_to_piece(vocab, model_token, buf, sizeof(buf) - 1, 0, true);
-            if (len > 0) {
-                buf[len] = '\0';
-                generated_text.append(buf, len);
-            }
-            g_state.n_past++;
-            n_accepted++; // the model's token counts as one accepted
-            // remove the KV entries for unverified draft tokens
-            if (i + 1 < n_eval) {
-                llama_memory_t mem = llama_get_memory(g_state.ctx);
-                if (mem) llama_memory_seq_rm(mem, 0, g_state.n_past, -1);
-            }
-            break;
-        }
-    }
-    return n_accepted;
-}
 
 // Generate a hash of a string for prompt cache filenames
 static std::string hash_string(const std::string & s) {
@@ -1094,18 +913,17 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModel(
     auto cparams = llama_context_default_params();
     cparams.n_ctx = nCtx > 0 ? nCtx : 4096;
 
-    if (nThreads > 0) {
-        // caller specified explicit count — use it for both
-        cparams.n_threads = nThreads;
-        cparams.n_threads_batch = nThreads;
-    } else {
-        // auto-detect optimal split
-        cparams.n_threads = decode_thread_count();
-        cparams.n_threads_batch = batch_thread_count();
+    {
+        tn_thread_config cfg = tn_thread_config_for_mode((tn_thread_mode)g_state.thread_mode);
+        if (nThreads > 0) {
+            cparams.n_threads = nThreads;
+            cparams.n_threads_batch = nThreads;
+        } else {
+            cparams.n_threads = cfg.n_threads_generation;
+            cparams.n_threads_batch = cfg.n_threads_batch;
+        }
+        cparams.n_batch = cfg.n_batch;
     }
-    g_state.n_threads_decode = cparams.n_threads;
-    g_state.n_threads_batch = cparams.n_threads_batch;
-    cparams.n_batch = 512;
 
     if (flashAttn) {
         cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
@@ -1125,8 +943,8 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModel(
         return JNI_FALSE;
     }
 
-    // pin inference threads to performance cores (prevents scheduler migration to E-cores)
-    pin_to_perf_cores();
+    // pin to performance cores via thread-engine
+    apply_thread_mode(g_state.thread_mode);
 
     // initialize chat templates from model
     g_state.chat_templates = common_chat_templates_init(
@@ -1151,8 +969,8 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModel(
         }
     }
 
-    LOGI("Model loaded (ctx=%d threads_decode=%d threads_batch=%d)",
-         (int)llama_n_ctx(g_state.ctx), cparams.n_threads, cparams.n_threads_batch);
+    LOGI("Model loaded (ctx=%d threads_gen=%d threads_batch=%d mode=%d)",
+         (int)llama_n_ctx(g_state.ctx), cparams.n_threads, cparams.n_threads_batch, g_state.thread_mode);
 
     return JNI_TRUE;
 }
@@ -1477,26 +1295,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStream(
         g_state.n_past++;
         n_generated++;
 
-        // ngram self-speculative decoding: predict next tokens from history, verify in batch.
-        // For repetitive/structured output (JSON, code, lists), this yields 1.3-2x throughput.
-        if (g_state.speculative_enabled && n_generated > g_state.speculative_ngram) {
-            g_state.gen_history.push_back(id);
-            auto draft = ngram_draft_tokens(g_state.gen_history,
-                                             g_state.speculative_n_draft,
-                                             g_state.speculative_ngram);
-            if (!draft.empty()) {
-                int accepted = verify_draft_tokens(draft, generated_text, vocab);
-                if (accepted > 0) {
-                    // update sent_count tracking — new text was added by verify_draft_tokens
-                    n_generated += accepted;
-                    for (int di = 0; di < accepted && di < (int)draft.size(); di++) {
-                        g_state.gen_history.push_back(draft[di]);
-                    }
-                }
-            }
-        } else if (g_state.speculative_enabled) {
-            g_state.gen_history.push_back(id);
-        }
+
     }
 
     // flush any remaining buffered text
@@ -1794,8 +1593,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStreamMultiTurn(
     generated_text.reserve(maxTokens * 4);
     size_t sent_count = 0;
 
-    // clear speculative decode history for new generation
-    if (g_state.speculative_enabled) g_state.gen_history.clear();
+
 
     token_batcher batcher(env, callback, g_onToken);
 
@@ -1849,24 +1647,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStreamMultiTurn(
         g_state.n_past++;
         n_generated++;
 
-        // ngram self-speculative decoding (same logic as single-turn)
-        if (g_state.speculative_enabled && n_generated > g_state.speculative_ngram) {
-            g_state.gen_history.push_back(id);
-            auto draft = ngram_draft_tokens(g_state.gen_history,
-                                             g_state.speculative_n_draft,
-                                             g_state.speculative_ngram);
-            if (!draft.empty()) {
-                int accepted = verify_draft_tokens(draft, generated_text, vocab);
-                if (accepted > 0) {
-                    n_generated += accepted;
-                    for (int di = 0; di < accepted && di < (int)draft.size(); di++) {
-                        g_state.gen_history.push_back(draft[di]);
-                    }
-                }
-            }
-        } else if (g_state.speculative_enabled) {
-            g_state.gen_history.push_back(id);
-        }
+
     }
 
     if (sent_count < generated_text.size()) {
@@ -1992,8 +1773,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRelease(JNIEnv *, jobject) {
     g_state.lora_adapters.clear();
     g_state.cached_refusal_ids.clear();
     g_state.refusal_ids_scanned = false;
-    g_state.gen_history.clear();
-    g_state.ngram_context.clear();
 
     // Free reusable batches
     if (g_prompt_batch_cap > 0) {
@@ -2012,11 +1791,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRelease(JNIEnv *, jobject) {
         tool_manager_free(g_state.tool_mgr);
         g_state.tool_mgr = nullptr;
     }
-    if (g_state.char_eng) {
-        character_engine_free(g_state.char_eng);
-        g_state.char_eng = nullptr;
-    }
-
     LOGI("Model released");
 }
 
@@ -2313,16 +2087,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetLogitBias(
         // Save a copy as persona biases so setUncensored can merge without losing them
         g_state.persona_biases = g_state.sampling_params.logit_bias;
 
-        // If uncensored mode is active, re-merge refusal biases on top
-        if (g_state.char_eng && character_engine_get_uncensored(g_state.char_eng)) {
-            auto eff = character_engine_get_params(g_state.char_eng);
-            for (int i = 0; i < eff.n_logit_biases; i++) {
-                llama_logit_bias lb;
-                lb.token = eff.logit_biases[i].token_id;
-                lb.bias = eff.logit_biases[i].bias;
-                g_state.sampling_params.logit_bias.push_back(lb);
-            }
-        }
+        // Refusal biases are tracked in cached_refusal_ids and re-applied by nativeSetUncensored
 
         rebuild_sampler();
         LOGI("Logit bias set: %zu persona + merged", g_state.persona_biases.size());
@@ -2507,7 +2272,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadEmbeddingModel(
 
     auto cparams = llama_context_default_params();
     cparams.n_ctx = nCtx > 0 ? nCtx : 512;
-    cparams.n_threads = nThreads > 0 ? nThreads : auto_thread_count();
+    cparams.n_threads = nThreads > 0 ? nThreads : tn_thread_config_for_mode((tn_thread_mode)g_state.thread_mode).n_threads_batch;
     cparams.n_threads_batch = cparams.n_threads;
     cparams.n_batch = 512;
     cparams.embeddings = true;
@@ -2629,7 +2394,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeReleaseEmbeddingModel(JNIEnv *, jobj
     LOGI("Embedding model released");
 }
 
-// Character Engine JNI bindings
+// Character / Personality JNI bindings — implemented directly via sampler params
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetPersonality(
@@ -2641,46 +2406,16 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetPersonality(
 
     try {
         auto j = json::parse(json_str);
-
-        if (!g_state.char_eng) {
-            g_state.char_eng = character_engine_create();
-        }
-
-        char_personality p = {};
-        std::string name = j.value("name", "");
-        std::string persona = j.value("persona", "");
-        p.name = name.c_str();
-        p.persona = persona.c_str();
-        p.temperature = j.value("temperature", 0.7f);
-        p.top_p = j.value("topP", j.value("top_p", 0.9f));
-        p.repetition_penalty = j.value("repetitionPenalty", j.value("repetition_penalty", 1.1f));
-        p.creativity = j.value("creativity", 0.5f);
-        p.verbosity = j.value("verbosity", 0.5f);
-        p.formality = j.value("formality", 0.5f);
-
-        character_engine_set_personality(g_state.char_eng, &p);
-
-        // Apply the effective params to the sampler
-        auto eff = character_engine_get_params(g_state.char_eng);
-        g_state.sampling_params.temp = eff.temperature;
-        g_state.sampling_params.top_p = eff.top_p;
-        g_state.sampling_params.min_p = eff.min_p;
-        g_state.sampling_params.top_k = eff.top_k;
-        g_state.sampling_params.penalty_repeat = eff.repetition_penalty;
-
-        // Apply logit biases from character engine
-        g_state.sampling_params.logit_bias.clear();
-        for (int i = 0; i < eff.n_logit_biases; i++) {
-            llama_logit_bias lb;
-            lb.token = eff.logit_biases[i].token_id;
-            lb.bias = eff.logit_biases[i].bias;
-            g_state.sampling_params.logit_bias.push_back(lb);
-        }
-
+        // Map personality traits directly to sampler params — no separate character engine needed
+        g_state.sampling_params.temp          = j.value("temperature", 0.7f);
+        g_state.sampling_params.top_p         = j.value("topP", j.value("top_p", 0.9f));
+        g_state.sampling_params.penalty_repeat = j.value("repetitionPenalty", j.value("repetition_penalty", 1.1f));
+        // creativity → min_p (higher creativity = lower min_p filter = more token diversity)
+        float creativity = j.value("creativity", 0.5f);
+        g_state.sampling_params.min_p = 0.1f - creativity * 0.08f; // 0.5 → 0.06, 1.0 → 0.02
         rebuild_sampler();
-        LOGI("CharacterEngine personality set: %s (temp=%.2f top_p=%.2f)",
-             name.c_str(), eff.temperature, eff.top_p);
-
+        LOGI("Personality applied: temp=%.2f top_p=%.2f",
+             g_state.sampling_params.temp, g_state.sampling_params.top_p);
     } catch (const std::exception & e) {
         LOGE("Failed to set personality: %s", e.what());
     }
@@ -2689,44 +2424,35 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetPersonality(
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetMood(JNIEnv *, jobject, jint mood) {
     std::lock_guard<std::mutex> lock(g_state.gen_mutex);
-    if (!g_state.char_eng) {
-        g_state.char_eng = character_engine_create();
-    }
-
-    character_engine_set_mood(g_state.char_eng, (char_mood)mood);
-
-    // Re-apply effective params to sampler
-    auto eff = character_engine_get_params(g_state.char_eng);
-    g_state.sampling_params.temp = eff.temperature;
-    g_state.sampling_params.top_p = eff.top_p;
-    g_state.sampling_params.min_p = eff.min_p;
-    g_state.sampling_params.top_k = eff.top_k;
-    g_state.sampling_params.penalty_repeat = eff.repetition_penalty;
-
+    // 0=NEUTRAL 1=HAPPY 2=SAD 3=EXCITED 4=CALM 5=ANGRY 6=CURIOUS 7=CREATIVE 8=FOCUSED 9=CUSTOM
+    static const float mood_temp[]    = { 0.7f, 0.8f, 0.6f, 0.9f, 0.5f, 0.85f, 0.75f, 0.9f, 0.6f, 0.7f };
+    static const float mood_penalty[] = { 1.1f, 1.05f,1.15f,1.0f, 1.2f, 1.0f,  1.1f,  1.0f, 1.15f,1.1f };
+    int m = (int)mood;
+    if (m < 0 || m > 9) m = 0;
+    g_state.sampling_params.temp = mood_temp[m];
+    g_state.sampling_params.penalty_repeat = mood_penalty[m];
     rebuild_sampler();
-    LOGI("CharacterEngine mood set: %d (temp=%.2f)", mood, eff.temperature);
+    LOGI("Mood set: %d (temp=%.2f)", m, mood_temp[m]);
 }
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGetCharacterContext(JNIEnv * env, jobject) {
-    if (!g_state.char_eng) return env->NewStringUTF("");
-
-    char * ctx = character_engine_get_context(g_state.char_eng);
-    jstring result = safe_new_string_utf(env, ctx ? ctx : "");
-    character_engine_free_string(ctx);
-    return result;
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "{\"temperature\":%.2f,\"top_p\":%.2f,\"penalty\":%.2f}",
+             g_state.sampling_params.temp,
+             g_state.sampling_params.top_p,
+             g_state.sampling_params.penalty_repeat);
+    return safe_new_string_utf(env, buf);
 }
+
+static bool g_uncensored = false;
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetUncensored(JNIEnv *, jobject, jboolean enabled) {
     std::lock_guard<std::mutex> lock(g_state.gen_mutex);
-    if (!g_state.char_eng) {
-        g_state.char_eng = character_engine_create();
-    }
-    character_engine_set_uncensored(g_state.char_eng, enabled);
+    g_uncensored = (bool)enabled;
 
-    // Use cached refusal token IDs — scan once per model load, not on every toggle.
-    // The vocab scan is O(vocab_size * n_patterns) and can be 3.2M string ops on 128k-vocab models.
     if (enabled && g_state.model) {
         if (!g_state.refusal_ids_scanned) {
             const llama_vocab * vocab = llama_model_get_vocab(g_state.model);
@@ -2753,50 +2479,36 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetUncensored(JNIEnv *, jobject, jbo
                 int len = llama_token_to_piece(vocab, id, buf, sizeof(buf) - 1, 0, true);
                 if (len <= 0) continue;
                 buf[len] = '\0';
-                std::string tok(buf);
                 for (int pi = 0; refusal_patterns[pi]; pi++) {
-                    if (tok.find(refusal_patterns[pi]) != std::string::npos) {
+                    if (strstr(buf, refusal_patterns[pi])) {
                         g_state.cached_refusal_ids.push_back(id);
                         break;
                     }
                 }
             }
             g_state.refusal_ids_scanned = true;
-            LOGI("Refusal token scan cached: %zu tokens", g_state.cached_refusal_ids.size());
+            LOGI("Refusal scan: %zu tokens cached", g_state.cached_refusal_ids.size());
         }
 
-        if (!g_state.cached_refusal_ids.empty()) {
-            character_engine_set_refusal_tokens(g_state.char_eng,
-                g_state.cached_refusal_ids.data(), (int32_t)g_state.cached_refusal_ids.size());
-            LOGI("Uncensored: suppressing %zu cached refusal tokens", g_state.cached_refusal_ids.size());
-        }
-
-        // Merge persona biases + refusal biases (don't wipe persona biases)
         g_state.sampling_params.logit_bias = g_state.persona_biases;
-        auto eff = character_engine_get_params(g_state.char_eng);
-        for (int i = 0; i < eff.n_logit_biases; i++) {
+        for (int32_t id : g_state.cached_refusal_ids) {
             llama_logit_bias lb;
-            lb.token = eff.logit_biases[i].token_id;
-            lb.bias = eff.logit_biases[i].bias;
+            lb.token = id;
+            lb.bias = -100.0f;
             g_state.sampling_params.logit_bias.push_back(lb);
         }
         rebuild_sampler();
-        LOGI("Uncensored ON: %zu persona + %d refusal biases",
-             g_state.persona_biases.size(), eff.n_logit_biases);
+        LOGI("Uncensored ON: suppressing %zu refusal tokens", g_state.cached_refusal_ids.size());
     } else if (!enabled) {
-        // Restore only persona biases, removing refusal ones
         g_state.sampling_params.logit_bias = g_state.persona_biases;
         rebuild_sampler();
-        LOGI("Uncensored OFF: restored %zu persona biases", g_state.persona_biases.size());
+        LOGI("Uncensored OFF");
     }
-
-    LOGI("CharacterEngine uncensored mode: %s", enabled ? "ON" : "OFF");
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGetUncensored(JNIEnv *, jobject) {
-    if (!g_state.char_eng) return JNI_FALSE;
-    return character_engine_get_uncensored(g_state.char_eng) ? JNI_TRUE : JNI_FALSE;
+    return g_uncensored ? JNI_TRUE : JNI_FALSE;
 }
 
 // JNI: nativeSupportsThinking — detect from chat template
@@ -2816,18 +2528,28 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetThinkingEnabled(JNIEnv *, jobject
     LOGI("Thinking %s", g_state.thinking_enabled ? "enabled" : "disabled");
 }
 
-// JNI: nativeSetSpeculativeDecoding — enable/disable ngram self-speculative decoding
-
+// JNI: nativeSetSpeculativeDecoding — removed (ngram cache deleted)
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetSpeculativeDecoding(
-        JNIEnv *, jobject, jboolean enabled, jint nDraft, jint ngramSize) {
+        JNIEnv *, jobject, jboolean, jint, jint) {
+    // no-op: speculative decoding removed
+}
+
+// JNI: nativeSetThreadMode — switch thread mode at runtime (0=power_saving 1=balanced 2=performance)
+extern "C" JNIEXPORT void JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetThreadMode(JNIEnv *, jobject, jint mode) {
     std::lock_guard<std::mutex> lock(g_state.gen_mutex);
-    g_state.speculative_enabled = enabled;
-    if (nDraft > 0) g_state.speculative_n_draft = nDraft;
-    if (ngramSize > 0) g_state.speculative_ngram = ngramSize;
-    g_state.gen_history.clear();
-    LOGI("Speculative decoding: %s (draft=%d ngram=%d)",
-         enabled ? "ON" : "OFF", g_state.speculative_n_draft, g_state.speculative_ngram);
+    if (mode < 0 || mode > 2) mode = 1;
+    apply_thread_mode(mode);
+    LOGI("Thread mode set: %d", mode);
+}
+
+// JNI: nativeSetTokenBatchSize — tune Binder IPC batch size for AIDL service use
+// Larger = fewer IPC calls, higher latency to first visible token. Default=256.
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetTokenBatchSize(JNIEnv *, jobject, jint bytes) {
+    if (bytes >= 1) g_token_batch_threshold = (size_t)bytes;
 }
 
 // JNI: nativeSetPromptCacheDir — set directory for disk-backed prompt cache
@@ -3658,7 +3380,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmLoadProjector(
 
     auto params = mtmd_context_params_default();
     params.use_gpu       = false;  // CPU only on mobile
-    params.n_threads     = nThreads > 0 ? nThreads : g_state.n_threads_batch;
+    params.n_threads     = nThreads > 0 ? nThreads : tn_thread_config_for_mode((tn_thread_mode)g_state.thread_mode).n_threads_batch;
     params.print_timings = false;
     params.warmup        = true;
 

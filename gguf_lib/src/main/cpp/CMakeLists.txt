@@ -96,7 +96,7 @@ set(VLM_SOURCES
 add_library(${CMAKE_PROJECT_NAME} SHARED
     gguf_lib.cpp
     ${LLAMA_DIR}/engine/tool-manager.cpp
-    ${LLAMA_DIR}/engine/character-engine.cpp
+    ${LLAMA_DIR}/engine/thread-engine.cpp
     ${LLAMA_DIR}/engine/rag-engine.cpp
     ${VLM_SOURCES})
 

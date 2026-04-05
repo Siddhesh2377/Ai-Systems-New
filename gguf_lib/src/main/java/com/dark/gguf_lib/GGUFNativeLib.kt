@@ -19,12 +19,12 @@ object GGUFNativeLib {
     // ---- Model Loading ----
 
     external fun nativeLoadModel(
-        path: String, nCtx: Int, nThreads: Int,
+        path: String, nCtx: Int, threadMode: Int,
         flashAttn: Boolean, cacheTypeK: String, cacheTypeV: String
     ): Boolean
 
     external fun nativeLoadModelFromFd(
-        fd: Int, nCtx: Int, nThreads: Int,
+        fd: Int, nCtx: Int, threadMode: Int,
         flashAttn: Boolean, cacheTypeK: String, cacheTypeV: String
     ): Boolean
 
@@ -87,9 +87,17 @@ object GGUFNativeLib {
     external fun nativeSupportsThinking(): Boolean
     external fun nativeSetThinkingEnabled(enabled: Boolean)
 
+    // ---- Thread Mode ----
+
+    external fun nativeSetThreadMode(mode: Int)
+
+    // ---- Token Batch Size (tune for AIDL vs direct JNI) ----
+
+    /** Set token batch size before each JNI/Binder callback. Default=256. Use 64 for direct, 512+ for AIDL. */
+    external fun nativeSetTokenBatchSize(bytes: Int)
+
     // ---- Optimization Controls ----
 
-    external fun nativeSetSpeculativeDecoding(enabled: Boolean, nDraft: Int, ngramSize: Int)
     external fun nativeSetPromptCacheDir(path: String)
     external fun nativeWarmUp(): Boolean
 

@@ -92,20 +92,20 @@ class GGMLEngine : TextEngine,
      *
      * @param path Absolute path to the .gguf file
      * @param contextSize Context window size (default 4096)
-     * @param threads Number of threads (0 = auto-detect, recommended)
-     * @param flashAttn Enable flash attention (may crash on some ARM devices with q8_0)
+     * @param threadMode Thread mode: 0=power_saving, 1=balanced, 2=performance
+     * @param flashAttn Enable flash attention
      * @param cacheTypeK KV cache type for keys: "f16", "q8_0", "q4_0", etc.
      * @param cacheTypeV KV cache type for values
      */
     fun load(
         path: String,
         contextSize: Int = 4096,
-        threads: Int = 0,
+        threadMode: Int = 1,
         flashAttn: Boolean = false,
         cacheTypeK: String = "q8_0",
         cacheTypeV: String = "q8_0",
     ): Boolean {
-        loaded = GGUFNativeLib.nativeLoadModel(path, contextSize, threads, flashAttn, cacheTypeK, cacheTypeV)
+        loaded = GGUFNativeLib.nativeLoadModel(path, contextSize, threadMode, flashAttn, cacheTypeK, cacheTypeV)
         return loaded
     }
 
@@ -115,12 +115,12 @@ class GGMLEngine : TextEngine,
     fun loadFromFd(
         fd: Int,
         contextSize: Int = 4096,
-        threads: Int = 0,
+        threadMode: Int = 1,
         flashAttn: Boolean = false,
         cacheTypeK: String = "q8_0",
         cacheTypeV: String = "q8_0",
     ): Boolean {
-        loaded = GGUFNativeLib.nativeLoadModelFromFd(fd, contextSize, threads, flashAttn, cacheTypeK, cacheTypeV)
+        loaded = GGUFNativeLib.nativeLoadModelFromFd(fd, contextSize, threadMode, flashAttn, cacheTypeK, cacheTypeV)
         return loaded
     }
 
@@ -131,18 +131,32 @@ class GGMLEngine : TextEngine,
         context: Context,
         uri: Uri,
         contextSize: Int = 4096,
-        threads: Int = 0,
+        threadMode: Int = 1,
         flashAttn: Boolean = false,
         cacheTypeK: String = "q8_0",
         cacheTypeV: String = "q8_0",
     ): Boolean {
         val pfd = context.contentResolver.openFileDescriptor(uri, "r") ?: return false
         return try {
-            loadFromFd(pfd.fd, contextSize, threads, flashAttn, cacheTypeK, cacheTypeV)
+            loadFromFd(pfd.fd, contextSize, threadMode, flashAttn, cacheTypeK, cacheTypeV)
         } finally {
             pfd.close()
         }
     }
+
+    /**
+     * Switch thread mode at runtime without reloading the model.
+     * @param mode 0=power_saving, 1=balanced, 2=performance
+     */
+    fun setThreadMode(mode: Int) = GGUFNativeLib.nativeSetThreadMode(mode)
+
+    /**
+     * Set token accumulation size before each callback (JNI/AIDL Binder call).
+     * Tune this based on your IPC cost:
+     * - Direct in-process JNI: 64 bytes (~1 token) for low latency
+     * - AIDL service: 256-512 bytes to amortize Binder overhead (~20-50µs/call)
+     */
+    fun setTokenBatchSize(bytes: Int) = GGUFNativeLib.nativeSetTokenBatchSize(bytes)
 
     /**
      * Release the loaded model and free all resources.
@@ -349,16 +363,6 @@ class GGMLEngine : TextEngine,
     // ---- Optimization Controls ----
 
     /**
-     * Enable/disable ngram self-speculative decoding.
-     * For repetitive/structured output (JSON, code, lists), yields 1.3-2x throughput.
-     * @param enabled true to enable
-     * @param nDraft max tokens to draft per step (default 4)
-     * @param ngramSize ngram size for history lookup (default 4)
-     */
-    fun setSpeculativeDecoding(enabled: Boolean, nDraft: Int = 4, ngramSize: Int = 4) =
-        GGUFNativeLib.nativeSetSpeculativeDecoding(enabled, nDraft, ngramSize)
-
-    /**
      * Set directory for disk-backed prompt cache.
      * When set, system prompt KV state is saved/restored across sessions,
      * eliminating re-evaluation of the system prompt on cold starts.
@@ -494,9 +498,9 @@ class GGMLEngine : TextEngine,
          */
         fun getRecommendedParams(context: Context): LoadingParams {
             return when (detectDeviceTier(context)) {
-                DeviceTier.LOW_END -> LoadingParams(contextSize = 2048, threads = 0, cacheTypeK = "q4_0", cacheTypeV = "q4_0")
-                DeviceTier.MID_RANGE -> LoadingParams(contextSize = 4096, threads = 0, cacheTypeK = "q8_0", cacheTypeV = "q8_0")
-                DeviceTier.HIGH_END -> LoadingParams(contextSize = 8192, threads = 0, cacheTypeK = "q8_0", cacheTypeV = "q8_0")
+                DeviceTier.LOW_END -> LoadingParams(contextSize = 2048, threadMode = 0, cacheTypeK = "q4_0", cacheTypeV = "q4_0")
+                DeviceTier.MID_RANGE -> LoadingParams(contextSize = 4096, threadMode = 1, cacheTypeK = "q8_0", cacheTypeV = "q8_0")
+                DeviceTier.HIGH_END -> LoadingParams(contextSize = 8192, threadMode = 2, cacheTypeK = "q8_0", cacheTypeV = "q8_0")
             }
         }
     }
@@ -525,7 +529,7 @@ enum class DeviceTier { LOW_END, MID_RANGE, HIGH_END }
 
 data class LoadingParams(
     val contextSize: Int = 4096,
-    val threads: Int = 0,
+    val threadMode: Int = 1,
     val flashAttn: Boolean = false,
     val cacheTypeK: String = "q8_0",
     val cacheTypeV: String = "q8_0",
