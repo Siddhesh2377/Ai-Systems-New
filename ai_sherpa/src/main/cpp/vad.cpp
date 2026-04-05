@@ -2,8 +2,6 @@
 #include "jni_common.h"
 #include "jni_cache.h"
 #include "sherpa-onnx/c-api/c-api.h"
-#include <android/asset_manager.h>
-#include <android/asset_manager_jni.h>
 
 struct VadCfg {
   std::string silero_model, ten_model, provider;
@@ -61,29 +59,11 @@ JNIEXPORT jlong JNICALL
 Java_com_dark_ai_1sherpa_Vad_newFromFile(
     JNIEnv *env, jobject, jobject jconfig, jint buffer_size_in_seconds) {
   auto h = ReadVadConfig(env, jconfig);
-  SherpaOnnxVoiceActivityDetector *p =
+  const SherpaOnnxVoiceActivityDetector *p =
       SherpaOnnxCreateVoiceActivityDetector(&h.cfg, static_cast<float>(buffer_size_in_seconds));
   if (!p) {
     jclass ex = env->FindClass("java/lang/IllegalStateException");
     env->ThrowNew(ex, "Failed to create VoiceActivityDetector");
-    env->DeleteLocalRef(ex);
-    return 0;
-  }
-  return reinterpret_cast<jlong>(p);
-}
-
-JNIEXPORT jlong JNICALL
-Java_com_dark_ai_1sherpa_Vad_newFromAsset(
-    JNIEnv *env, jobject, jobject asset_manager, jobject jconfig,
-    jint buffer_size_in_seconds) {
-  auto h = ReadVadConfig(env, jconfig);
-  AAssetManager *mgr = AAssetManager_fromJava(env, asset_manager);
-  SherpaOnnxVoiceActivityDetector *p =
-      SherpaOnnxCreateVoiceActivityDetectorFromAsset(
-          mgr, &h.cfg, static_cast<float>(buffer_size_in_seconds));
-  if (!p) {
-    jclass ex = env->FindClass("java/lang/IllegalStateException");
-    env->ThrowNew(ex, "Failed to create VoiceActivityDetector from asset");
     env->DeleteLocalRef(ex);
     return 0;
   }
@@ -95,7 +75,7 @@ Java_com_dark_ai_1sherpa_Vad_delete(
     JNIEnv *env, jobject, jlong ptr) {
   CHECK_PTR(env, ptr, );
   SherpaOnnxDestroyVoiceActivityDetector(
-      reinterpret_cast<SherpaOnnxVoiceActivityDetector *>(ptr));
+      reinterpret_cast<const SherpaOnnxVoiceActivityDetector *>(ptr));
 }
 
 JNIEXPORT void JNICALL
@@ -107,7 +87,7 @@ Java_com_dark_ai_1sherpa_Vad_acceptWaveform(
       env->GetPrimitiveArrayCritical(samples, nullptr));
   if (!data) return;
   SherpaOnnxVoiceActivityDetectorAcceptWaveform(
-      reinterpret_cast<SherpaOnnxVoiceActivityDetector *>(ptr), data,
+      reinterpret_cast<const SherpaOnnxVoiceActivityDetector *>(ptr), data,
       static_cast<int>(len));
   env->ReleasePrimitiveArrayCritical(samples, data, JNI_ABORT);
 }
@@ -117,7 +97,7 @@ Java_com_dark_ai_1sherpa_Vad_empty(
     JNIEnv *env, jobject, jlong ptr) {
   CHECK_PTR(env, ptr, JNI_TRUE);
   return SherpaOnnxVoiceActivityDetectorEmpty(
-      reinterpret_cast<SherpaOnnxVoiceActivityDetector *>(ptr))
+      reinterpret_cast<const SherpaOnnxVoiceActivityDetector *>(ptr))
       ? JNI_TRUE : JNI_FALSE;
 }
 
@@ -126,7 +106,7 @@ Java_com_dark_ai_1sherpa_Vad_pop(
     JNIEnv *env, jobject, jlong ptr) {
   CHECK_PTR(env, ptr, );
   SherpaOnnxVoiceActivityDetectorPop(
-      reinterpret_cast<SherpaOnnxVoiceActivityDetector *>(ptr));
+      reinterpret_cast<const SherpaOnnxVoiceActivityDetector *>(ptr));
 }
 
 JNIEXPORT void JNICALL
@@ -134,7 +114,7 @@ Java_com_dark_ai_1sherpa_Vad_clear(
     JNIEnv *env, jobject, jlong ptr) {
   CHECK_PTR(env, ptr, );
   SherpaOnnxVoiceActivityDetectorClear(
-      reinterpret_cast<SherpaOnnxVoiceActivityDetector *>(ptr));
+      reinterpret_cast<const SherpaOnnxVoiceActivityDetector *>(ptr));
 }
 
 JNIEXPORT jobject JNICALL
@@ -143,7 +123,7 @@ Java_com_dark_ai_1sherpa_Vad_front(
   CHECK_PTR(env, ptr, nullptr);
 
   const SherpaOnnxSpeechSegment *seg = SherpaOnnxVoiceActivityDetectorFront(
-      reinterpret_cast<SherpaOnnxVoiceActivityDetector *>(ptr));
+      reinterpret_cast<const SherpaOnnxVoiceActivityDetector *>(ptr));
   if (!seg) return nullptr;
 
   jfloatArray samples = env->NewFloatArray(seg->n);
@@ -165,7 +145,7 @@ Java_com_dark_ai_1sherpa_Vad_isSpeechDetected(
     JNIEnv *env, jobject, jlong ptr) {
   CHECK_PTR(env, ptr, JNI_FALSE);
   return SherpaOnnxVoiceActivityDetectorDetected(
-      reinterpret_cast<SherpaOnnxVoiceActivityDetector *>(ptr))
+      reinterpret_cast<const SherpaOnnxVoiceActivityDetector *>(ptr))
       ? JNI_TRUE : JNI_FALSE;
 }
 
@@ -174,7 +154,7 @@ Java_com_dark_ai_1sherpa_Vad_reset(
     JNIEnv *env, jobject, jlong ptr) {
   CHECK_PTR(env, ptr, );
   SherpaOnnxVoiceActivityDetectorReset(
-      reinterpret_cast<SherpaOnnxVoiceActivityDetector *>(ptr));
+      reinterpret_cast<const SherpaOnnxVoiceActivityDetector *>(ptr));
 }
 
 JNIEXPORT void JNICALL
@@ -182,22 +162,7 @@ Java_com_dark_ai_1sherpa_Vad_flush(
     JNIEnv *env, jobject, jlong ptr) {
   CHECK_PTR(env, ptr, );
   SherpaOnnxVoiceActivityDetectorFlush(
-      reinterpret_cast<SherpaOnnxVoiceActivityDetector *>(ptr));
-}
-
-JNIEXPORT jfloat JNICALL
-Java_com_dark_ai_1sherpa_Vad_compute(
-    JNIEnv *env, jobject, jlong ptr, jfloatArray samples) {
-  CHECK_PTR(env, ptr, 0.f);
-  jsize len = env->GetArrayLength(samples);
-  jfloat *data = reinterpret_cast<jfloat *>(
-      env->GetPrimitiveArrayCritical(samples, nullptr));
-  if (!data) return 0.f;
-  float prob = SherpaOnnxVadModelComputeProb(
-      reinterpret_cast<SherpaOnnxVoiceActivityDetector *>(ptr), data,
-      static_cast<int>(len));
-  env->ReleasePrimitiveArrayCritical(samples, data, JNI_ABORT);
-  return static_cast<jfloat>(prob);
+      reinterpret_cast<const SherpaOnnxVoiceActivityDetector *>(ptr));
 }
 
 } // extern "C"

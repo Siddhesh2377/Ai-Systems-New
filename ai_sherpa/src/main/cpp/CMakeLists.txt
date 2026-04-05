@@ -17,9 +17,16 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
 endif()
 
 set(SHERPA_ONNX_DIR /home/home/dev/include/sherpa-onnx)
+set(ORT_DIR /home/home/dev/include/ort-android-1.24.3)
 
-# Configure sherpa-onnx as static library (no JNI, no binaries, with C API + TTS)
+# Point sherpa-onnx at the prebuilt ORT Android .so
+set(ENV{SHERPA_ONNXRUNTIME_INCLUDE_DIR} "${ORT_DIR}/headers")
+set(ENV{SHERPA_ONNXRUNTIME_LIB_DIR} "${ORT_DIR}/${ANDROID_ABI}")
+set(SHERPA_ONNX_USE_PRE_INSTALLED_ONNXRUNTIME_IF_AVAILABLE ON CACHE BOOL "" FORCE)
+
+# sherpa-onnx build options
 set(SHERPA_ONNX_ENABLE_JNI OFF CACHE BOOL "" FORCE)
+set(SHERPA_ONNX_ENABLE_SPEAKER_DIARIZATION OFF CACHE BOOL "" FORCE)
 set(SHERPA_ONNX_ENABLE_BINARY OFF CACHE BOOL "" FORCE)
 set(SHERPA_ONNX_ENABLE_C_API ON CACHE BOOL "" FORCE)
 set(SHERPA_ONNX_ENABLE_TTS ON CACHE BOOL "" FORCE)
@@ -42,6 +49,7 @@ add_library(ai_sherpa SHARED
 
 target_include_directories(ai_sherpa PRIVATE
   ${SHERPA_ONNX_DIR}
+  ${ORT_DIR}/headers
   ${CMAKE_CURRENT_SOURCE_DIR}
 )
 

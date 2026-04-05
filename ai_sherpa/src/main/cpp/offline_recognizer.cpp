@@ -2,8 +2,6 @@
 #include "jni_common.h"
 #include "jni_cache.h"
 #include "sherpa-onnx/c-api/c-api.h"
-#include <android/asset_manager.h>
-#include <android/asset_manager_jni.h>
 
 struct OfflineCfg {
   std::string decoding_method, hotwords_file, rule_fsts, rule_fars;
@@ -12,7 +10,6 @@ struct OfflineCfg {
   std::string paraformer_model, nemo_ctc_model;
   std::string whisper_enc, whisper_dec, whisper_lang, whisper_task;
   std::string tdnn_model;
-  std::string nemo_trans_enc, nemo_trans_dec, nemo_trans_joi;
   std::string lm_model;
   std::string hr_lexicon, hr_rule_fsts;
   SherpaOnnxOfflineRecognizerConfig cfg{};
@@ -30,7 +27,6 @@ static OfflineCfg ReadOfflineConfig(JNIEnv *env, jobject jconfig) {
     jclass fc = env->GetObjectClass(jfeat);
     h.cfg.feat_config.sample_rate = GetIntField(env, jfeat, fc, "sampleRate");
     h.cfg.feat_config.feature_dim = GetIntField(env, jfeat, fc, "featureDim");
-    h.cfg.feat_config.dither = GetFloatField(env, jfeat, fc, "dither");
     env->DeleteLocalRef(fc);
     env->DeleteLocalRef(jfeat);
   }
@@ -100,20 +96,6 @@ static OfflineCfg ReadOfflineConfig(JNIEnv *env, jobject jconfig) {
       h.cfg.model_config.tdnn.model = h.tdnn_model.c_str();
       env->DeleteLocalRef(tc);
       env->DeleteLocalRef(jtdnn);
-    }
-
-    jobject jnemo_t = GetObjField(env, jmodel, mc, "nemoTransducer",
-                                   "Lcom/dark/ai_sherpa/OfflineNemoEncDecRnntModelConfig;");
-    if (jnemo_t) {
-      jclass ntc = env->GetObjectClass(jnemo_t);
-      h.nemo_trans_enc = GetStringField(env, jnemo_t, ntc, "encoder");
-      h.nemo_trans_dec = GetStringField(env, jnemo_t, ntc, "decoder");
-      h.nemo_trans_joi = GetStringField(env, jnemo_t, ntc, "joiner");
-      h.cfg.model_config.nemo_transducer.encoder = h.nemo_trans_enc.c_str();
-      h.cfg.model_config.nemo_transducer.decoder = h.nemo_trans_dec.c_str();
-      h.cfg.model_config.nemo_transducer.joiner = h.nemo_trans_joi.c_str();
-      env->DeleteLocalRef(ntc);
-      env->DeleteLocalRef(jnemo_t);
     }
 
     h.tokens = GetStringField(env, jmodel, mc, "tokens");
@@ -190,22 +172,6 @@ Java_com_dark_ai_1sherpa_OfflineRecognizer_newFromFile(
   return reinterpret_cast<jlong>(p);
 }
 
-JNIEXPORT jlong JNICALL
-Java_com_dark_ai_1sherpa_OfflineRecognizer_newFromAsset(
-    JNIEnv *env, jobject, jobject asset_manager, jobject jconfig) {
-  auto h = ReadOfflineConfig(env, jconfig);
-  AAssetManager *mgr = AAssetManager_fromJava(env, asset_manager);
-  const SherpaOnnxOfflineRecognizer *p =
-      SherpaOnnxCreateOfflineRecognizerFromAsset(mgr, &h.cfg);
-  if (!p) {
-    jclass ex = env->FindClass("java/lang/IllegalStateException");
-    env->ThrowNew(ex, "Failed to create OfflineRecognizer from asset");
-    env->DeleteLocalRef(ex);
-    return 0;
-  }
-  return reinterpret_cast<jlong>(p);
-}
-
 JNIEXPORT void JNICALL
 Java_com_dark_ai_1sherpa_OfflineRecognizer_delete(
     JNIEnv *env, jobject, jlong ptr) {
@@ -263,7 +229,7 @@ Java_com_dark_ai_1sherpa_OfflineRecognizer_decode(
 
 JNIEXPORT jobject JNICALL
 Java_com_dark_ai_1sherpa_OfflineRecognizer_getResult(
-    JNIEnv *env, jobject, jlong stream_ptr) {
+    JNIEnv *env, jobject, jlong /*ptr*/, jlong stream_ptr) {
   CHECK_PTR(env, stream_ptr, nullptr);
 
   const SherpaOnnxOfflineRecognizerResult *r = SherpaOnnxGetOfflineStreamResult(
@@ -275,7 +241,7 @@ Java_com_dark_ai_1sherpa_OfflineRecognizer_getResult(
   int n_tokens = r->count;
   jobjectArray tokens = env->NewObjectArray(n_tokens, g_cache.string_cls, nullptr);
   for (int i = 0; i < n_tokens; ++i) {
-    jstring t = env->NewStringUTF(r->tokens[i] ? r->tokens[i] : "");
+    jstring t = env->NewStringUTF(r->tokens_arr[i] ? r->tokens_arr[i] : "");
     env->SetObjectArrayElement(tokens, i, t);
     env->DeleteLocalRef(t);
   }

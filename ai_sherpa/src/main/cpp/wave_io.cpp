@@ -11,7 +11,7 @@ JNIEXPORT jobject JNICALL
 Java_com_dark_ai_1sherpa_WaveReader_readWaveFromFile(
     JNIEnv *env, jobject, jstring jfilename) {
   const char *filename = env->GetStringUTFChars(jfilename, nullptr);
-  SherpaOnnxWave *wave = SherpaOnnxReadWave(filename);
+  const SherpaOnnxWave *wave = SherpaOnnxReadWave(filename);
   env->ReleaseStringUTFChars(jfilename, filename);
 
   if (!wave) {
@@ -40,8 +40,20 @@ Java_com_dark_ai_1sherpa_WaveReader_readWaveFromAsset(
     JNIEnv *env, jobject, jobject asset_manager, jstring jfilename) {
   AAssetManager *mgr = AAssetManager_fromJava(env, asset_manager);
   const char *filename = env->GetStringUTFChars(jfilename, nullptr);
-  SherpaOnnxWave *wave = SherpaOnnxReadWaveFromAsset(mgr, filename);
+  AAsset *asset = AAssetManager_open(mgr, filename, AASSET_MODE_BUFFER);
   env->ReleaseStringUTFChars(jfilename, filename);
+
+  if (!asset) {
+    jclass ex = env->FindClass("java/lang/IllegalStateException");
+    env->ThrowNew(ex, "Failed to open wave asset");
+    env->DeleteLocalRef(ex);
+    return nullptr;
+  }
+
+  off_t size = AAsset_getLength(asset);
+  const char *data = reinterpret_cast<const char *>(AAsset_getBuffer(asset));
+  const SherpaOnnxWave *wave = SherpaOnnxReadWaveFromBinaryData(data, static_cast<int32_t>(size));
+  AAsset_close(asset);
 
   if (!wave) {
     jclass ex = env->FindClass("java/lang/IllegalStateException");
@@ -76,8 +88,8 @@ Java_com_dark_ai_1sherpa_WaveReader_writeWaveToFile(
     env->ReleaseStringUTFChars(jfilename, filename);
     return JNI_FALSE;
   }
-  int ok = SherpaOnnxWriteWave(filename, data, static_cast<int>(len),
-                                static_cast<int>(sample_rate));
+  int32_t ok = SherpaOnnxWriteWave(data, static_cast<int32_t>(len),
+                                    static_cast<int32_t>(sample_rate), filename);
   env->ReleasePrimitiveArrayCritical(jsamples, data, JNI_ABORT);
   env->ReleaseStringUTFChars(jfilename, filename);
   return ok ? JNI_TRUE : JNI_FALSE;

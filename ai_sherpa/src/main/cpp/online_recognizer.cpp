@@ -2,16 +2,6 @@
 #include "jni_common.h"
 #include "jni_cache.h"
 #include "sherpa-onnx/c-api/c-api.h"
-#include <android/asset_manager.h>
-#include <android/asset_manager_jni.h>
-#include <cstring>
-
-static void ReadEndpointRule(JNIEnv *env, jobject rule, jclass cls,
-                              SherpaOnnxEndpointRule *out) {
-  out->must_contain_nonsilence = GetBoolField(env, rule, cls, "mustContainNonSilence") ? 1 : 0;
-  out->min_trailing_silence = GetFloatField(env, rule, cls, "minTrailingSilence");
-  out->min_utterance_length = GetFloatField(env, rule, cls, "minUtteranceLength");
-}
 
 struct OnlineCfg {
   std::string decoding_method, hotwords_file, rule_fsts, rule_fars;
@@ -19,7 +9,6 @@ struct OnlineCfg {
   std::string trans_enc, trans_dec, trans_joi;
   std::string para_enc, para_dec;
   std::string zf_model, nemo_model;
-  std::string lm_model;
   std::string ctc_graph;
   std::string hr_lexicon, hr_rule_fsts;
   SherpaOnnxOnlineRecognizerConfig cfg{};
@@ -37,7 +26,6 @@ static OnlineCfg ReadOnlineConfig(JNIEnv *env, jobject jconfig) {
     jclass fc = env->GetObjectClass(jfeat);
     h.cfg.feat_config.sample_rate = GetIntField(env, jfeat, fc, "sampleRate");
     h.cfg.feat_config.feature_dim = GetIntField(env, jfeat, fc, "featureDim");
-    h.cfg.feat_config.dither = GetFloatField(env, jfeat, fc, "dither");
     env->DeleteLocalRef(fc);
     env->DeleteLocalRef(jfeat);
   }
@@ -111,37 +99,35 @@ static OnlineCfg ReadOnlineConfig(JNIEnv *env, jobject jconfig) {
     env->DeleteLocalRef(jmodel);
   }
 
-  // lm config
-  jobject jlm = GetObjField(env, jconfig, cfg_cls, "lmConfig",
-                              "Lcom/dark/ai_sherpa/OnlineLMConfig;");
-  if (jlm) {
-    jclass lc = env->GetObjectClass(jlm);
-    h.lm_model = GetStringField(env, jlm, lc, "model");
-    h.cfg.lm_config.model = h.lm_model.c_str();
-    h.cfg.lm_config.scale = GetFloatField(env, jlm, lc, "scale");
-    env->DeleteLocalRef(lc);
-    env->DeleteLocalRef(jlm);
-  }
-
-  // endpoint config
+  // endpoint: read rule thresholds from EndpointConfig/EndpointRule objects
+  h.cfg.enable_endpoint = GetBoolField(env, jconfig, cfg_cls, "enableEndpoint") ? 1 : 0;
   jobject jep = GetObjField(env, jconfig, cfg_cls, "endpointConfig",
                              "Lcom/dark/ai_sherpa/EndpointConfig;");
   if (jep) {
     jclass ec = env->GetObjectClass(jep);
 
     jobject jr1 = GetObjField(env, jep, ec, "rule1", "Lcom/dark/ai_sherpa/EndpointRule;");
-    jobject jr2 = GetObjField(env, jep, ec, "rule2", "Lcom/dark/ai_sherpa/EndpointRule;");
-    jobject jr3 = GetObjField(env, jep, ec, "rule3", "Lcom/dark/ai_sherpa/EndpointRule;");
     if (jr1) {
       jclass rc = env->GetObjectClass(jr1);
-      ReadEndpointRule(env, jr1, rc, &h.cfg.endpoint_config.rule1);
-      if (jr2) ReadEndpointRule(env, jr2, rc, &h.cfg.endpoint_config.rule2);
-      if (jr3) ReadEndpointRule(env, jr3, rc, &h.cfg.endpoint_config.rule3);
+      h.cfg.rule1_min_trailing_silence = GetFloatField(env, jr1, rc, "minTrailingSilence");
       env->DeleteLocalRef(rc);
+      env->DeleteLocalRef(jr1);
     }
-    if (jr1) env->DeleteLocalRef(jr1);
-    if (jr2) env->DeleteLocalRef(jr2);
-    if (jr3) env->DeleteLocalRef(jr3);
+    jobject jr2 = GetObjField(env, jep, ec, "rule2", "Lcom/dark/ai_sherpa/EndpointRule;");
+    if (jr2) {
+      jclass rc = env->GetObjectClass(jr2);
+      h.cfg.rule2_min_trailing_silence = GetFloatField(env, jr2, rc, "minTrailingSilence");
+      env->DeleteLocalRef(rc);
+      env->DeleteLocalRef(jr2);
+    }
+    jobject jr3 = GetObjField(env, jep, ec, "rule3", "Lcom/dark/ai_sherpa/EndpointRule;");
+    if (jr3) {
+      jclass rc = env->GetObjectClass(jr3);
+      h.cfg.rule3_min_utterance_length = GetFloatField(env, jr3, rc, "minUtteranceLength");
+      env->DeleteLocalRef(rc);
+      env->DeleteLocalRef(jr3);
+    }
+
     env->DeleteLocalRef(ec);
     env->DeleteLocalRef(jep);
   }
@@ -182,7 +168,6 @@ static OnlineCfg ReadOnlineConfig(JNIEnv *env, jobject jconfig) {
   h.cfg.rule_fsts = h.rule_fsts.c_str();
   h.cfg.rule_fars = h.rule_fars.c_str();
   h.cfg.blank_penalty = GetFloatField(env, jconfig, cfg_cls, "blankPenalty");
-  h.cfg.enable_endpoint = GetBoolField(env, jconfig, cfg_cls, "enableEndpoint") ? 1 : 0;
 
   env->DeleteLocalRef(cfg_cls);
   return h;
@@ -198,22 +183,6 @@ Java_com_dark_ai_1sherpa_OnlineRecognizer_newFromFile(
   if (!p) {
     jclass ex = env->FindClass("java/lang/IllegalStateException");
     env->ThrowNew(ex, "Failed to create OnlineRecognizer");
-    env->DeleteLocalRef(ex);
-    return 0;
-  }
-  return reinterpret_cast<jlong>(p);
-}
-
-JNIEXPORT jlong JNICALL
-Java_com_dark_ai_1sherpa_OnlineRecognizer_newFromAsset(
-    JNIEnv *env, jobject, jobject asset_manager, jobject jconfig) {
-  auto h = ReadOnlineConfig(env, jconfig);
-  AAssetManager *mgr = AAssetManager_fromJava(env, asset_manager);
-  const SherpaOnnxOnlineRecognizer *p =
-      SherpaOnnxCreateOnlineRecognizerFromAsset(mgr, &h.cfg);
-  if (!p) {
-    jclass ex = env->FindClass("java/lang/IllegalStateException");
-    env->ThrowNew(ex, "Failed to create OnlineRecognizer from asset");
     env->DeleteLocalRef(ex);
     return 0;
   }
@@ -256,7 +225,7 @@ Java_com_dark_ai_1sherpa_OnlineRecognizer_reset(
     JNIEnv *env, jobject, jlong ptr, jlong stream_ptr) {
   CHECK_PTR(env, ptr, );
   CHECK_PTR(env, stream_ptr, );
-  SherpaOnnxOnlineRecognizerReset(
+  SherpaOnnxOnlineStreamReset(
       reinterpret_cast<const SherpaOnnxOnlineRecognizer *>(ptr),
       reinterpret_cast<const SherpaOnnxOnlineStream *>(stream_ptr));
 }
@@ -266,7 +235,7 @@ Java_com_dark_ai_1sherpa_OnlineRecognizer_isReady(
     JNIEnv *env, jobject, jlong ptr, jlong stream_ptr) {
   CHECK_PTR(env, ptr, JNI_FALSE);
   CHECK_PTR(env, stream_ptr, JNI_FALSE);
-  return SherpaOnnxOnlineRecognizerIsReady(
+  return SherpaOnnxIsOnlineStreamReady(
       reinterpret_cast<const SherpaOnnxOnlineRecognizer *>(ptr),
       reinterpret_cast<const SherpaOnnxOnlineStream *>(stream_ptr))
       ? JNI_TRUE : JNI_FALSE;
@@ -277,7 +246,7 @@ Java_com_dark_ai_1sherpa_OnlineRecognizer_isEndpoint(
     JNIEnv *env, jobject, jlong ptr, jlong stream_ptr) {
   CHECK_PTR(env, ptr, JNI_FALSE);
   CHECK_PTR(env, stream_ptr, JNI_FALSE);
-  return SherpaOnnxOnlineRecognizerIsEndpoint(
+  return SherpaOnnxOnlineStreamIsEndpoint(
       reinterpret_cast<const SherpaOnnxOnlineRecognizer *>(ptr),
       reinterpret_cast<const SherpaOnnxOnlineStream *>(stream_ptr))
       ? JNI_TRUE : JNI_FALSE;
@@ -332,7 +301,7 @@ Java_com_dark_ai_1sherpa_OnlineRecognizer_getResult(
   int n_tokens = r->count;
   jobjectArray tokens = env->NewObjectArray(n_tokens, g_cache.string_cls, nullptr);
   for (int i = 0; i < n_tokens; ++i) {
-    jstring t = env->NewStringUTF(r->tokens[i] ? r->tokens[i] : "");
+    jstring t = env->NewStringUTF(r->tokens_arr && r->tokens_arr[i] ? r->tokens_arr[i] : "");
     env->SetObjectArrayElement(tokens, i, t);
     env->DeleteLocalRef(t);
   }

@@ -1,8 +1,6 @@
 // Copyright (c) 2025 Dark Matter Labs
 package com.dark.ai_sherpa
 
-import android.content.res.AssetManager
-
 class OfflineTts private constructor(private var ptr: Long) : AutoCloseable {
 
     val sampleRate: Int get() = getSampleRate(ptr)
@@ -32,13 +30,6 @@ class OfflineTts private constructor(private var ptr: Long) : AutoCloseable {
             return OfflineTts(p)
         }
 
-        fun fromAsset(assetManager: AssetManager, config: OfflineTtsConfig): OfflineTts {
-            val p = newFromAsset(assetManager, config)
-            check(p != 0L) { "Failed to create OfflineTts from assets" }
-            return OfflineTts(p)
-        }
-
         @JvmStatic private external fun newFromFile(config: OfflineTtsConfig): Long
-        @JvmStatic private external fun newFromAsset(assetManager: AssetManager, config: OfflineTtsConfig): Long
     }
 }

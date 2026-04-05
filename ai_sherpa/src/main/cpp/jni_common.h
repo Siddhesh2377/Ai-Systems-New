@@ -13,7 +13,7 @@
     jclass ex = (env)->FindClass("java/lang/NullPointerException"); \
     (env)->ThrowNew(ex, "Native pointer is null"); \
     (env)->DeleteLocalRef(ex); \
-    return (retval); \
+    return retval; \
   }
 
 inline std::string GetStringField(JNIEnv *env, jobject obj, jclass cls, const char *name) {

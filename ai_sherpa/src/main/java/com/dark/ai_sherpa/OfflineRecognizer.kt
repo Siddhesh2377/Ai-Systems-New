@@ -1,8 +1,6 @@
 // Copyright (c) 2025 Dark Matter Labs
 package com.dark.ai_sherpa
 
-import android.content.res.AssetManager
-
 class OfflineRecognizer private constructor(private var ptr: Long) : AutoCloseable {
 
     fun createStream(): OfflineStream {
@@ -36,14 +34,7 @@ class OfflineRecognizer private constructor(private var ptr: Long) : AutoCloseab
             return OfflineRecognizer(p)
         }
 
-        fun fromAsset(assetManager: AssetManager, config: OfflineRecognizerConfig): OfflineRecognizer {
-            val p = newFromAsset(assetManager, config)
-            check(p != 0L) { "Failed to create OfflineRecognizer from assets" }
-            return OfflineRecognizer(p)
-        }
-
         @JvmStatic private external fun newFromFile(config: OfflineRecognizerConfig): Long
-        @JvmStatic private external fun newFromAsset(assetManager: AssetManager, config: OfflineRecognizerConfig): Long
     }
 }
 

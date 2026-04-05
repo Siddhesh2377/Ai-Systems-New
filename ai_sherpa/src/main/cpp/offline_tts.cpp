@@ -2,8 +2,6 @@
 #include "jni_common.h"
 #include "jni_cache.h"
 #include "sherpa-onnx/c-api/c-api.h"
-#include <android/asset_manager.h>
-#include <android/asset_manager_jni.h>
 
 struct TtsCfg {
   std::string vits_model, vits_lexicon, vits_tokens, vits_data_dir, vits_dict_dir;
@@ -97,21 +95,6 @@ Java_com_dark_ai_1sherpa_OfflineTts_newFromFile(
   return reinterpret_cast<jlong>(p);
 }
 
-JNIEXPORT jlong JNICALL
-Java_com_dark_ai_1sherpa_OfflineTts_newFromAsset(
-    JNIEnv *env, jobject, jobject asset_manager, jobject jconfig) {
-  auto h = ReadTtsConfig(env, jconfig);
-  AAssetManager *mgr = AAssetManager_fromJava(env, asset_manager);
-  const SherpaOnnxOfflineTts *p = SherpaOnnxCreateOfflineTtsFromAsset(mgr, &h.cfg);
-  if (!p) {
-    jclass ex = env->FindClass("java/lang/IllegalStateException");
-    env->ThrowNew(ex, "Failed to create OfflineTts from asset");
-    env->DeleteLocalRef(ex);
-    return 0;
-  }
-  return reinterpret_cast<jlong>(p);
-}
-
 JNIEXPORT void JNICALL
 Java_com_dark_ai_1sherpa_OfflineTts_delete(
     JNIEnv *env, jobject, jlong ptr) {
@@ -142,9 +125,12 @@ Java_com_dark_ai_1sherpa_OfflineTts_generate(
   CHECK_PTR(env, ptr, nullptr);
 
   const char *text = env->GetStringUTFChars(jtext, nullptr);
-  const SherpaOnnxGeneratedAudio *audio = SherpaOnnxOfflineTtsGenerate(
+  SherpaOnnxGenerationConfig gen_cfg{};
+  gen_cfg.sid = static_cast<int>(sid);
+  gen_cfg.speed = static_cast<float>(speed);
+  const SherpaOnnxGeneratedAudio *audio = SherpaOnnxOfflineTtsGenerateWithConfig(
       reinterpret_cast<const SherpaOnnxOfflineTts *>(ptr),
-      text, static_cast<int>(sid), static_cast<float>(speed));
+      text, &gen_cfg, nullptr, nullptr);
   env->ReleaseStringUTFChars(jtext, text);
 
   if (!audio) {
