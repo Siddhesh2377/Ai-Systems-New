@@ -1,18 +1,32 @@
-# IDE
-**/*.iml
-.idea/
+# Gradle
 .gradle/
-.kotlin/
-.vscode/
+**/build/
+local.properties
 
-# Build artifacts
-build/
-.cxx/
-.externalNativeBuild/
+# Android
+*.apk
+*.aab
+*.ap_
 /captures
 
-# Local configuration
-local.properties
+# NDK / CMake
+**/.cxx/
+.externalNativeBuild/
+CMakeFiles/
+cmake_install.cmake
+CMakeCache.txt
+
+# IDE
+**/*.iml
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/shelf/
+.idea/dictionaries/
+.idea/.name
+.vscode/
+
+# Kotlin
+.kotlin/
 
 # Claude Code
 .claude/
@@ -22,3 +36,4 @@ local.properties
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
