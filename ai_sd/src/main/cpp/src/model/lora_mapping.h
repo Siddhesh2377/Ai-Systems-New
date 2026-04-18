@@ -1,7 +1,8 @@
+#pragma once
 #include <string>
 #include <unordered_map>
 
-std::unordered_map<std::string, std::string> lora_mapping = {
+inline std::unordered_map<std::string, std::string> lora_mapping = {
     {"cond_stage_model.transformer.text_model.encoder.layers.0.mlp.fc1.weight",
      "lora_te_text_model_encoder_layers_0_mlp_fc1"},
     {"cond_stage_model.transformer.text_model.encoder.layers.0.mlp.fc2.weight",

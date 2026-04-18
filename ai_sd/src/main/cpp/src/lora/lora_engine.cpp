@@ -19,6 +19,8 @@
 
 namespace fs = std::filesystem;
 
+namespace sd_pipeline {
+
 // ============================================================================
 // Public API
 // ============================================================================
@@ -247,3 +249,5 @@ bool LoRAEngine::validate_lora_file(const std::string& path) {
         return false;
     }
 }
+
+} // namespace sd_pipeline

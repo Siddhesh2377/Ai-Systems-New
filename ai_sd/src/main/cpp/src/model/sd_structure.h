@@ -1,7 +1,8 @@
+#pragma once
 #include <string>
 #include <vector>
 
-std::vector<std::vector<std::string>> clip_structure = {
+inline std::vector<std::vector<std::string>> clip_structure = {
     {"cond_stage_model.transformer.text_model.encoder.layers.0.layer_norm1."
      "weight",
      "fp32"},
@@ -533,7 +534,7 @@ std::vector<std::vector<std::string>> clip_structure = {
     {"cond_stage_model.transformer.text_model.final_layer_norm.weight", "fp32"},
     {"cond_stage_model.transformer.text_model.final_layer_norm.bias", "fp32"}};
 
-std::vector<std::vector<std::string>> clip_skip_2_structure = {
+inline std::vector<std::vector<std::string>> clip_skip_2_structure = {
     {"cond_stage_model.transformer.text_model.encoder.layers.0.layer_norm1."
      "weight",
      "fp32"},
@@ -1021,7 +1022,7 @@ std::vector<std::vector<std::string>> clip_skip_2_structure = {
     {"cond_stage_model.transformer.text_model.final_layer_norm.weight", "fp32"},
     {"cond_stage_model.transformer.text_model.final_layer_norm.bias", "fp32"}};
 
-std::vector<std::vector<std::string>> unet_structure = {
+inline std::vector<std::vector<std::string>> unet_structure = {
     {"model.diffusion_model.input_blocks.0.0.weight", "block_quant",
      "320x4x3x3"},
     {"model.diffusion_model.input_blocks.0.0.bias", "fp32"},
@@ -2436,7 +2437,7 @@ std::vector<std::vector<std::string>> unet_structure = {
     {"model.diffusion_model.out.2.weight", "block_quant", "4x320x3x3"},
     {"model.diffusion_model.out.2.bias", "fp32"}};
 
-std::vector<std::vector<std::string>> vae_decoder_structure = {
+inline std::vector<std::vector<std::string>> vae_decoder_structure = {
     {"first_stage_model.post_quant_conv.weight", "fp16"},
     {"first_stage_model.post_quant_conv.bias", "fp32"},
     {"first_stage_model.decoder.conv_in.weight", "fp16"},
@@ -2518,7 +2519,7 @@ std::vector<std::vector<std::string>> vae_decoder_structure = {
     {"first_stage_model.decoder.conv_out.weight", "fp16"},
     {"first_stage_model.decoder.conv_out.bias", "fp32"}};
 
-std::vector<std::vector<std::string>> vae_encoder_structure = {
+inline std::vector<std::vector<std::string>> vae_encoder_structure = {
     {"first_stage_model.encoder.conv_in.weight", "fp16"},
     {"first_stage_model.encoder.conv_in.bias", "fp32"},
     {"first_stage_model.encoder.down.0.block.0.conv1.weight", "fp16"},
@@ -2584,7 +2585,7 @@ std::vector<std::vector<std::string>> vae_encoder_structure = {
     {"first_stage_model.quant_conv.weight", "fp16"},
     {"first_stage_model.quant_conv.bias", "fp32"}};
 
-std::unordered_map<std::string, int> vae_encoder_small_weights = {
+inline std::unordered_map<std::string, int> vae_encoder_small_weights = {
     {"first_stage_model.encoder.down.0.block.0.norm1.bias", 119516},
     {"first_stage_model.encoder.down.0.block.0.norm1.weight", 120008},
     {"first_stage_model.encoder.down.0.block.0.norm2.bias", 117180},
@@ -2630,7 +2631,7 @@ std::unordered_map<std::string, int> vae_encoder_small_weights = {
     {"first_stage_model.encoder.norm_out.bias", 30796},
     {"first_stage_model.encoder.norm_out.weight", 32016}};
 
-std::unordered_map<std::string, int> vae_decoder_small_weights = {
+inline std::unordered_map<std::string, int> vae_decoder_small_weights = {
     {"first_stage_model.decoder.mid.attn_1.norm.bias", 137824},
     {"first_stage_model.decoder.mid.attn_1.norm.weight", 139060},
     {"first_stage_model.decoder.mid.block_1.norm1.bias", 149480},
@@ -2692,7 +2693,7 @@ std::unordered_map<std::string, int> vae_decoder_small_weights = {
     {"first_stage_model.decoder.up.3.block.2.norm2.bias", 95488},
     {"first_stage_model.decoder.up.3.block.2.norm2.weight", 96724}};
 
-std::unordered_map<std::string, int> unet_small_weights = {
+inline std::unordered_map<std::string, int> unet_small_weights = {
     {"model.diffusion_model.input_blocks.1.0.in_layers.0.bias", 1102828},
     {"model.diffusion_model.input_blocks.1.0.in_layers.0.weight", 1104344},
     {"model.diffusion_model.input_blocks.1.0.out_layers.0.bias", 1089404},

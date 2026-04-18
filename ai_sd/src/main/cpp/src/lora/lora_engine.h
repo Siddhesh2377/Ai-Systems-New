@@ -15,6 +15,8 @@
 #include <string>
 #include <vector>
 
+namespace sd_pipeline {
+
 class LoRAEngine {
 public:
     struct ActiveLoRA {
@@ -78,3 +80,5 @@ private:
     /** Validate that a LoRA file is a readable SafeTensor with LoRA keys. */
     static bool validate_lora_file(const std::string& path);
 };
+
+} // namespace sd_pipeline

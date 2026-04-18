@@ -1175,6 +1175,8 @@ GenerationResult generateImage(
   }
 }
 
+#include "../lora/lora_engine.h"
+
 // =============================================================================
 // sd_pipeline namespace - JNI-callable functions replacing HTTP server
 // =============================================================================
@@ -1272,8 +1274,6 @@ SDGenerationResult run_generation(PipelineContext& ctx,
 // ============================================================================
 // LoRA — runtime weight patching (MNN-only)
 // ============================================================================
-#include "../lora/lora_engine.h"
-
 static LoRAEngine g_lora_engine;
 
 bool apply_lora(const std::string& path, float weight) {
