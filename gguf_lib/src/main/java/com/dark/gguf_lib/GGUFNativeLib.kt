@@ -77,6 +77,14 @@ object GGUFNativeLib {
     external fun nativeStateSaveToFile(path: String): Boolean
     external fun nativeStateLoadFromFile(path: String): Boolean
 
+    // ---- KV Eviction Policy ----
+
+    /** Set StreamingLLM-style eviction policy. nWindow=0 disables eviction. */
+    external fun nativeSetKvPolicy(nSink: Int, nWindow: Int, evictAtFull: Boolean)
+
+    /** Apply eviction immediately — useful after long prefill (SnapKV-style budget). */
+    external fun nativeEvictToBudget()
+
     // ---- Character Engine ----
 
     external fun nativeSetPersonality(paramsJson: String)

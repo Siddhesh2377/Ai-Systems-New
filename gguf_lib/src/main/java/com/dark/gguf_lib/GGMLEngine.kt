@@ -8,21 +8,10 @@ import com.dark.gguf_lib.models.StreamCallback
 import com.dark.gguf_lib.toolcalling.GrammarMode
 import com.dark.gguf_lib.toolcalling.ToolCallingConfig
 import com.dark.gguf_lib.toolcalling.ToolDefinitionBuilder
-import com.dark.unified_inference.capability.SamplerConfigurable
-import com.dark.unified_inference.capability.StatePersistable
-import com.dark.unified_inference.capability.ThinkingCapable
-import com.dark.unified_inference.capability.ToolCallingCapable
-import com.dark.unified_inference.capability.VisionCapable
-import com.dark.unified_inference.model.ModelDescriptor
-import com.dark.unified_inference.model.ModelFormat
-import com.dark.unified_inference.model.ModelSource
-import com.dark.unified_inference.text.TextEngine
-import com.dark.unified_inference.text.TextEvent
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
-import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -58,32 +47,11 @@ import org.json.JSONArray
  * engine.unload()
  * ```
  */
-class GGMLEngine : TextEngine,
-    ToolCallingCapable,
-    VisionCapable,
-    ThinkingCapable,
-    SamplerConfigurable,
-    StatePersistable {
+class GGMLEngine {
 
     private var loaded = false
 
-    // ── UIS: InferenceEngine ──
-
-    override val engineId: String = "gguf"
-    override val displayName: String = "llama.cpp"
-    override val providerTag: String = "Tool Neuron"
-    override val supportedFormats: List<ModelFormat> = listOf(ModelFormat.GGUF)
-
-    override fun isModelLoaded(): Boolean = loaded
-
-    override suspend fun loadModel(descriptor: ModelDescriptor, params: String?): Boolean {
-        return when (val source = descriptor.source) {
-            is ModelSource.FilePath -> load(source.path)
-            is ModelSource.FileDescriptor -> loadFromFd(source.fd)
-            is ModelSource.ContentUri -> false
-            is ModelSource.Directory -> false
-        }
-    }
+    fun isModelLoaded(): Boolean = loaded
 
     // ---- Model Loading ----
 
@@ -159,9 +127,32 @@ class GGMLEngine : TextEngine,
     fun setTokenBatchSize(bytes: Int) = GGUFNativeLib.nativeSetTokenBatchSize(bytes)
 
     /**
+     * Configure StreamingLLM-style KV eviction policy.
+     *
+     * When the context fills up, instead of a hard stop:
+     * - Keeps [0, nSink) tokens (attention sinks — typically 4)
+     * - Keeps the most recent [nPast-nWindow, nPast) tokens
+     * - Evicts everything in between
+     *
+     * Set nWindow=0 to disable (default — falls back to normal context shift).
+     *
+     * @param nSink   Tokens at the start to never evict. Default: 4.
+     * @param nWindow Max recency window. 0 = disabled.
+     * @param evictAtFull Auto-evict at generation start if context would overflow.
+     */
+    fun setKvPolicy(nSink: Int = 4, nWindow: Int = 0, evictAtFull: Boolean = false) =
+        GGUFNativeLib.nativeSetKvPolicy(nSink, nWindow, evictAtFull)
+
+    /**
+     * Apply KV eviction immediately (SnapKV-style post-prefill budget enforcement).
+     * Call after loading a long system prompt to trim KV cache to the policy window.
+     */
+    fun evictToBudget() = GGUFNativeLib.nativeEvictToBudget()
+
+    /**
      * Release the loaded model and free all resources.
      */
-    override suspend fun unload() {
+    suspend fun unload() {
         if (loaded) {
             GGUFNativeLib.nativeRelease()
             loaded = false
@@ -181,9 +172,9 @@ class GGMLEngine : TextEngine,
     /**
      * Check if the loaded model supports thinking/reasoning blocks.
      */
-    override fun supportsThinking(): Boolean = loaded && GGUFNativeLib.nativeSupportsThinking()
+    fun supportsThinking(): Boolean = loaded && GGUFNativeLib.nativeSupportsThinking()
 
-    override fun setThinkingEnabled(enabled: Boolean) {
+    fun setThinkingEnabled(enabled: Boolean) {
         GGUFNativeLib.nativeSetThinkingEnabled(enabled)
     }
 
@@ -213,14 +204,14 @@ class GGMLEngine : TextEngine,
      * dryMultiplier, dryBase, dryAllowedLength, dryPenaltyLastN,
      * xtcProbability, xtcThreshold, mirostat, mirostatTau, mirostatEta, seed
      */
-    override fun updateSamplerParams(paramsJson: String): Boolean =
+    fun updateSamplerParams(paramsJson: String): Boolean =
         GGUFNativeLib.nativeUpdateSamplerParams(paramsJson)
 
     /**
      * Set per-token logit biases.
      * @param biasJson JSON object {"token_id": bias} or array [{"token": id, "bias": val}]
      */
-    override fun setLogitBias(biasJson: String): Boolean {
+    fun setLogitBias(biasJson: String): Boolean {
         GGUFNativeLib.nativeSetLogitBias(biasJson)
         return true
     }
@@ -271,13 +262,11 @@ class GGMLEngine : TextEngine,
         awaitClose { job.cancel(); GGUFNativeLib.nativeStopGeneration() }
     }
 
-    // ── UIS: TextEngine ──
+    fun generateFlow(prompt: String, maxTokens: Int): Flow<GenerationEvent> =
+        generateRawFlow(prompt, maxTokens)
 
-    override fun generateFlow(prompt: String, maxTokens: Int): Flow<TextEvent> =
-        generateRawFlow(prompt, maxTokens).map { it.toTextEvent() }
-
-    override fun generateMultiTurnFlow(messagesJson: String, maxTokens: Int): Flow<TextEvent> =
-        generateMultiTurnRawFlow(messagesJson, maxTokens).map { it.toTextEvent() }
+    fun generateMultiTurnFlow(messagesJson: String, maxTokens: Int): Flow<GenerationEvent> =
+        generateMultiTurnRawFlow(messagesJson, maxTokens)
 
     /**
      * Simple non-streaming generation. Returns the complete text.
@@ -301,7 +290,7 @@ class GGMLEngine : TextEngine,
         GenerationResult(text = text.toString(), success = ok && error == null, metrics = metrics, error = error)
     }
 
-    override fun stopGeneration() = GGUFNativeLib.nativeStopGeneration()
+    fun stopGeneration() = GGUFNativeLib.nativeStopGeneration()
 
     // ---- Tool Calling ----
 
@@ -319,9 +308,7 @@ class GGMLEngine : TextEngine,
         GGUFNativeLib.nativeSetTypedGrammar(config.useTypedGrammar)
     }
 
-    // ── UIS: ToolCallingCapable ──
-
-    override fun enableToolCalling(toolsJson: String, grammarMode: Int, useTypedGrammar: Boolean): Boolean {
+    fun enableToolCalling(toolsJson: String, grammarMode: Int, useTypedGrammar: Boolean): Boolean {
         GGUFNativeLib.nativeSetToolsJson(toolsJson)
         GGUFNativeLib.nativeSetGrammarMode(grammarMode)
         GGUFNativeLib.nativeSetTypedGrammar(useTypedGrammar)
@@ -336,9 +323,9 @@ class GGMLEngine : TextEngine,
     /**
      * Disable tool calling.
      */
-    override fun clearTools() = GGUFNativeLib.nativeSetToolsJson("")
+    fun clearTools() = GGUFNativeLib.nativeSetToolsJson("")
 
-    override fun isToolCallingSupported(): Boolean = loaded && GGUFNativeLib.nativeIsToolCallingSupported()
+    fun isToolCallingSupported(): Boolean = loaded && GGUFNativeLib.nativeIsToolCallingSupported()
 
     // ---- Control Vectors ----
 
@@ -351,11 +338,9 @@ class GGMLEngine : TextEngine,
 
     fun clearControlVector() = GGUFNativeLib.nativeClearControlVector()
 
-    // ── UIS: StatePersistable ──
-
-    override fun getStateSize(): Long = if (loaded) GGUFNativeLib.nativeGetStateSize() else 0
-    override fun stateSaveToFile(path: String): Boolean = GGUFNativeLib.nativeStateSaveToFile(path)
-    override fun stateLoadFromFile(path: String): Boolean = GGUFNativeLib.nativeStateLoadFromFile(path)
+    fun getStateSize(): Long = if (loaded) GGUFNativeLib.nativeGetStateSize() else 0
+    fun stateSaveToFile(path: String): Boolean = GGUFNativeLib.nativeStateSaveToFile(path)
+    fun stateLoadFromFile(path: String): Boolean = GGUFNativeLib.nativeStateLoadFromFile(path)
 
     // get current KV cache utilization (0.0 = empty, 1.0 = full)
     fun getContextUsage(): Float = if (loaded) GGUFNativeLib.nativeGetContextUsage() else 0f
@@ -460,20 +445,7 @@ class GGMLEngine : TextEngine,
         awaitClose { job.cancel(); GGUFNativeLib.nativeStopGeneration() }
     }
 
-    // ── UIS: VisionCapable ──
-
-    override fun loadVisionProjector(descriptor: ModelDescriptor): Boolean {
-        return when (val source = descriptor.source) {
-            is ModelSource.FilePath -> loadVlmProjector(source.path)
-            is ModelSource.FileDescriptor -> loadVlmProjectorFromFd(source.fd)
-            else -> false
-        }
-    }
-
-    override fun releaseVisionProjector() = releaseVlmProjector()
-
-    override fun generateVisionFlow(messagesJson: String, imageData: List<ByteArray>, maxTokens: Int): Flow<TextEvent> =
-        generateVlmFlow(messagesJson, imageData, maxTokens).map { it.toTextEvent() }
+    fun releaseVisionProjector() = releaseVlmProjector()
 
     // ---- Device Tier ----
 
@@ -504,23 +476,6 @@ class GGMLEngine : TextEngine,
             }
         }
     }
-}
-
-// ---- Mapper ----
-
-private fun GenerationEvent.toTextEvent(): TextEvent = when (this) {
-    is GenerationEvent.Token -> TextEvent.Token(text)
-    is GenerationEvent.ToolCall -> TextEvent.ToolCall(name, argsJson)
-    is GenerationEvent.Done -> TextEvent.Done
-    is GenerationEvent.Error -> TextEvent.Error(message)
-    is GenerationEvent.Progress -> TextEvent.Progress(progress)
-    is GenerationEvent.Metrics -> TextEvent.Metrics(
-        tokensPerSecond = metrics.tokensPerSecond,
-        timeToFirstTokenMs = metrics.timeToFirstTokenMs,
-        totalTimeMs = metrics.totalTimeMs,
-        tokensEvaluated = metrics.tokensEvaluated,
-        tokensPredicted = metrics.tokensPredicted
-    )
 }
 
 // ---- Data classes ----

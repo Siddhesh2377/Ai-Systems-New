@@ -8,6 +8,7 @@
 #include <mutex>
 #include <thread>
 #include <cstring>
+#include <cstdio>
 #include <cstdlib>
 #include <cmath>
 #include <chrono>
@@ -184,7 +185,57 @@ static struct {
     // Thinking mode (set via nativeSetThinkingEnabled)
     bool thinking_enabled = true;
 
+    // StreamingLLM-style KV eviction policy
+    int kv_n_sink   = 4;   // attention sink tokens, never evicted
+    int kv_n_window = 0;   // 0 = disabled; >0 = max recency window
+    bool kv_evict_at_full = false;
+
 } g_state;
+
+static void kv_evict_streaming();
+
+// Memory introspection helpers ----------------------------------------------
+
+static float read_proc_status_mb(const char * key) {
+    FILE * f = fopen("/proc/self/status", "r");
+    if (!f) return 0.f;
+    char line[256];
+    size_t key_len = strlen(key);
+    float kb = 0.f;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, key, key_len) == 0 && line[key_len] == ':') {
+            long v = 0;
+            if (sscanf(line + key_len + 1, " %ld", &v) == 1) kb = (float)v;
+            break;
+        }
+    }
+    fclose(f);
+    return kb / 1024.f;
+}
+
+static float read_mem_total_mb() {
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (!f) return 0.f;
+    char line[256];
+    float kb = 0.f;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "MemTotal:", 9) == 0) {
+            long v = 0;
+            if (sscanf(line + 9, " %ld", &v) == 1) kb = (float)v;
+            break;
+        }
+    }
+    fclose(f);
+    return kb / 1024.f;
+}
+
+static void compute_memory_metrics(float & model_mb, float & ctx_mb, float & peak_mb, float & mem_pct) {
+    model_mb = g_state.model ? (float)llama_model_size(g_state.model) / (1024.f * 1024.f) : 0.f;
+    ctx_mb   = g_state.ctx   ? (float)llama_state_get_size(g_state.ctx) / (1024.f * 1024.f) : 0.f;
+    peak_mb  = read_proc_status_mb("VmPeak");
+    float total_mb = read_mem_total_mb();
+    mem_pct  = (total_mb > 0.f && peak_mb > 0.f) ? (peak_mb / total_mb) * 100.f : 0.f;
+}
 
 // Helper: GGML type string to enum
 
@@ -787,6 +838,12 @@ static int check_prompt_fits(int n_prompt_tokens, int max_gen_tokens) {
 static bool try_context_shift() {
     if (!g_state.ctx) return false;
 
+    // Prefer StreamingLLM eviction when policy is active
+    if (g_state.kv_n_window > 0) {
+        kv_evict_streaming();
+        return g_state.n_past < (int)llama_n_ctx(g_state.ctx) - 1;
+    }
+
     llama_memory_t mem = llama_get_memory(g_state.ctx);
     if (!mem || !llama_memory_can_shift(mem)) {
         LOGW("Context shift not supported by memory backend");
@@ -807,6 +864,27 @@ static bool try_context_shift() {
 
     LOGI("Context shift done: new n_past=%d", g_state.n_past);
     return true;
+}
+
+// StreamingLLM-style eviction: keep [0, n_sink) + tail [n_past-n_window, n_past)
+static void kv_evict_streaming() {
+    if (!g_state.ctx || g_state.kv_n_window <= 0) return;
+    int n_past   = g_state.n_past;
+    int n_sink   = g_state.kv_n_sink;
+    int n_window = g_state.kv_n_window;
+
+    if (n_past <= n_sink + n_window) return; // nothing to evict
+
+    llama_memory_t mem = llama_get_memory(g_state.ctx);
+    if (!mem) return;
+
+    int evict_end = n_past - n_window;
+    llama_memory_seq_rm(mem, 0, n_sink, evict_end);
+    // shift tail positions so they're contiguous after sinks
+    llama_memory_seq_add(mem, 0, evict_end, n_past, -(evict_end - n_sink));
+    g_state.n_past = n_sink + n_window;
+    g_state.prev_prompt_tokens.clear();
+    LOGI("KV evict: n_past %d -> %d (sink=%d window=%d)", n_past, g_state.n_past, n_sink, n_window);
 }
 
 // get current context usage as a ratio (0.0 to 1.0)
@@ -1384,6 +1462,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStream(
     float tps = gen_ms > 0 ? (n_generated / (gen_ms / 1000.0f)) : 0;
     float ttft_ms = prompt_ms;
     float model_mb = 0, ctx_mb = 0, peak_mb = 0, mem_pct = 0;
+    compute_memory_metrics(model_mb, ctx_mb, peak_mb, mem_pct);
 
     if (g_onMetrics) {
         env->CallVoidMethod(callback, g_onMetrics,
@@ -1718,12 +1797,14 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStreamMultiTurn(
     float total_ms = std::chrono::duration<float, std::milli>(t_end - t_start).count();
     float tps = gen_ms > 0 ? (n_generated / (gen_ms / 1000.0f)) : 0;
     float ttft_ms = prompt_ms;
+    float model_mb = 0, ctx_mb = 0, peak_mb = 0, mem_pct = 0;
+    compute_memory_metrics(model_mb, ctx_mb, peak_mb, mem_pct);
 
     if (g_onMetrics) {
         env->CallVoidMethod(callback, g_onMetrics,
             tps, ttft_ms, total_ms,
             prompt_tokens, n_generated,
-            0.0f, 0.0f, 0.0f, 0.0f);
+            model_mb, ctx_mb, peak_mb, mem_pct);
     }
 
     env->CallVoidMethod(callback, g_onDone);
@@ -3696,17 +3777,37 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGenerateStream(
     float gen_ms = std::chrono::duration<float, std::milli>(t_end - t_prompt_done).count();
     float total_ms = std::chrono::duration<float, std::milli>(t_end - t_start).count();
     float tps = gen_ms > 0 ? (n_generated / (gen_ms / 1000.0f)) : 0;
+    float model_mb = 0, ctx_mb = 0, peak_mb = 0, mem_pct = 0;
+    compute_memory_metrics(model_mb, ctx_mb, peak_mb, mem_pct);
 
     if (g_onMetrics) {
         env->CallVoidMethod(callback, g_onMetrics,
             tps, prompt_ms, total_ms,
             prompt_tokens, n_generated,
-            0.0f, 0.0f, 0.0f, 0.0f);
+            model_mb, ctx_mb, peak_mb, mem_pct);
     }
 
     env->CallVoidMethod(callback, g_onDone);
 
     LOGI("VLM: generation complete — %d tokens, %.1f t/s, prompt %.0fms", n_generated, tps, prompt_ms);
     return JNI_TRUE;
+}
+
+// ── KV Eviction Policy ────────────────────────────────────────────────────────
+
+// nativeSetKvPolicy(nSink, nWindow, evictAtFull)
+extern "C" JNIEXPORT void JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetKvPolicy(
+        JNIEnv *, jobject, jint nSink, jint nWindow, jboolean evictAtFull) {
+    g_state.kv_n_sink        = (int)nSink;
+    g_state.kv_n_window      = (int)nWindow;
+    g_state.kv_evict_at_full = (bool)evictAtFull;
+    LOGI("KV policy: sink=%d window=%d evict_at_full=%d", (int)nSink, (int)nWindow, (int)evictAtFull);
+}
+
+// nativeEvictToBudget — apply StreamingLLM eviction immediately
+extern "C" JNIEXPORT void JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeEvictToBudget(JNIEnv *, jobject) {
+    kv_evict_streaming();
 }
 

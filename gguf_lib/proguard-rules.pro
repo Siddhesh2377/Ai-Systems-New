@@ -1,40 +1,33 @@
 # ============================================================================
 # Tool-Neuron gguf_lib — Library ProGuard Rules
-# Applied when building the library itself with minification enabled.
+# Applied when building the library with minification enabled (release builds).
+# Consumer rules in consumer-rules.pro are automatically included — no duplication needed.
 # ============================================================================
 
-# Keep everything in consumer-rules.pro (auto-included),
-# plus library-internal classes needed for correct operation.
-
-# JNI bridge — all native methods must be kept verbatim
--keep class com.dark.gguf_lib.GGUFNativeLib {
-    native <methods>;
-    # Static init block loads the .so
-    static { *; }
-}
-
-# Callback interfaces — method signatures must match JNI lookups
--keep interface com.dark.gguf_lib.models.StreamCallback { *; }
--keep interface com.dark.gguf_lib.models.EmbeddingCallback { *; }
-
-# Data classes constructed or inspected from native/JSON
--keep class com.dark.gguf_lib.models.** { *; }
--keep class com.dark.gguf_lib.toolcalling.** { *; }
-
-# Public SDK API
--keep class com.dark.gguf_lib.GGMLEngine { public protected *; }
--keep class com.dark.gguf_lib.ToolManager { public protected *; }
--keep class com.dark.gguf_lib.CharacterEngine { public protected *; }
--keep class com.dark.gguf_lib.EmbeddingEngine { public protected *; }
--keep class com.dark.gguf_lib.RAGEngine { public protected *; }
-
-# Keep source file + line numbers for crash reports
+# --- Source map preservation for crash reports ---
 -keepattributes SourceFile,LineNumberTable
 -renamesourcefileattribute SourceFile
 
-# Keep annotations (used by Kotlin, coroutines, etc.)
--keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod
+# --- Kotlin metadata and signatures ---
+-keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod,RuntimeVisibleAnnotations
 
-# Kotlin coroutines
--keep class kotlinx.coroutines.** { *; }
+# --- Kotlin intrinsics ---
+# R8 can inline these but some versions produce broken bytecode without this guard.
+-dontwarn kotlin.Unit
+-dontwarn kotlin.**
+
+# --- Coroutines ---
+# Keep only what's needed: internal state machine classes and flow infrastructure.
+# Do NOT blanket-keep all of kotlinx.coroutines — that defeats minification.
+-keep class kotlinx.coroutines.flow.** { *; }
+-keepclassmembers class * {
+    @kotlinx.coroutines.** *;
+}
 -dontwarn kotlinx.coroutines.**
+
+# --- Kotlin callbackFlow / awaitClose internals ---
+# Used by GGMLEngine streaming flows — the lambda closures must survive.
+-keepclassmembers class * extends kotlinx.coroutines.channels.ProducerScope { *; }
+
+# --- R8 / ProGuard compatibility ---
+-ignorewarnings

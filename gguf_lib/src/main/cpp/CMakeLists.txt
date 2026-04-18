@@ -95,6 +95,7 @@ set(VLM_SOURCES
 # JNI bridge + engine libraries
 add_library(${CMAKE_PROJECT_NAME} SHARED
     gguf_lib.cpp
+    ${LLAMA_DIR}/engine/tn-log.cpp
     ${LLAMA_DIR}/engine/tool-manager.cpp
     ${LLAMA_DIR}/engine/thread-engine.cpp
     ${LLAMA_DIR}/engine/rag-engine.cpp
