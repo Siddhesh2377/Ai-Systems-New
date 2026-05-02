@@ -159,7 +159,8 @@ class DiffusionManager(private val context: Context) {
             // Early validation: fail fast if UNET file is missing
             val unetFile = File(modelsDir, unetFilename)
             if (!unetFile.exists()) {
-                val msg = "UNET file not found: ${unetFile.absolutePath} — CPU mode requires .mnn model files"
+                val mode = if (model.runOnCpu) "CPU/MNN" else "QNN"
+                val msg = "UNET file not found: ${unetFile.absolutePath} ($mode mode expects $unetFilename in modelDir)"
                 Log.e(TAG, msg)
                 synchronized(stateLock) {
                     _backendState.value = DiffusionBackendState.Error(msg)
@@ -358,6 +359,17 @@ class DiffusionManager(private val context: Context) {
             try {
                 updateGenerationState(DiffusionGenerationState.Progress(0f))
 
+                val inputImageBytes: ByteArray? = params.inputImage?.let { base64Str ->
+                    runCatching { java.util.Base64.getDecoder().decode(base64Str) }
+                        .onFailure { Log.e(TAG, "Failed to decode input image", it) }
+                        .getOrNull()
+                }
+                val maskBytes: ByteArray? = params.mask?.let { base64Str ->
+                    runCatching { java.util.Base64.getDecoder().decode(base64Str) }
+                        .onFailure { Log.e(TAG, "Failed to decode mask", it) }
+                        .getOrNull()
+                }
+
                 var result: DiffusionGenerationResult = DiffusionGenerationResult.Failure("No result")
 
                 val callback = object : SDCallback {
@@ -403,8 +415,8 @@ class DiffusionManager(private val context: Context) {
                     height = params.height,
                     scheduler = params.scheduler,
                     useOpenCL = params.useOpenCL,
-                    inputImage = null,
-                    mask = null,
+                    inputImage = inputImageBytes,
+                    mask = maskBytes,
                     denoiseStrength = params.denoiseStrength,
                     showProcess = params.showDiffusionProcess,
                     showStride = params.showDiffusionStride,

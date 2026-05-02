@@ -17,6 +17,7 @@
 #include "depth/depth_estimator.h"
 #include "style/style_transfer.h"
 #include "pipeline/pipeline_globals.h"
+#include "model/qnn_model.h"  // full type needed for unique_ptr<QnnModel>::reset()
 #include "utils/cpu_affinity.h"
 #include "utils/jni_utils.h"
 #include "utils/sd_logger.h"
@@ -222,35 +223,49 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeGenerate(
         }
     }
 
-    // Handle mask input
+    // Handle mask input.
+    // Two valid sizes: latent-space (sampleW*sampleH*3) or full-resolution
+    // (width*height*3). Anything else means the caller passed the wrong shape
+    // and would silently produce a wrong inpaint without this check.
     if (mask) {
         jsize maskLen = env->GetArrayLength(mask);
         if (maskLen > 0) {
-            params.hasMask = true;
-            // Mask processing is handled inside the pipeline
-            // (same as xororz's server handler)
-            jbyte* maskBytes = env->GetByteArrayElements(mask, nullptr);
-            JniByteArrayGuard maskGuard(env, mask, maskBytes);
             int sampleW = width / 8;
             int sampleH = height / 8;
+            jsize expectedLatent = sampleW * sampleH * 3;
+            jsize expectedFull   = width * height * 3;
+            if (maskLen != expectedLatent && maskLen != expectedFull) {
+                SD_LOG_ERROR(
+                    "Mask size mismatch: got %d bytes; expected %d (latent %dx%dx3) "
+                    "or %d (full %dx%dx3). Skipping mask.",
+                    (int)maskLen, expectedLatent, sampleW, sampleH,
+                    expectedFull, width, height);
+            } else {
+                params.hasMask = true;
+                jbyte* maskBytes = env->GetByteArrayElements(mask, nullptr);
+                JniByteArrayGuard maskGuard(env, mask, maskBytes);
 
-            // Latent-space mask (4 channels)
-            params.mask.resize(4 * sampleW * sampleH);
-            for (int y = 0; y < sampleH; y++) {
-                for (int x = 0; x < sampleW; x++) {
-                    // Average RGB to grayscale, normalize to [0,1]
-                    int srcIdx = (y * sampleW + x) * 3;
-                    float val = (static_cast<uint8_t>(maskBytes[srcIdx]) +
-                                 static_cast<uint8_t>(maskBytes[srcIdx + 1]) +
-                                 static_cast<uint8_t>(maskBytes[srcIdx + 2])) / (3.0f * 255.0f);
-                    for (int c = 0; c < 4; c++) {
-                        params.mask[c * sampleW * sampleH + y * sampleW + x] = val;
+                // Latent-space mask (4 channels). Downsample if caller passed
+                // full-resolution bytes; otherwise read directly.
+                params.mask.resize(4 * sampleW * sampleH);
+                bool isFullRes = (maskLen == expectedFull);
+                for (int y = 0; y < sampleH; y++) {
+                    for (int x = 0; x < sampleW; x++) {
+                        int srcIdx = isFullRes
+                            ? ((y * 8) * width + (x * 8)) * 3
+                            : (y * sampleW + x) * 3;
+                        float val = (static_cast<uint8_t>(maskBytes[srcIdx]) +
+                                     static_cast<uint8_t>(maskBytes[srcIdx + 1]) +
+                                     static_cast<uint8_t>(maskBytes[srcIdx + 2])) / (3.0f * 255.0f);
+                        for (int c = 0; c < 4; c++) {
+                            params.mask[c * sampleW * sampleH + y * sampleW + x] = val;
+                        }
                     }
                 }
-            }
 
-            // Full-resolution mask (3 channels)
-            params.maskFull.resize(3 * width * height);
+                // Full-resolution mask (3 channels)
+                params.maskFull.resize(3 * width * height);
+            }
         }
     }
 
@@ -314,13 +329,21 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeStopGeneration(
 /**
  * Release all model resources.
  */
+// Defined at the bottom of this TU — needs the full unique_ptr<T> types of
+// the module globals which appear later in the file.
+static void cleanup_secondary_modules();
+
 JNIEXPORT jboolean JNICALL
 Java_com_dark_ai_1sd_SDNativeLib_nativeRelease(
         JNIEnv* /* env */, jobject /* thiz */) {
     std::unique_lock lock(g_sd_mtx);
     g_sd_state.release();
     sd_jni::reset_cache();
-    SD_LOG_INFO("Models released");
+    // Tear down upscaler / segmenter / lama / depth / style globals too. Host
+    // apps call nativeRelease expecting a clean slate before model swap or
+    // shutdown; those secondary modules used to leak across.
+    cleanup_secondary_modules();
+    SD_LOG_INFO("Models released (full)");
     return JNI_TRUE;
 }
 
@@ -426,6 +449,18 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeUpscaleImage(
         return JNI_FALSE;
     }
 
+    // Cap input at 2048×2048: 4× output = 8192×8192 → ~768 MB heap. Larger
+    // inputs OOM-crash on most Android devices.
+    constexpr int UPSCALER_MAX_DIM = 2048;
+    if (width > UPSCALER_MAX_DIM || height > UPSCALER_MAX_DIM) {
+        char buf[160];
+        snprintf(buf, sizeof(buf),
+                 "Upscaler input too large (%dx%d). Max %d on each side; downscale first.",
+                 width, height, UPSCALER_MAX_DIM);
+        sd_jni::on_error(env, callback, buf);
+        return JNI_FALSE;
+    }
+
     // Copy input bytes
     jbyte* inputBytes = env->GetByteArrayElements(inputRgb, nullptr);
     JniByteArrayGuard inputGuard(env, inputRgb, inputBytes);
@@ -474,6 +509,12 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeReleaseUpscaler(
     std::lock_guard<std::mutex> lock(g_upscaler_mtx);
     g_upscaler_loaded = false;
     g_upscaler_model_path.clear();
+    // Free the QNN upscaler global so memory is reclaimed without a full
+    // nativeRelease. MNN path uses a function-local interpreter; nothing to do.
+    if (upscalerApp) {
+        upscalerApp.reset();
+        SD_LOG_INFO("[UPSCALER] Released QNN upscalerApp");
+    }
     SD_LOG_INFO("[UPSCALER] Released");
 }
 
@@ -492,17 +533,53 @@ static std::string read_sysfs(const char* path) {
     return buf;
 }
 
+// Map known Qualcomm soc_id -> {chipset, marketing generation, sdxl support,
+// recommended QNN model variant}. The soc_id is the canonical sysfs identifier
+// (kernel exposes it as a decimal int). When soc_id is not in the table we
+// fall back to inferring from `machine` if possible. Unknown -> conservative
+// "min" variant which the xororz bundles target as their broadest fallback.
+struct SocEntry {
+    int soc_id;
+    const char* chipset;       // SM-number
+    const char* marketing;     // "8 Gen 3" etc.
+    bool supports_sdxl;
+    const char* recommended_variant; // "8gen1", "8gen2", "8gen3", "min"
+};
+static const SocEntry kSocTable[] = {
+    // 7-series
+    { 530, "SM7325", "778G",          false, "min"   },
+    { 636, "SM7475", "7s Gen 3",      false, "min"   },
+    // 8-series
+    { 415, "SM8350", "8 Gen 1",       false, "8gen1" },
+    { 475, "SM8450", "8 Gen 1+",      false, "8gen1" },
+    { 502, "SM8475", "8+ Gen 1",      false, "8gen1" },
+    { 519, "SM8550", "8 Gen 2",       true,  "8gen2" },
+    { 557, "SM8650", "8 Gen 3",       true,  "8gen3" },
+    { 614, "SM8750", "8 Elite",       true,  "8gen3" },
+    // 8 Gen 5 / sm8845 — added in xororz Apr 2026 commit. Real id verified at
+    // device first-boot; placeholder until confirmed.
+    { 678, "SM8845", "8 Gen 5",       true,  "8gen3" },
+};
+static const SocEntry* find_soc(int id) {
+    for (const auto& e : kSocTable) if (e.soc_id == id) return &e;
+    return nullptr;
+}
+
 /**
  * Get SoC hardware info from sysfs + detect QNN HTP at native level.
  *
- * Returns JSON string:
+ * Returns JSON string with raw sysfs data plus a derived capability section:
  * {
  *   "soc_id": "636",
  *   "machine": "VOLCANO",
  *   "family": "Snapdragon",
  *   "revision": "1.0",
  *   "htp_version": 73,
- *   "has_qnn_htp": true
+ *   "has_qnn_htp": true,
+ *   "chipset": "SM7475",
+ *   "marketing": "7s Gen 3",
+ *   "supports_sdxl": false,
+ *   "recommended_variant": "min"
  * }
  */
 JNIEXPORT jstring JNICALL
@@ -545,12 +622,30 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeGetSocInfo(
         if (f) { fclose(f); hasQnnHtp = true; break; }
     }
 
-    char json[512];
+    // Capability lookup. Unknown soc_id -> conservative defaults.
+    int soc_id_int = atoi(socId.c_str());
+    const SocEntry* soc = find_soc(soc_id_int);
+    const char* chipset = soc ? soc->chipset : "unknown";
+    const char* marketing = soc ? soc->marketing : "unknown";
+    bool supports_sdxl = soc ? soc->supports_sdxl : false;
+    const char* recommended_variant = soc ? soc->recommended_variant : "min";
+
+    // HTP version cross-check: SDXL needs at least HTP V73 (8 Gen 2 era).
+    // If SoC table says yes but HTP libs are older, downgrade.
+    if (supports_sdxl && htpVersion > 0 && htpVersion < 73) {
+        supports_sdxl = false;
+    }
+
+    char json[1024];
     snprintf(json, sizeof(json),
         "{\"soc_id\":\"%s\",\"machine\":\"%s\",\"family\":\"%s\","
-        "\"revision\":\"%s\",\"htp_version\":%d,\"has_qnn_htp\":%s}",
+        "\"revision\":\"%s\",\"htp_version\":%d,\"has_qnn_htp\":%s,"
+        "\"chipset\":\"%s\",\"marketing\":\"%s\","
+        "\"supports_sdxl\":%s,\"recommended_variant\":\"%s\"}",
         socId.c_str(), machine.c_str(), family.c_str(), rev.c_str(),
-        htpVersion, hasQnnHtp ? "true" : "false");
+        htpVersion, hasQnnHtp ? "true" : "false",
+        chipset, marketing,
+        supports_sdxl ? "true" : "false", recommended_variant);
 
     SD_LOG_INFO("SoC Info: %s", json);
     return env->NewStringUTF(json);
@@ -909,3 +1004,20 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeReleaseStyleTransfer(
 }
 
 } // extern "C"
+
+// Defined here so the unique_ptr<T> globals' full types are in scope for
+// reset(). Each module owns its own mutex; we lock then drop the pointer so
+// the destructor runs on each.
+static void cleanup_secondary_modules() {
+    {
+        std::lock_guard<std::mutex> u(g_upscaler_mtx);
+        g_upscaler_loaded = false;
+        g_upscaler_model_path.clear();
+        if (upscalerApp) upscalerApp.reset();
+    }
+    { std::lock_guard<std::mutex> l(g_segmenter_mtx); g_segmenter.reset(); }
+    { std::lock_guard<std::mutex> l(g_lama_mtx);      g_lama.reset();      }
+    { std::lock_guard<std::mutex> l(g_depth_mtx);     g_depth.reset();     }
+    { std::lock_guard<std::mutex> l(g_style_mtx);     g_style.reset();     }
+    SD_LOG_INFO("Secondary modules released");
+}

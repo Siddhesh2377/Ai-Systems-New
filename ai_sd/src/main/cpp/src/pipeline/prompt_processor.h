@@ -233,7 +233,19 @@ class PromptProcessor {
  public:
   PromptProcessor() = default;
 
-  void loadEmbeddings(const std::string &embeddings_dir) {
+  /**
+   * Load all `.safetensors` textual-inversion embeddings from a directory.
+   *
+   * @param embeddings_dir  Directory to scan.
+   * @param expected_dim    If > 0, embeddings whose final-axis dim does not
+   *                        match are skipped. This prevents an SDXL TI
+   *                        (1280/2048-dim) from being silently mixed into a
+   *                        SD1.5 (768) pipeline, where it would either crash
+   *                        the memcpy in text_encoder.cpp or produce garbage
+   *                        embeddings.
+   */
+  void loadEmbeddings(const std::string &embeddings_dir,
+                      int expected_dim = 0) {
     embeddings_dir_ = embeddings_dir;
     embeddings_.clear();
 
@@ -243,20 +255,49 @@ class PromptProcessor {
 
     for (const auto &entry :
          std::filesystem::directory_iterator(embeddings_dir)) {
-      if (entry.path().extension() == ".safetensors") {
-        try {
-          SafeTensorReader reader(entry.path().string());
-          std::string name = entry.path().stem().string();
-          std::string name_lower = toLowerCase(name);
+      if (entry.path().extension() != ".safetensors") continue;
+      try {
+        SafeTensorReader reader(entry.path().string());
+        std::string name = entry.path().stem().string();
+        std::string name_lower = toLowerCase(name);
 
-          auto tensor_names = reader.get_tensor_names();
-          if (!tensor_names.empty()) {
-            reader.read(tensor_names[0], true);
-            embeddings_[name_lower] = reader.data;
+        auto tensor_names = reader.get_tensor_names();
+        if (tensor_names.empty()) continue;
+
+        // Reject LoRA files dropped into the embeddings dir. LoRA tensor names
+        // start with `lora_`, `lora.`, or contain `.lora_` — none of those are
+        // valid TI embedding tensors.
+        const std::string &first = tensor_names[0];
+        bool looks_like_lora = false;
+        for (const auto& n : tensor_names) {
+          auto nl = toLowerCase(n);
+          if (nl.rfind("lora_", 0) == 0 ||
+              nl.rfind("lora.", 0) == 0 ||
+              nl.find(".lora_") != std::string::npos ||
+              nl.find("lora_unet") != std::string::npos ||
+              nl.find("lora_te") != std::string::npos) {
+            looks_like_lora = true;
+            break;
           }
-        } catch (const std::exception &e) {
-          // could not load this embedding
         }
+        if (looks_like_lora) continue;
+
+        reader.read(first, true);
+
+        // Reject dimension mismatch. The TI tensor is typically (N, dim) where
+        // dim equals the CLIP text embedding size. We compare reader.data.size()
+        // against expected_dim — any leftover that isn't a multiple of
+        // expected_dim is rejected as malformed or wrong-family.
+        if (expected_dim > 0) {
+          if (reader.data.empty() ||
+              reader.data.size() % static_cast<size_t>(expected_dim) != 0) {
+            continue;
+          }
+        }
+
+        embeddings_[name_lower] = reader.data;
+      } catch (const std::exception &e) {
+        // could not load this embedding
       }
     }
   }

@@ -25,6 +25,8 @@ android {
                     "-DLLAMA_BUILD_EXAMPLES=OFF",
                     "-DLLAMA_BUILD_TOOLS=OFF",
                     "-DLLAMA_BUILD_SERVER=OFF",
+                    "-Wno-deprecated",
+                    "-Wno-dev",
                 )
                 abiFilters += listOf("arm64-v8a", "x86_64")
             }

@@ -6,8 +6,13 @@
 # --- JNI bridge ---
 # Method names are looked up by the native layer at runtime via GetMethodID.
 # Renaming or removing ANY method here will cause a crash at the JNI lookup site.
+# Kotlin object — must keep INSTANCE field so callers can dispatch native methods.
 -keep class com.dark.gguf_lib.GGUFNativeLib {
+    public static ** INSTANCE;
     native <methods>;
+}
+-keepclassmembers class com.dark.gguf_lib.GGUFNativeLib {
+    public static ** INSTANCE;
 }
 
 # --- JNI callback interfaces ---
@@ -34,6 +39,8 @@
 -keep class com.dark.gguf_lib.CharacterEngine { public *; }
 -keep class com.dark.gguf_lib.EmbeddingEngine { public *; }
 -keep class com.dark.gguf_lib.RAGEngine { public *; }
+-keep class com.dark.gguf_lib.TextDigest { *; }
+-keep class com.dark.gguf_lib.TextDigest$* { *; }
 
 # --- Enums used by the SDK ---
 # Enum names are accessed via name()/ordinal() in Kotlin/Java and must survive.
@@ -41,6 +48,7 @@
 -keep enum com.dark.gguf_lib.Mood { *; }
 -keep enum com.dark.gguf_lib.toolcalling.GrammarMode { *; }
 -keep enum com.dark.gguf_lib.TaskProfileMode { *; }
+-keep enum com.dark.gguf_lib.DocKind { *; }
 
 # --- Data classes part of public API ---
 -keep class com.dark.gguf_lib.LoadingParams { *; }

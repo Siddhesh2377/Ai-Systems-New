@@ -231,14 +231,36 @@ Grammar modes:
 ```kotlin
 // Load text model first, then the vision projector
 engine.load("/path/to/model.gguf")
-engine.loadVlmProjector("/path/to/mmproj.gguf")
+engine.loadVlmProjector(
+    path            = "/path/to/mmproj.gguf",
+    threads         = 0,     // 0 = auto
+    imageMinTokens  = -1,    // -1 = model default
+    imageMaxTokens  = 128,   // cap overview resolution (model default may be 256+)
+)
 
 val imageBytes = File("/path/to/image.jpg").readBytes()
-val marker     = engine.getVlmDefaultMarker()   // e.g. "<__image__>"
+val marker     = engine.getVlmDefaultMarker()   // e.g. "<__media__>"
 
 val messages = """[{"role":"user","content":"Describe this: $marker"}]"""
-engine.generateVlmFlow(messages, listOf(imageBytes), maxTokens = 512).collect { ... }
+engine.generateVlmFlow(messages, listOf(imageBytes), maxTokens = 512).collect { event ->
+    when (event) {
+        is GenerationEvent.Token -> print(event.text)
+        is GenerationEvent.VlmStageMetrics -> println(
+            "encode=${event.vlmEncodeMs}ms decode=${event.vlmDecodeMs}ms " +
+            "image_tokens=${event.imageTokens}"
+        )
+        else -> {}
+    }
+}
 ```
+
+Listen for `GenerationEvent.VlmStageMetrics` to see how time was spent — `vlmEncodeMs` is the vision-encoder forward pass, `vlmDecodeMs` is the LLM running prompt-eval on the image embeddings, `imageTokens` is how many embedding tokens the model produced for your image.
+
+### Tuning VLM performance
+
+- `imageMaxTokens` caps the **overview image** pixel budget. Lower = smaller overview, faster ViT. Default in upstream models is often 256.
+- For **LFM2-VL** specifically, the tile grid (which multiplies the per-tile ViT forward + LLM decode cost) is capped by a compile-time constant `lfm2_vl_image_processor::max_tiles` in `engine/vlm/clip.cpp`. This fork sets it to `4`; the upstream default was `10`. Changing `imageMaxTokens` alone will not change tile count.
+- Larger `n_batch` (from `threadMode = 1` or `2`) halves the number of `llama_decode` calls during prompt-eval on image embeddings.
 
 ---
 
@@ -333,6 +355,33 @@ engine.load(path, params.contextSize, params.threadMode, cacheTypeK = params.cac
 | Sampler reuse | Sampler rebuilt only on structural param changes |
 | Refusal token cache | Vocab scan runs once on first `setUncensored`, IDs reused forever |
 | KV eviction | Native `llama_memory_seq_rm` + `seq_add` — no KV re-copy, just pointer removal |
+| VLM per-chunk timed loop | Walks `mtmd_input_chunks` manually and times `mtmd_encode_chunk` vs `llama_decode` separately, so `GenerationEvent.VlmStageMetrics` can report an honest breakdown |
+| VLM streamed progress | `onProgress` fires after each image/text chunk during prompt-eval instead of a single blocking `mtmd_helper_eval_chunks` call |
+
+## What changed on 2026-04-24 (VLM perf pass)
+
+Measured on LFM2-VL-450M Q4_0 + mmproj Q8_0, 8-core ARM, BALANCED mode, one 236 KB screenshot:
+
+| Config                                     | ViT encode | LLM decode | Total prompt | vs baseline |
+|--------------------------------------------|-----------:|-----------:|-------------:|------------:|
+| Baseline                                   |      47 s  |      58 s  |      105 s   |       1.0×  |
+| Optimized                                  |    ~19 s   |    ~32 s   |      ~51 s   |       2.1×  |
+
+Changes in `llama.cpp/engine/`:
+- `lfm2_vl_image_processor::max_tiles` 10 → 4 in `vlm/clip.cpp` — **the dominant win** for LFM2-VL.
+- `normalize_image_u8_to_f32` unrolled by 3 (removes `i % 3`, fuses div/mul, no SIMD intrinsics yet).
+- BALANCED `n_batch` 256 → 512, PERFORMANCE 512 → 1024.
+- `ggml_engine_perf` gained `vlm_tokenize_ms / vlm_encode_ms / vlm_decode_ms / vlm_image_tokens`.
+- `mtmd-helper.cpp` logs now go through `TN_LOG_*` → Android logcat (previously stderr, invisible).
+- New `engine/vlm-bench.cpp` CLI for reproducible on-device measurement.
+- Build fix: `ggml_engine_kv_evict_internal` shim so the inline `ggml_engine_generate_loop` links from all TUs.
+
+Changes in this module (`gguf_lib`):
+- `nativeVlmLoadProjector` / `nativeVlmLoadProjectorFromFd` gained `imageMinTokens, imageMaxTokens`.
+- `GGMLEngine.loadVlmProjector*` exposes the new params (default `-1` = model default).
+- New `StreamCallback.onVlmStageMetrics(vlmEncodeMs, vlmDecodeMs, imageTokens)` — no-op default, binary-compatible.
+- New `GenerationEvent.VlmStageMetrics` routed through `generateVlmFlow`.
+- VLM JNI path rewritten as a timed per-chunk loop; per-chunk progress updates; logcat line with full breakdown.
 
 ---
 

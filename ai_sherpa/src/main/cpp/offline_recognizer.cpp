@@ -1,6 +1,7 @@
 // Copyright (c) 2025 Dark Matter Labs
 #include "jni_common.h"
 #include "jni_cache.h"
+#include "error_tracker.h"
 #include "sherpa-onnx/c-api/c-api.h"
 
 struct OfflineCfg {
@@ -162,8 +163,19 @@ JNIEXPORT jlong JNICALL
 Java_com_dark_ai_1sherpa_OfflineRecognizer_newFromFile(
     JNIEnv *env, jobject, jobject jconfig) {
   auto h = ReadOfflineConfig(env, jconfig);
+  char detail[640];
+  snprintf(detail, sizeof(detail),
+      "tokens=%s whisper_enc=%s whisper_dec=%s nemo=%s",
+      h.tokens.c_str(),
+      h.whisper_enc.empty() ? "-" : h.whisper_enc.c_str(),
+      h.whisper_dec.empty() ? "-" : h.whisper_dec.c_str(),
+      h.nemo_ctc_model.empty() ? "-" : h.nemo_ctc_model.c_str());
+  tn_error_set_op("OfflineRecognizer.newFromFile", detail);
+
   const SherpaOnnxOfflineRecognizer *p = SherpaOnnxCreateOfflineRecognizer(&h.cfg);
   if (!p) {
+    tn_error_set_last(TN_ERR_MODEL_LOAD, "STTLoad",
+        "SherpaOnnxCreateOfflineRecognizer returned null. Likely missing/corrupt model file, mismatched tokens, or insufficient memory.");
     jclass ex = env->FindClass("java/lang/IllegalStateException");
     env->ThrowNew(ex, "Failed to create OfflineRecognizer");
     env->DeleteLocalRef(ex);

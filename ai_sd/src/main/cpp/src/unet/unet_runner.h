@@ -66,9 +66,15 @@ public:
      * @param timestep          Current timestep value
      * @param text_embeddings   Text embeddings [batch_size * 77 * text_emb_size]
      * @param unet_out          Output noise prediction [batch_size * 4 * sample_h * sample_w]
+     * @param cfg_scale         CFG scale; if 1.0f the QNN runner skips the uncond
+     *                          pass and mirrors the cond output into the uncond
+     *                          half so the CPU-side CFG combiner stays correct
+     *                          (uc + 1.0*(tx-uc) == tx). MNN path is unaffected
+     *                          (batch=2 is fixed at session creation).
      */
     void step(const float* latents_in, int timestep,
-              const float* text_embeddings, float* unet_out);
+              const float* text_embeddings, float* unet_out,
+              float cfg_scale = 7.0f);
 
     /// Release MNN session/interpreter. Safe to call multiple times.
     void cleanup();

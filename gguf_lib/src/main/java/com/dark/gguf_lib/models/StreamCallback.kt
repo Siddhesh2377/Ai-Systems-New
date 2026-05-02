@@ -27,4 +27,16 @@ interface StreamCallback {
     fun onTokenBytes(data: ByteArray, length: Int) {
         onToken(String(data, 0, length, Charsets.UTF_8))
     }
+
+    /**
+     * VLM-only per-stage timing, emitted once after all image chunks have been
+     * encoded and their embeddings pushed through the LLM, before generation starts.
+     *
+     * @param vlmEncodeMs Total time spent in the vision/audio encoder (ViT / conformer) forward passes.
+     * @param vlmDecodeMs Total time spent running llama_decode on image+text chunks during prompt-eval.
+     * @param imageTokens Number of image embedding tokens consumed by the LLM.
+     *
+     * Default no-op for backwards compatibility.
+     */
+    fun onVlmStageMetrics(vlmEncodeMs: Float, vlmDecodeMs: Float, imageTokens: Int) {}
 }

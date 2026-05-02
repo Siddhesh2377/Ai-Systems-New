@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <string>
 #include <cstring>
+#include <cmath>
 
 UNetRunner::~UNetRunner() {
     cleanup();
@@ -101,12 +102,17 @@ void UNetRunner::init(bool use_mnn, bool use_opencl,
 }
 
 void UNetRunner::step(const float* latents_in, int timestep,
-                      const float* text_embeddings, float* unet_out) {
+                      const float* text_embeddings, float* unet_out,
+                      float cfg_scale) {
     if (!initialized_)
         throw std::runtime_error("UNetRunner not initialized");
 
     int total_latent_size = batch_size_ * single_latent_size_;
     int total_embed_size = batch_size_ * 77 * text_emb_size_;
+    // cfg=1 -> the CPU-side CFG combiner reduces to just `tx`; the uncond pass is
+    // a wasted NPU/CPU inference. Skip it on QNN where the two passes are
+    // sequential `executeUnetGraphs` calls.
+    const bool skip_uncond = std::fabs(cfg_scale - 1.0f) < 1e-4f;
 
     if (use_mnn_) {
         auto samp = mnn_interpreter_->getSessionInput(mnn_session_, "sample");
@@ -135,17 +141,12 @@ void UNetRunner::step(const float* latents_in, int timestep,
         memcpy(unet_out, samp_host->host<float>(),
                total_latent_size * sizeof(float));
     } else {
-        // QNN path: two separate calls (uncond + cond)
+        // QNN path: two separate calls (uncond + cond), or one if cfg==1.
         float* latents_out_ptr = unet_out;
         const float* embed_ptr = text_embeddings;
 
-        if (StatusCode::SUCCESS !=
-            unetApp->executeUnetGraphs(
-                const_cast<float*>(latents_in),
-                timestep, const_cast<float*>(embed_ptr),
-                latents_out_ptr))
-            throw std::runtime_error("QNN UNET exec failed (uncond)");
-
+        // Always run cond. We write it to the cond slot first so the uncond
+        // mirror is correct in the cfg==1 fast path.
         if (StatusCode::SUCCESS !=
             unetApp->executeUnetGraphs(
                 const_cast<float*>(latents_in) + single_latent_size_,
@@ -153,6 +154,20 @@ void UNetRunner::step(const float* latents_in, int timestep,
                 const_cast<float*>(embed_ptr) + 77 * text_emb_size_,
                 latents_out_ptr + single_latent_size_))
             throw std::runtime_error("QNN UNET exec failed (cond)");
+
+        if (skip_uncond) {
+            // Mirror cond into the uncond slot so the CPU-side CFG combiner
+            // produces tx as expected: uc + 1.0 * (tx - uc) == tx for any uc.
+            std::memcpy(latents_out_ptr, latents_out_ptr + single_latent_size_,
+                        single_latent_size_ * sizeof(float));
+        } else {
+            if (StatusCode::SUCCESS !=
+                unetApp->executeUnetGraphs(
+                    const_cast<float*>(latents_in),
+                    timestep, const_cast<float*>(embed_ptr),
+                    latents_out_ptr))
+                throw std::runtime_error("QNN UNET exec failed (uncond)");
+        }
     }
 }
 

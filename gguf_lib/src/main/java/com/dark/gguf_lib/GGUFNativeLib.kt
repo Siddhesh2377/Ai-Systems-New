@@ -132,8 +132,60 @@ object GGUFNativeLib {
     external fun nativeRagDocumentCount(): Int
     external fun nativeRagChunkCount(): Int
 
+    external fun nativeRagIngestBytes(
+        bytes: ByteArray, mimeHint: String?, nameHint: String?, docId: String
+    ): Int
+
+    external fun nativeRagDetectKind(
+        bytes: ByteArray?, mimeHint: String?, nameHint: String?
+    ): Int
+
+    // ---- Error Tracker ----
+
+    external fun nativeErrorInit()
+    external fun nativeErrorSetCrashLogPath(path: String)
+    external fun nativeErrorGetLastJson(): String
+    external fun nativeErrorClear()
+
+    // ---- Text Digest (extractive summarization) ----
+
+    external fun nativeTextDigest(
+        text: String,
+        query: String?,
+        targetTokens: Int,
+        wQuery: Float,
+        wCentrality: Float,
+        wLead: Float,
+        wEntity: Float,
+        mmrLambda: Float,
+        maxSentences: Int,
+        minSentenceChars: Int,
+        maxSentenceChars: Int,
+        textrankIterations: Int,
+        textrankDamping: Float,
+    ): String?
+
     /** Returns JSON array of results: [{text, doc_id, chunk_index, score}, ...] */
     external fun nativeRagQuery(query: String): String?
+
+    /** Same as nativeRagQuery but restricted to chunks whose doc_id starts with docIdPrefix. */
+    external fun nativeRagQueryFiltered(query: String, docIdPrefix: String?): String?
+
+    /** Extract plain UTF-8 text from raw bytes without ingesting. Returns null on parse failure. */
+    external fun nativeRagExtractText(
+        bytes: ByteArray, mimeHint: String?, nameHint: String?
+    ): String?
+
+    /** Serialize the in-memory RAG index to a portable byte buffer. Returns null on error. */
+    external fun nativeRagExportIndex(): ByteArray?
+
+    /**
+     * Import a buffer produced by [nativeRagExportIndex]. Engine must be created and
+     * embedding model loaded. Returns 0 on success, or:
+     *   -1 magic mismatch, -2 version mismatch, -3 dim mismatch,
+     *   -4 model fingerprint mismatch, -5 corrupt buffer, -6 engine not ready.
+     */
+    external fun nativeRagImportIndex(buf: ByteArray): Int
 
     /** Returns augmented prompt with retrieved context injected */
     external fun nativeRagBuildPrompt(query: String, userPrompt: String): String?
@@ -152,8 +204,29 @@ object GGUFNativeLib {
 
     // ---- VLM (Vision Language Model) ----
 
-    external fun nativeVlmLoadProjector(path: String, nThreads: Int): Boolean
-    external fun nativeVlmLoadProjectorFromFd(fd: Int, nThreads: Int): Boolean
+    /**
+     * Load a vision/audio projector (mmproj GGUF) onto the currently loaded text model.
+     *
+     * @param path Absolute path to the mmproj .gguf file
+     * @param nThreads Threads for vision encoding (0 = auto, inherits the engine's batch threads)
+     * @param imageMinTokens Minimum image tokens. -1 = model default.
+     * @param imageMaxTokens Maximum image tokens for the overview image. -1 = model default.
+     *        Note: for LFM2-VL this only caps the overview, not the tile grid; the grid is
+     *        bounded by a compile-time constant (`max_tiles` in clip.cpp).
+     */
+    external fun nativeVlmLoadProjector(
+        path: String,
+        nThreads: Int,
+        imageMinTokens: Int,
+        imageMaxTokens: Int
+    ): Boolean
+
+    external fun nativeVlmLoadProjectorFromFd(
+        fd: Int,
+        nThreads: Int,
+        imageMinTokens: Int,
+        imageMaxTokens: Int
+    ): Boolean
     external fun nativeVlmRelease()
     external fun nativeVlmIsLoaded(): Boolean
     external fun nativeVlmGetInfo(): String?

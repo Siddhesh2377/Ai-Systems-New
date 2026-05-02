@@ -27,6 +27,9 @@
 #include "tool-manager.h"
 #include "thread-engine.h"
 #include "rag-engine.h"
+#include "rag_ingest/rag_ingest.h"
+#include "text_digest/text_digest.h"
+#include "error_tracker.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -55,6 +58,8 @@ static void llama_android_log_callback(enum ggml_log_level level, const char * t
     switch (level) {
         case GGML_LOG_LEVEL_ERROR: LOGE("%s", buf); break;
         case GGML_LOG_LEVEL_WARN:  LOGW("%s", buf); break;
+        case GGML_LOG_LEVEL_DEBUG:
+        case GGML_LOG_LEVEL_CONT:  break;
         default:                   LOGI("%s", buf); break;
     }
 }
@@ -79,6 +84,7 @@ static jmethodID g_onError        = nullptr;
 static jmethodID g_onMetrics      = nullptr;
 static jmethodID g_onProgress     = nullptr; // nullable — added later, default no-op in Kotlin
 static jmethodID g_onTokenBytes   = nullptr; // nullable — zero-copy byte[] fast path
+static jmethodID g_onVlmStageMetrics = nullptr; // nullable — per-stage VLM timings
 
 // Cached EmbeddingCallback method IDs
 static jclass    g_embed_cb_class  = nullptr;
@@ -106,6 +112,9 @@ static bool ensure_callback_methods(JNIEnv * env, jobject callback) {
     if (env->ExceptionCheck()) env->ExceptionClear();
     // onTokenBytes is optional zero-copy fast path — don't fail if not found
     g_onTokenBytes = env->GetMethodID(cls, "onTokenBytes", "([BI)V");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    // onVlmStageMetrics is optional — VLM-only per-stage timings
+    g_onVlmStageMetrics = env->GetMethodID(cls, "onVlmStageMetrics", "(FFI)V");
     if (env->ExceptionCheck()) env->ExceptionClear();
     env->DeleteLocalRef(cls);
     return g_onToken && g_onDone && g_onError;
@@ -955,6 +964,17 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModel(
         jboolean flashAttn, jstring jCacheTypeK, jstring jCacheTypeV) {
 
     ensure_backend_init();
+
+    {
+        const char * peek = env->GetStringUTFChars(jpath, nullptr);
+        char detail[512];
+        snprintf(detail, sizeof(detail),
+            "path=%s ctx=%d threads=%d flash=%d",
+            peek ? peek : "<null>", (int)nCtx, (int)nThreads, (int)flashAttn);
+        tn_error_set_op("loadModel", detail);
+        if (peek) env->ReleaseStringUTFChars(jpath, peek);
+    }
+
     std::lock_guard<std::mutex> lock(g_state.gen_mutex);
 
     // Clean up any existing model
@@ -967,23 +987,34 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModel(
     g_state.prev_prompt_tokens.clear();
     g_state.n_system_tokens = 0;
 
-    const char * path = env->GetStringUTFChars(jpath, nullptr);
-    const char * cacheK = env->GetStringUTFChars(jCacheTypeK, nullptr);
-    const char * cacheV = env->GetStringUTFChars(jCacheTypeV, nullptr);
+    // Copy JNI strings into std::string so they survive past the JNI release.
+    // Without this, the context-create error path below dereferenced freed memory.
+    std::string path_s, cacheK_s, cacheV_s;
+    {
+        const char * path  = env->GetStringUTFChars(jpath,        nullptr);
+        const char * ck    = env->GetStringUTFChars(jCacheTypeK,  nullptr);
+        const char * cv    = env->GetStringUTFChars(jCacheTypeV,  nullptr);
+        if (path) path_s   = path;
+        if (ck)   cacheK_s = ck;
+        if (cv)   cacheV_s = cv;
+        if (path) env->ReleaseStringUTFChars(jpath,       path);
+        if (ck)   env->ReleaseStringUTFChars(jCacheTypeK, ck);
+        if (cv)   env->ReleaseStringUTFChars(jCacheTypeV, cv);
+    }
 
-    LOGI("Loading model: %s (ctx=%d threads=%d flash=%d)", path, nCtx, nThreads, flashAttn);
+    LOGI("Loading model: %s (ctx=%d threads=%d flash=%d)",
+         path_s.c_str(), nCtx, nThreads, flashAttn);
 
     // Model params
     auto mparams = llama_model_default_params();
     mparams.use_mmap = true;
 
-    g_state.model = llama_model_load_from_file(path, mparams);
-    env->ReleaseStringUTFChars(jpath, path);
+    g_state.model = llama_model_load_from_file(path_s.c_str(), mparams);
 
     if (!g_state.model) {
         LOGE("Failed to load model");
-        env->ReleaseStringUTFChars(jCacheTypeK, cacheK);
-        env->ReleaseStringUTFChars(jCacheTypeV, cacheV);
+        tn_error_set_last(TN_ERR_MODEL_LOAD, "ModelLoad",
+            "llama_model_load_from_file returned null. Likely causes: corrupt or non-GGUF file, unsupported architecture, or out of memory.");
         return JNI_FALSE;
     }
 
@@ -1007,15 +1038,20 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModel(
         cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     }
 
-    cparams.type_k = cache_type_from_string(cacheK);
-    cparams.type_v = cache_type_from_string(cacheV);
-
-    env->ReleaseStringUTFChars(jCacheTypeK, cacheK);
-    env->ReleaseStringUTFChars(jCacheTypeV, cacheV);
+    cparams.type_k = cache_type_from_string(cacheK_s);
+    cparams.type_v = cache_type_from_string(cacheV_s);
 
     g_state.ctx = llama_init_from_model(g_state.model, cparams);
     if (!g_state.ctx) {
         LOGE("Failed to create context");
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+            "llama_init_from_model failed (n_ctx=%d, type_k=%s, type_v=%s). "
+            "Likely out of memory — try reducing Context Size or KV cache type.",
+            (int)cparams.n_ctx,
+            cacheK_s.empty() ? "?" : cacheK_s.c_str(),
+            cacheV_s.empty() ? "?" : cacheV_s.c_str());
+        tn_error_set_last(TN_ERR_OOM, "ContextAlloc", msg);
         llama_model_free(g_state.model);
         g_state.model = nullptr;
         return JNI_FALSE;
@@ -1094,7 +1130,8 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModelFromFd(
     env->DeleteLocalRef(jpath);
 
     close(owned_fd);
-    close(fd);  // close the original fd — llama.cpp has its own via /proc/self/fd
+    // Do NOT close the caller's fd here — Kotlin owns it via ParcelFileDescriptor
+    // and will close it when GC'd. dup() above gave us our own copy.
     return result;
 }
 
@@ -1129,6 +1166,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetSampling(
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetSystemPrompt(
         JNIEnv * env, jobject, jstring jprompt) {
+    std::lock_guard<std::mutex> lock(g_state.gen_mutex);
     const char * prompt = env->GetStringUTFChars(jprompt, nullptr);
     g_state.system_prompt = prompt;
     env->ReleaseStringUTFChars(jprompt, prompt);
@@ -1140,14 +1178,27 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetSystemPrompt(
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetChatTemplate(
         JNIEnv * env, jobject, jstring jtemplate) {
+    std::lock_guard<std::mutex> lock(g_state.gen_mutex);
     const char * tmpl = env->GetStringUTFChars(jtemplate, nullptr);
     g_state.chat_template_override = tmpl;
     env->ReleaseStringUTFChars(jtemplate, tmpl);
 
-    // Reinitialize chat templates with override
+    {
+        char detail[256];
+        snprintf(detail, sizeof(detail), "len=%zu", g_state.chat_template_override.size());
+        tn_error_set_op("setChatTemplate", detail);
+    }
+
     if (g_state.model) {
-        g_state.chat_templates = common_chat_templates_init(
-            g_state.model, g_state.chat_template_override);
+        try {
+            g_state.chat_templates = common_chat_templates_init(
+                g_state.model, g_state.chat_template_override);
+        } catch (const std::exception & e) {
+            tn_error_set_last(TN_ERR_TEMPLATE, "ChatTemplate",
+                std::string("Invalid chat template: ").append(e.what()).c_str());
+            g_state.chat_template_override.clear();
+            g_state.chat_templates = common_chat_templates_init(g_state.model, "");
+        }
     }
 
     LOGI("Chat template override set (%zu chars)", g_state.chat_template_override.size());
@@ -1251,7 +1302,8 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStream(
     if (!tmpl_result.grammar.empty() && !g_state.tools_json.empty()) {
         saved_params = g_state.sampling_params; // save for restore after generation
         g_state.sampling_params.grammar = tmpl_result.grammar;
-        g_state.sampling_params.grammar_lazy = tmpl_result.grammar_lazy;
+        g_state.sampling_params.grammar_lazy =
+            (g_state.grammar_mode == 0) ? tmpl_result.grammar_lazy : true;
         g_state.sampling_params.grammar_triggers = tmpl_result.grammar_triggers;
         // Resolve preserved_tokens strings to token IDs
         for (auto & tok_str : tmpl_result.preserved_tokens) {
@@ -1262,7 +1314,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStream(
         }
         grammar_applied = true;
         LOGI("Grammar constraints applied for tool calling (lazy=%d, %zu triggers)",
-             tmpl_result.grammar_lazy, tmpl_result.grammar_triggers.size());
+             g_state.sampling_params.grammar_lazy, tmpl_result.grammar_triggers.size());
     }
 
     // reset sampler (with or without grammar)
@@ -1623,7 +1675,8 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStreamMultiTurn(
     if (!tmpl_result.grammar.empty() && !g_state.tools_json.empty()) {
         saved_params = g_state.sampling_params;
         g_state.sampling_params.grammar = tmpl_result.grammar;
-        g_state.sampling_params.grammar_lazy = tmpl_result.grammar_lazy;
+        g_state.sampling_params.grammar_lazy =
+            (g_state.grammar_mode == 0) ? tmpl_result.grammar_lazy : true;
         g_state.sampling_params.grammar_triggers = tmpl_result.grammar_triggers;
         for (auto & tok_str : tmpl_result.preserved_tokens) {
             auto ids = tokenize_string(tok_str, false);
@@ -1632,7 +1685,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStreamMultiTurn(
             }
         }
         grammar_applied = true;
-        LOGI("Grammar constraints applied for tool calling (lazy=%d)", tmpl_result.grammar_lazy);
+        LOGI("Grammar constraints applied for tool calling (lazy=%d)", g_state.sampling_params.grammar_lazy);
     }
 
     rebuild_sampler();
@@ -2062,6 +2115,12 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeUpdateSamplerParams(
     std::string json_str(json_cstr);
     env->ReleaseStringUTFChars(jparamsJson, json_cstr);
 
+    {
+        char detail[512];
+        snprintf(detail, sizeof(detail), "json=%.480s", json_str.c_str());
+        tn_error_set_op("updateSamplerParams", detail);
+    }
+
     try {
         auto j = json::parse(json_str);
 
@@ -2107,6 +2166,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeUpdateSamplerParams(
 
     } catch (const std::exception & e) {
         LOGE("Failed to parse sampler params JSON: %s", e.what());
+        tn_error_set_last(TN_ERR_INVALID_PARAM, "InvalidParam", e.what());
         return JNI_FALSE;
     }
 }
@@ -2452,7 +2512,20 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeEncodeText(
     }
 
     jclass resultClass = env->FindClass("com/dark/gguf_lib/models/EmbeddingResult");
+    if (!resultClass) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        LOGE("EmbeddingResult class not found — likely R8 stripped or wrong classloader");
+        tn_error_set_last(TN_ERR_UNKNOWN, "EncodeText",
+            "EmbeddingResult class not found at runtime");
+        return JNI_FALSE;
+    }
     jmethodID resultCtor = env->GetMethodID(resultClass, "<init>", "([F)V");
+    if (!resultCtor) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(resultClass);
+        LOGE("EmbeddingResult constructor signature mismatch");
+        return JNI_FALSE;
+    }
     jfloatArray jembd = env->NewFloatArray(n_embd);
     env->SetFloatArrayRegion(jembd, 0, n_embd, result.data());
     jobject resultObj = env->NewObject(resultClass, resultCtor, jembd);
@@ -2461,6 +2534,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeEncodeText(
 
     env->DeleteLocalRef(jembd);
     env->DeleteLocalRef(resultObj);
+    env->DeleteLocalRef(resultClass);
 
     return JNI_TRUE;
 }
@@ -2607,13 +2681,6 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetThinkingEnabled(JNIEnv *, jobject, jboolean enabled) {
     g_state.thinking_enabled = (enabled == JNI_TRUE);
     LOGI("Thinking %s", g_state.thinking_enabled ? "enabled" : "disabled");
-}
-
-// JNI: nativeSetSpeculativeDecoding — removed (ngram cache deleted)
-extern "C" JNIEXPORT void JNICALL
-Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetSpeculativeDecoding(
-        JNIEnv *, jobject, jboolean, jint, jint) {
-    // no-op: speculative decoding removed
 }
 
 // JNI: nativeSetThreadMode — switch thread mode at runtime (0=power_saving 1=balanced 2=performance)
@@ -2905,6 +2972,205 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeReleaseRagEngine(JNIEnv *, jobject) 
     LOGI("RAG engine released");
 }
 
+extern "C" JNIEXPORT jint JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRagIngestBytes(
+        JNIEnv * env, jobject,
+        jbyteArray jbytes, jstring jmime, jstring jname, jstring jdocId) {
+
+    if (!jbytes) return -3;
+
+    jsize len = env->GetArrayLength(jbytes);
+    if (len <= 0) return -3;
+
+    jbyte * raw = env->GetByteArrayElements(jbytes, nullptr);
+    if (!raw) return -4;
+
+    const char * mime = jmime ? env->GetStringUTFChars(jmime, nullptr) : nullptr;
+    const char * name = jname ? env->GetStringUTFChars(jname, nullptr) : nullptr;
+    const char * doc_id = env->GetStringUTFChars(jdocId, nullptr);
+
+    char * text = nullptr;
+    int rc = rag_ingest_extract(
+        reinterpret_cast<const uint8_t *>(raw), (size_t) len,
+        mime, name, &text);
+
+    env->ReleaseByteArrayElements(jbytes, raw, JNI_ABORT);
+    if (mime) env->ReleaseStringUTFChars(jmime, mime);
+    if (name) env->ReleaseStringUTFChars(jname, name);
+
+    if (rc != 0 || !text) {
+        env->ReleaseStringUTFChars(jdocId, doc_id);
+        LOGW("Ingest parse failed rc=%d", rc);
+        return rc < 0 ? rc : -2;
+    }
+
+    int32_t n_chunks = -1;
+    {
+        std::lock_guard<std::mutex> lock(g_rag.mutex);
+        if (g_rag.engine && rag_engine_is_loaded(g_rag.engine)) {
+            n_chunks = rag_engine_add_document(g_rag.engine, text, doc_id);
+        } else {
+            LOGE("Ingest: RAG engine not ready");
+            n_chunks = -6;
+        }
+    }
+
+    rag_ingest_free_string(text);
+    env->ReleaseStringUTFChars(jdocId, doc_id);
+
+    if (n_chunks < 0) LOGE("Ingest indexing failed: %d", n_chunks);
+    else              LOGI("Ingest indexed: %d chunks", n_chunks);
+
+    return n_chunks;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRagDetectKind(
+        JNIEnv * env, jobject,
+        jbyteArray jbytes, jstring jmime, jstring jname) {
+
+    const uint8_t * ptr = nullptr;
+    jsize len = 0;
+    jbyte * raw = nullptr;
+    if (jbytes) {
+        len = env->GetArrayLength(jbytes);
+        if (len > 0) {
+            raw = env->GetByteArrayElements(jbytes, nullptr);
+            ptr = reinterpret_cast<const uint8_t *>(raw);
+        }
+    }
+    const char * mime = jmime ? env->GetStringUTFChars(jmime, nullptr) : nullptr;
+    const char * name = jname ? env->GetStringUTFChars(jname, nullptr) : nullptr;
+
+    int kind = (int) rag_ingest_detect_kind(ptr, (size_t) len, mime, name);
+
+    if (raw) env->ReleaseByteArrayElements(jbytes, raw, JNI_ABORT);
+    if (mime) env->ReleaseStringUTFChars(jmime, mime);
+    if (name) env->ReleaseStringUTFChars(jname, name);
+
+    return kind;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRagQueryFiltered(
+        JNIEnv * env, jobject, jstring jquery, jstring jdocIdPrefix) {
+
+    std::lock_guard<std::mutex> lock(g_rag.mutex);
+
+    if (!g_rag.engine || !rag_engine_is_loaded(g_rag.engine)) {
+        return nullptr;
+    }
+
+    const char * query_cstr = env->GetStringUTFChars(jquery, nullptr);
+    const char * prefix = jdocIdPrefix ? env->GetStringUTFChars(jdocIdPrefix, nullptr) : nullptr;
+
+    int32_t n_results = 0;
+    rag_result * results = rag_engine_query_filtered(
+        g_rag.engine, query_cstr, prefix, &n_results);
+
+    env->ReleaseStringUTFChars(jquery, query_cstr);
+    if (prefix) env->ReleaseStringUTFChars(jdocIdPrefix, prefix);
+
+    if (!results || n_results <= 0) {
+        if (results) rag_engine_free_results(results, n_results);
+        return env->NewStringUTF("[]");
+    }
+
+    json arr = json::array();
+    for (int32_t i = 0; i < n_results; i++) {
+        arr.push_back({
+            {"text",        results[i].text ? results[i].text : ""},
+            {"doc_id",      results[i].doc_id ? results[i].doc_id : ""},
+            {"chunk_index", results[i].chunk_index},
+            {"score",       results[i].score}
+        });
+    }
+    rag_engine_free_results(results, n_results);
+
+    std::string json_str = arr.dump();
+    return env->NewStringUTF(json_str.c_str());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRagExtractText(
+        JNIEnv * env, jobject,
+        jbyteArray jbytes, jstring jmime, jstring jname) {
+
+    if (!jbytes) return nullptr;
+
+    jsize len = env->GetArrayLength(jbytes);
+    if (len <= 0) return nullptr;
+
+    jbyte * raw = env->GetByteArrayElements(jbytes, nullptr);
+    if (!raw) return nullptr;
+
+    const char * mime = jmime ? env->GetStringUTFChars(jmime, nullptr) : nullptr;
+    const char * name = jname ? env->GetStringUTFChars(jname, nullptr) : nullptr;
+
+    char * text = rag_engine_extract_text(
+        reinterpret_cast<const uint8_t *>(raw), (int32_t) len, mime, name);
+
+    env->ReleaseByteArrayElements(jbytes, raw, JNI_ABORT);
+    if (mime) env->ReleaseStringUTFChars(jmime, mime);
+    if (name) env->ReleaseStringUTFChars(jname, name);
+
+    if (!text) return nullptr;
+
+    jstring out = env->NewStringUTF(text);
+    rag_engine_free_string(text);
+    return out;
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRagExportIndex(JNIEnv * env, jobject) {
+    std::lock_guard<std::mutex> lock(g_rag.mutex);
+
+    if (!g_rag.engine) return nullptr;
+
+    int32_t size = 0;
+    uint8_t * buf = rag_engine_export_index(g_rag.engine, &size);
+    if (!buf || size <= 0) {
+        if (buf) rag_engine_free_buffer(buf);
+        return nullptr;
+    }
+
+    jbyteArray arr = env->NewByteArray(size);
+    if (!arr) {
+        rag_engine_free_buffer(buf);
+        return nullptr;
+    }
+    env->SetByteArrayRegion(arr, 0, size, reinterpret_cast<const jbyte *>(buf));
+    rag_engine_free_buffer(buf);
+    LOGI("RAG index exported: %d bytes", size);
+    return arr;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRagImportIndex(
+        JNIEnv * env, jobject, jbyteArray jbuf) {
+
+    std::lock_guard<std::mutex> lock(g_rag.mutex);
+
+    if (!g_rag.engine) return -6;
+    if (!jbuf) return -5;
+
+    jsize len = env->GetArrayLength(jbuf);
+    if (len <= 0) return -5;
+
+    jbyte * raw = env->GetByteArrayElements(jbuf, nullptr);
+    if (!raw) return -5;
+
+    int32_t rc = rag_engine_import_index(
+        g_rag.engine, reinterpret_cast<const uint8_t *>(raw), (int32_t) len);
+
+    env->ReleaseByteArrayElements(jbuf, raw, JNI_ABORT);
+
+    if (rc == 0) LOGI("RAG index imported: %d bytes", (int) len);
+    else         LOGE("RAG index import failed rc=%d", rc);
+
+    return rc;
+}
+
 // ════════════════════════════════════════════
 //  AGENT ENGINE — Native orchestrator
 //  Plan → Execute (tool calls) → Summarize
@@ -3008,7 +3274,8 @@ after_template:
     if (use_grammar && !tmpl_result.grammar.empty() && !g_state.tools_json.empty()) {
         saved_params = g_state.sampling_params;
         g_state.sampling_params.grammar = tmpl_result.grammar;
-        g_state.sampling_params.grammar_lazy = tmpl_result.grammar_lazy;
+        g_state.sampling_params.grammar_lazy =
+            (g_state.grammar_mode == 0) ? tmpl_result.grammar_lazy : true;
         g_state.sampling_params.grammar_triggers = tmpl_result.grammar_triggers;
         for (auto & tok_str : tmpl_result.preserved_tokens) {
             auto ids = tokenize_string(tok_str, false);
@@ -3334,11 +3601,18 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRunAgentStep(
         env->DeleteLocalRef(jexec_name);
         env->DeleteLocalRef(jexec_args);
 
+        // JNI spec: any pending exception from the upcall must be cleared before
+        // making further JNI calls — otherwise the next call hits UB.
         std::string result_str;
-        if (jresult) {
+        if (env->ExceptionCheck()) {
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+            if (jresult) env->DeleteLocalRef(jresult);
+            result_str = "{\"error\":\"tool executor threw\"}";
+        } else if (jresult) {
             const char * res_cstr = env->GetStringUTFChars(jresult, nullptr);
-            result_str = res_cstr;
-            env->ReleaseStringUTFChars(jresult, res_cstr);
+            result_str = res_cstr ? res_cstr : "";
+            if (res_cstr) env->ReleaseStringUTFChars(jresult, res_cstr);
             env->DeleteLocalRef(jresult);
         } else {
             result_str = "{\"error\":\"null result\"}";
@@ -3439,10 +3713,15 @@ static struct {
 } g_vlm;
 
 // ── JNI: nativeVlmLoadProjector ──
-
+//
+// imageMinTokens / imageMaxTokens let the caller cap the mmproj token budget.
+// Pass -1 for either to use the model default. Lowering imageMaxTokens reduces
+// the overview resolution but does NOT cap the per-tile count for LFM2-VL;
+// the tile cap is a compile-time constant in clip.cpp.
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmLoadProjector(
-        JNIEnv * env, jobject, jstring jpath, jint nThreads) {
+        JNIEnv * env, jobject, jstring jpath, jint nThreads,
+        jint imageMinTokens, jint imageMaxTokens) {
 
     std::lock_guard<std::mutex> lock(g_vlm.mutex);
 
@@ -3464,6 +3743,8 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmLoadProjector(
     params.n_threads     = nThreads > 0 ? nThreads : tn_thread_config_for_mode((tn_thread_mode)g_state.thread_mode).n_threads_batch;
     params.print_timings = false;
     params.warmup        = true;
+    if (imageMinTokens > 0) params.image_min_tokens = imageMinTokens;
+    if (imageMaxTokens > 0) params.image_max_tokens = imageMaxTokens;
 
     g_vlm.ctx = mtmd_init_from_file(path, g_state.model, params);
     env->ReleaseStringUTFChars(jpath, path);
@@ -3473,8 +3754,9 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmLoadProjector(
         return JNI_FALSE;
     }
 
-    LOGI("VLM: projector loaded (vision=%d, audio=%d)",
-         mtmd_support_vision(g_vlm.ctx), mtmd_support_audio(g_vlm.ctx));
+    LOGI("VLM: projector loaded (vision=%d, audio=%d, img_tokens=[%d..%d])",
+         mtmd_support_vision(g_vlm.ctx), mtmd_support_audio(g_vlm.ctx),
+         imageMinTokens, imageMaxTokens);
     return JNI_TRUE;
 }
 
@@ -3482,15 +3764,37 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmLoadProjector(
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmLoadProjectorFromFd(
-        JNIEnv * env, jobject thiz, jint fd, jint nThreads) {
+        JNIEnv * env, jobject thiz, jint fd, jint nThreads,
+        jint imageMinTokens, jint imageMaxTokens) {
 
-    // Use /proc/self/fd/<fd> trick for file descriptor access
+    if (fd < 0) {
+        LOGE("VLM: invalid file descriptor: %d", fd);
+        return JNI_FALSE;
+    }
+
+    // Own the fd so /proc/self/fd/<n> stays valid across the load — Kotlin's
+    // ParcelFileDescriptor may close the original mid-load.
+    int owned_fd = dup(fd);
+    if (owned_fd < 0) {
+        LOGE("VLM: dup() failed for fd %d: %s", fd, strerror(errno));
+        return JNI_FALSE;
+    }
+
+    // mmap-based loading requires a seekable fd; SAF pipe providers fail this.
+    if (lseek(owned_fd, 0, SEEK_CUR) == (off_t)-1) {
+        LOGE("VLM: fd %d is not seekable: %s", fd, strerror(errno));
+        close(owned_fd);
+        return JNI_FALSE;
+    }
+
     char fd_path[64];
-    snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", fd);
+    snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", owned_fd);
     jstring jpath = env->NewStringUTF(fd_path);
     jboolean result = Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmLoadProjector(
-        env, thiz, jpath, nThreads);
+        env, thiz, jpath, nThreads, imageMinTokens, imageMaxTokens);
     env->DeleteLocalRef(jpath);
+
+    close(owned_fd);
     return result;
 }
 
@@ -3665,15 +3969,51 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGenerateStream(
         env->CallVoidMethod(callback, g_onProgress, 0.1f);
     }
 
-    // Process all chunks: text decode + image encode + embedding injection
+    // Walk chunks manually so we can split vision-encode time from LLM
+    // prompt-eval time on image embeddings, and stream progress between
+    // chunks instead of a single blocking call.
+    const int32_t vlm_n_batch = 512;  // mobile-friendly cap
+    int64_t t_encode_us = 0;
+    int64_t t_decode_us = 0;
+    int32_t n_image_tokens = 0;
     llama_pos new_n_past = 0;
-    int32_t eval_result = mtmd_helper_eval_chunks(
-        g_vlm.ctx, g_state.ctx, chunks,
-        0,    // n_past
-        0,    // seq_id
-        512,  // n_batch (smaller for mobile memory)
-        true, // logits_last
-        &new_n_past);
+    int32_t eval_result = 0;
+
+    const size_t n_chunks_total = mtmd_input_chunks_size(chunks);
+    for (size_t ci = 0; ci < n_chunks_total && eval_result == 0; ci++) {
+        const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, ci);
+        const bool is_last = (ci == n_chunks_total - 1);
+        const enum mtmd_input_chunk_type ctype = mtmd_input_chunk_get_type(chunk);
+
+        if (ctype == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+            const int64_t t0 = llama_time_us();
+            eval_result = mtmd_helper_eval_chunk_single(
+                g_vlm.ctx, g_state.ctx, chunk,
+                new_n_past, 0, vlm_n_batch, is_last, &new_n_past);
+            t_decode_us += llama_time_us() - t0;
+        } else {
+            // Vision / audio encoder forward
+            const int64_t t_enc0 = llama_time_us();
+            eval_result = mtmd_encode_chunk(g_vlm.ctx, chunk);
+            t_encode_us += llama_time_us() - t_enc0;
+            if (eval_result != 0) break;
+
+            float * embd = mtmd_get_output_embd(g_vlm.ctx);
+            const int32_t n_tok = (int32_t)mtmd_input_chunk_get_n_tokens(chunk);
+            n_image_tokens += n_tok;
+
+            const int64_t t_dec0 = llama_time_us();
+            eval_result = mtmd_helper_decode_image_chunk(
+                g_vlm.ctx, g_state.ctx, chunk, embd,
+                new_n_past, 0, vlm_n_batch, &new_n_past);
+            t_decode_us += llama_time_us() - t_dec0;
+        }
+
+        if (g_onProgress && n_chunks_total > 1) {
+            float p = 0.1f + 0.4f * ((float)(ci + 1) / (float)n_chunks_total);
+            env->CallVoidMethod(callback, g_onProgress, p);
+        }
+    }
 
     mtmd_input_chunks_free(chunks);
 
@@ -3688,13 +4028,22 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGenerateStream(
     g_state.n_past = new_n_past;
     int prompt_tokens = g_state.n_past;
 
+    const float vlm_encode_ms = t_encode_us / 1000.0f;
+    const float vlm_decode_ms = t_decode_us / 1000.0f;
+
+    if (g_onVlmStageMetrics) {
+        env->CallVoidMethod(callback, g_onVlmStageMetrics,
+            vlm_encode_ms, vlm_decode_ms, (jint)n_image_tokens);
+    }
+
     if (g_onProgress) {
         env->CallVoidMethod(callback, g_onProgress, 0.5f);
     }
 
     auto t_prompt_done = std::chrono::high_resolution_clock::now();
 
-    LOGI("VLM: prompt + images processed, %d tokens, starting generation", prompt_tokens);
+    LOGI("VLM: prompt processed %d tokens (image=%d, encode=%.0fms, decode=%.0fms), starting generation",
+         prompt_tokens, n_image_tokens, vlm_encode_ms, vlm_decode_ms);
 
     // ── Autoregressive generation loop (reuses existing sampling infrastructure) ──
 
@@ -3811,3 +4160,68 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeEvictToBudget(JNIEnv *, jobject) {
     kv_evict_streaming();
 }
 
+
+
+// ── Error Tracker JNI ──────────────────────────────────────────────────────
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeErrorInit(JNIEnv *, jobject) {
+    tn_error_init();
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeErrorSetCrashLogPath(
+        JNIEnv * env, jobject, jstring jpath) {
+    if (!jpath) return;
+    const char * p = env->GetStringUTFChars(jpath, nullptr);
+    tn_error_set_crash_log_path(p);
+    env->ReleaseStringUTFChars(jpath, p);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeErrorGetLastJson(JNIEnv * env, jobject) {
+    const char * j = tn_error_get_last_json();
+    return env->NewStringUTF(j ? j : "{}");
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeErrorClear(JNIEnv *, jobject) {
+    tn_error_clear_last();
+    tn_error_clear_op();
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeTextDigest(
+        JNIEnv * env, jobject,
+        jstring jtext, jstring jquery,
+        jint jtargetTokens,
+        jfloat jwQuery, jfloat jwCentrality, jfloat jwLead, jfloat jwEntity,
+        jfloat jmmrLambda,
+        jint jmaxSentences, jint jminSentenceChars, jint jmaxSentenceChars,
+        jint jtextrankIters, jfloat jtextrankDamping) {
+
+    if (!jtext) return nullptr;
+
+    const char * tcs = env->GetStringUTFChars(jtext, nullptr);
+    const char * qcs = jquery ? env->GetStringUTFChars(jquery, nullptr) : nullptr;
+    std::string text_str = tcs ? tcs : "";
+    std::string query_str = qcs ? qcs : "";
+    if (tcs) env->ReleaseStringUTFChars(jtext, tcs);
+    if (qcs) env->ReleaseStringUTFChars(jquery, qcs);
+
+    text_digest::Options opts;
+    if (jtargetTokens > 0) opts.target_tokens = jtargetTokens;
+    if (jwQuery >= 0.f) opts.w_query = jwQuery;
+    if (jwCentrality >= 0.f) opts.w_centrality = jwCentrality;
+    if (jwLead >= 0.f) opts.w_lead = jwLead;
+    if (jwEntity >= 0.f) opts.w_entity = jwEntity;
+    if (jmmrLambda > 0.f) opts.mmr_lambda = jmmrLambda;
+    if (jmaxSentences > 0) opts.max_sentences = jmaxSentences;
+    if (jminSentenceChars > 0) opts.min_sentence_chars = jminSentenceChars;
+    if (jmaxSentenceChars > 0) opts.max_sentence_chars = jmaxSentenceChars;
+    if (jtextrankIters > 0) opts.textrank_iterations = jtextrankIters;
+    if (jtextrankDamping > 0.f) opts.textrank_damping = jtextrankDamping;
+
+    std::string out = text_digest::compress(text_str, query_str, opts);
+    return env->NewStringUTF(out.c_str());
+}

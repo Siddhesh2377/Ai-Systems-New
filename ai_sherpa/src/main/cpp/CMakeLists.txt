@@ -45,6 +45,8 @@ add_library(ai_sherpa SHARED
   offline_tts.cpp
   vad.cpp
   wave_io.cpp
+  error_tracker.cpp
+  error_jni.cpp
 )
 
 target_include_directories(ai_sherpa PRIVATE
@@ -58,4 +60,9 @@ target_link_libraries(ai_sherpa PRIVATE
   sherpa-onnx-core
   android
   log
+)
+
+target_link_options(ai_sherpa PRIVATE
+  "-Wl,-z,max-page-size=16384"
+  "-Wl,-z,common-page-size=16384"
 )

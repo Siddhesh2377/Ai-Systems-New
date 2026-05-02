@@ -100,6 +100,30 @@ class RAGEngine : AutoCloseable {
     }
 
     /**
+     * Parse raw document bytes natively (PDF, DOCX, EPUB, ODT, PPTX, XLSX, RTF,
+     * HTML, or plain text) and index the extracted text.
+     *
+     * @return number of chunks created (>= 0) or a negative error code:
+     *   -1 unsupported format, -2 parse error, -3 empty, -4 OOM, -5 internal,
+     *   -6 engine not ready
+     */
+    suspend fun ingestBytes(
+        bytes: ByteArray,
+        mimeHint: String? = null,
+        nameHint: String? = null,
+        docId: String
+    ): Int = withContext(Dispatchers.IO) {
+        if (!isModelLoaded) return@withContext -6
+        GGUFNativeLib.nativeRagIngestBytes(bytes, mimeHint, nameHint, docId)
+    }
+
+    fun detectKind(
+        bytes: ByteArray? = null,
+        mimeHint: String? = null,
+        nameHint: String? = null
+    ): DocKind = DocKind.fromNative(GGUFNativeLib.nativeRagDetectKind(bytes, mimeHint, nameHint))
+
+    /**
      * Remove a document and all its chunks from the index.
      *
      * @param docId Document identifier to remove
@@ -134,8 +158,26 @@ class RAGEngine : AutoCloseable {
         if (!isModelLoaded) return@withContext emptyList()
 
         val jsonStr = GGUFNativeLib.nativeRagQuery(query) ?: return@withContext emptyList()
+        parseResults(jsonStr)
+    }
 
-        try {
+    /**
+     * Query the RAG index restricted to chunks whose docId starts with [docIdPrefix].
+     * If [docIdPrefix] is empty, behaves like [query].
+     */
+    suspend fun queryFiltered(
+        query: String,
+        docIdPrefix: String
+    ): List<RAGResult> = withContext(Dispatchers.IO) {
+        if (!isModelLoaded) return@withContext emptyList()
+
+        val jsonStr = GGUFNativeLib.nativeRagQueryFiltered(query, docIdPrefix)
+            ?: return@withContext emptyList()
+        parseResults(jsonStr)
+    }
+
+    private fun parseResults(jsonStr: String): List<RAGResult> {
+        return try {
             val arr = JSONArray(jsonStr)
             (0 until arr.length()).map { i ->
                 val obj = arr.getJSONObject(i)
@@ -149,6 +191,45 @@ class RAGEngine : AutoCloseable {
         } catch (_: Exception) {
             emptyList()
         }
+    }
+
+    /**
+     * Extract plain UTF-8 text from raw document bytes (PDF/DOCX/EPUB/HTML/text/...)
+     * without indexing. Useful for downstream Kotlin-side text indexing (e.g. FTS5).
+     *
+     * @return extracted text, or null on parse failure / unsupported / empty bytes.
+     */
+    suspend fun extractText(
+        bytes: ByteArray,
+        mimeHint: String? = null,
+        nameHint: String? = null
+    ): String? = withContext(Dispatchers.IO) {
+        GGUFNativeLib.nativeRagExtractText(bytes, mimeHint, nameHint)
+    }
+
+    /**
+     * Serialize the in-memory RAG index to a portable byte buffer (chunks, BQ vectors,
+     * float embeddings, doc metadata, model fingerprint). Persist this and call
+     * [importIndex] on next launch to skip re-embedding.
+     *
+     * @return serialized buffer, or null on error / engine not created.
+     */
+    fun exportIndex(): ByteArray? {
+        if (!created) return null
+        return GGUFNativeLib.nativeRagExportIndex()
+    }
+
+    /**
+     * Restore an index serialized by [exportIndex]. The embedding model must be loaded
+     * and match the fingerprint stored in the buffer.
+     *
+     * @return 0 on success, or:
+     *   -1 magic mismatch, -2 version mismatch, -3 dim mismatch,
+     *   -4 model fingerprint mismatch, -5 corrupt buffer, -6 engine not ready.
+     */
+    fun importIndex(buf: ByteArray): Int {
+        if (!created) return -6
+        return GGUFNativeLib.nativeRagImportIndex(buf)
     }
 
     /**

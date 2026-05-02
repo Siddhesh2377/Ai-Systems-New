@@ -49,9 +49,7 @@ import org.json.JSONArray
  */
 class GGMLEngine {
 
-    private var loaded = false
-
-    fun isModelLoaded(): Boolean = loaded
+    @Volatile private var loaded = false
 
     // ---- Model Loading ----
 
@@ -151,8 +149,10 @@ class GGMLEngine {
 
     /**
      * Release the loaded model and free all resources.
+     * Runs on [Dispatchers.IO] — `nativeRelease()` blocks for the duration of
+     * KV cache + context teardown (can be hundreds of ms).
      */
-    suspend fun unload() {
+    suspend fun unload() = withContext(Dispatchers.IO) {
         if (loaded) {
             GGUFNativeLib.nativeRelease()
             loaded = false
@@ -211,10 +211,7 @@ class GGMLEngine {
      * Set per-token logit biases.
      * @param biasJson JSON object {"token_id": bias} or array [{"token": id, "bias": val}]
      */
-    fun setLogitBias(biasJson: String): Boolean {
-        GGUFNativeLib.nativeSetLogitBias(biasJson)
-        return true
-    }
+    fun setLogitBias(biasJson: String) = GGUFNativeLib.nativeSetLogitBias(biasJson)
 
     fun setSystemPrompt(prompt: String) = GGUFNativeLib.nativeSetSystemPrompt(prompt)
     fun setChatTemplate(template: String) = GGUFNativeLib.nativeSetChatTemplate(template)
@@ -308,13 +305,6 @@ class GGMLEngine {
         GGUFNativeLib.nativeSetTypedGrammar(config.useTypedGrammar)
     }
 
-    fun enableToolCalling(toolsJson: String, grammarMode: Int, useTypedGrammar: Boolean): Boolean {
-        GGUFNativeLib.nativeSetToolsJson(toolsJson)
-        GGUFNativeLib.nativeSetGrammarMode(grammarMode)
-        GGUFNativeLib.nativeSetTypedGrammar(useTypedGrammar)
-        return true
-    }
-
     /**
      * Set tools from raw OpenAI-format JSON string.
      */
@@ -362,36 +352,57 @@ class GGMLEngine {
 
     // ---- VLM (Vision Language Model) ----
 
-    private var vlmLoaded = false
+    @Volatile private var vlmLoaded = false
 
     /**
      * Load a vision projector (mmproj GGUF). Must be called after loading the text model.
+     *
      * @param path Absolute path to the mmproj .gguf file
      * @param threads Threads for vision encoding (0 = auto)
+     * @param imageMinTokens Minimum image-token budget (-1 = model default)
+     * @param imageMaxTokens Maximum image-token budget for the overview image (-1 = model default).
+     *        Lowering this caps overview resolution. For LFM2-VL it does NOT cap the tile grid;
+     *        the tile count is a compile-time constant in clip.cpp.
      */
-    fun loadVlmProjector(path: String, threads: Int = 0): Boolean {
+    fun loadVlmProjector(
+        path: String,
+        threads: Int = 0,
+        imageMinTokens: Int = -1,
+        imageMaxTokens: Int = -1
+    ): Boolean {
         if (!loaded) return false
-        vlmLoaded = GGUFNativeLib.nativeVlmLoadProjector(path, threads)
+        vlmLoaded = GGUFNativeLib.nativeVlmLoadProjector(path, threads, imageMinTokens, imageMaxTokens)
         return vlmLoaded
     }
 
     /**
      * Load a vision projector from Android file descriptor.
      */
-    fun loadVlmProjectorFromFd(fd: Int, threads: Int = 0): Boolean {
+    fun loadVlmProjectorFromFd(
+        fd: Int,
+        threads: Int = 0,
+        imageMinTokens: Int = -1,
+        imageMaxTokens: Int = -1
+    ): Boolean {
         if (!loaded) return false
-        vlmLoaded = GGUFNativeLib.nativeVlmLoadProjectorFromFd(fd, threads)
+        vlmLoaded = GGUFNativeLib.nativeVlmLoadProjectorFromFd(fd, threads, imageMinTokens, imageMaxTokens)
         return vlmLoaded
     }
 
     /**
      * Load a vision projector from a content:// URI via SAF.
      */
-    fun loadVlmProjector(context: Context, uri: Uri, threads: Int = 0): Boolean {
+    fun loadVlmProjector(
+        context: Context,
+        uri: Uri,
+        threads: Int = 0,
+        imageMinTokens: Int = -1,
+        imageMaxTokens: Int = -1
+    ): Boolean {
         if (!loaded) return false
         val pfd = context.contentResolver.openFileDescriptor(uri, "r") ?: return false
         return try {
-            loadVlmProjectorFromFd(pfd.fd, threads)
+            loadVlmProjectorFromFd(pfd.fd, threads, imageMinTokens, imageMaxTokens)
         } finally {
             pfd.close()
         }
@@ -437,6 +448,9 @@ class GGMLEngine {
                 override fun onMetrics(tps: Float, ttftMs: Float, totalMs: Float, tokensEvaluated: Int, tokensPredicted: Int, modelMB: Float, ctxMB: Float, peakMB: Float, memPct: Float) {
                     trySend(GenerationEvent.Metrics(DecodingMetrics(tps, ttftMs, totalMs, tokensEvaluated, tokensPredicted, modelMB, ctxMB, peakMB, memPct)))
                 }
+                override fun onVlmStageMetrics(vlmEncodeMs: Float, vlmDecodeMs: Float, imageTokens: Int) {
+                    trySend(GenerationEvent.VlmStageMetrics(vlmEncodeMs, vlmDecodeMs, imageTokens))
+                }
             }
             GGUFNativeLib.nativeVlmGenerateStream(
                 messagesJson, imageData.toTypedArray(), maxTokens, cb
@@ -444,8 +458,6 @@ class GGMLEngine {
         }
         awaitClose { job.cancel(); GGUFNativeLib.nativeStopGeneration() }
     }
-
-    fun releaseVisionProjector() = releaseVlmProjector()
 
     // ---- Device Tier ----
 

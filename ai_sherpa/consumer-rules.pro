@@ -69,3 +69,12 @@
 -keep class com.dark.ai_sherpa.SileroVadModelConfig { *; }
 -keep class com.dark.ai_sherpa.TenVadModelConfig { *; }
 -keep class com.dark.ai_sherpa.VadModelConfig { *; }
+
+# SherpaLib — JNI bridge + error tracker (Kotlin object: keep INSTANCE)
+-keepclasseswithmembernames,includedescriptorclasses class com.dark.ai_sherpa.SherpaLib {
+    native <methods>;
+}
+-keep class com.dark.ai_sherpa.SherpaLib { public *; }
+-keepclassmembers class com.dark.ai_sherpa.SherpaLib {
+    public static ** INSTANCE;
+}

@@ -1,6 +1,7 @@
 // Copyright (c) 2025 Dark Matter Labs
 #include "jni_common.h"
 #include "jni_cache.h"
+#include "error_tracker.h"
 #include "sherpa-onnx/c-api/c-api.h"
 
 struct TtsCfg {
@@ -85,8 +86,18 @@ JNIEXPORT jlong JNICALL
 Java_com_dark_ai_1sherpa_OfflineTts_newFromFile(
     JNIEnv *env, jobject, jobject jconfig) {
   auto h = ReadTtsConfig(env, jconfig);
+  char detail[640];
+  snprintf(detail, sizeof(detail),
+      "vits=%s kokoro=%s tokens=%s",
+      h.vits_model.empty() ? "-" : h.vits_model.c_str(),
+      h.kokoro_model.empty() ? "-" : h.kokoro_model.c_str(),
+      h.vits_tokens.empty() ? h.kokoro_tokens.c_str() : h.vits_tokens.c_str());
+  tn_error_set_op("OfflineTts.newFromFile", detail);
+
   const SherpaOnnxOfflineTts *p = SherpaOnnxCreateOfflineTts(&h.cfg);
   if (!p) {
+    tn_error_set_last(TN_ERR_MODEL_LOAD, "TTSLoad",
+        "SherpaOnnxCreateOfflineTts returned null. Likely missing/incompatible VITS model, tokens, or insufficient memory.");
     jclass ex = env->FindClass("java/lang/IllegalStateException");
     env->ThrowNew(ex, "Failed to create OfflineTts");
     env->DeleteLocalRef(ex);
@@ -125,6 +136,14 @@ Java_com_dark_ai_1sherpa_OfflineTts_generate(
   CHECK_PTR(env, ptr, nullptr);
 
   const char *text = env->GetStringUTFChars(jtext, nullptr);
+
+  {
+    char detail[256];
+    snprintf(detail, sizeof(detail), "sid=%d speed=%.2f text_len=%zu",
+        (int)sid, (float)speed, text ? strlen(text) : 0);
+    tn_error_set_op("OfflineTts.generate", detail);
+  }
+
   SherpaOnnxGenerationConfig gen_cfg{};
   gen_cfg.sid = static_cast<int>(sid);
   gen_cfg.speed = static_cast<float>(speed);
@@ -134,6 +153,8 @@ Java_com_dark_ai_1sherpa_OfflineTts_generate(
   env->ReleaseStringUTFChars(jtext, text);
 
   if (!audio) {
+    tn_error_set_last(TN_ERR_GENERATION, "TTSGenerate",
+        "TTS generation returned null. Possibly invalid speaker id, empty text, or out of memory.");
     jclass ex = env->FindClass("java/lang/IllegalStateException");
     env->ThrowNew(ex, "TTS generation failed");
     env->DeleteLocalRef(ex);

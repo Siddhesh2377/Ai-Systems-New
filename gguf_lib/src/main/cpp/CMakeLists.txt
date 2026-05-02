@@ -65,6 +65,26 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--gc-sections -W
 
 add_subdirectory(${LLAMA_DIR} ${CMAKE_CURRENT_BINARY_DIR}/llama)
 
+set(RAG_INGEST_DIR ${CMAKE_CURRENT_SOURCE_DIR}/rag_ingest)
+set(PDFIUM_DIR ${RAG_INGEST_DIR}/third_party/pdfium)
+
+add_library(pdfium SHARED IMPORTED)
+set_target_properties(pdfium PROPERTIES
+    IMPORTED_LOCATION ${PDFIUM_DIR}/${ANDROID_ABI}/libpdfium.so)
+
+set(MINIZ_SOURCES ${RAG_INGEST_DIR}/third_party/miniz/miniz.c)
+set_source_files_properties(${MINIZ_SOURCES} PROPERTIES LANGUAGE C)
+
+set(RAG_INGEST_SOURCES
+    ${RAG_INGEST_DIR}/rag_ingest.cpp
+    ${RAG_INGEST_DIR}/rag_ingest_html.cpp
+    ${RAG_INGEST_DIR}/rag_ingest_zip.cpp
+    ${RAG_INGEST_DIR}/rag_ingest_pdf.cpp
+    ${MINIZ_SOURCES})
+
+set(TEXT_DIGEST_DIR ${CMAKE_CURRENT_SOURCE_DIR}/text_digest)
+set(TEXT_DIGEST_SOURCES ${TEXT_DIGEST_DIR}/text_digest.cpp)
+
 # VLM (Vision Language Model) sources
 set(VLM_DIR ${LLAMA_DIR}/engine/vlm)
 set(VLM_SOURCES
@@ -95,10 +115,13 @@ set(VLM_SOURCES
 # JNI bridge + engine libraries
 add_library(${CMAKE_PROJECT_NAME} SHARED
     gguf_lib.cpp
+    error_tracker.cpp
     ${LLAMA_DIR}/engine/tn-log.cpp
     ${LLAMA_DIR}/engine/tool-manager.cpp
     ${LLAMA_DIR}/engine/thread-engine.cpp
     ${LLAMA_DIR}/engine/rag-engine.cpp
+    ${RAG_INGEST_SOURCES}
+    ${TEXT_DIGEST_SOURCES}
     ${VLM_SOURCES})
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
@@ -109,6 +132,8 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     ${LLAMA_DIR}/engine
     ${LLAMA_DIR}/engine/vlm
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${RAG_INGEST_DIR}
+    ${TEXT_DIGEST_DIR}
 )
 
 # JNI bridge flags (inherits global C/CXX flags)
@@ -119,5 +144,6 @@ target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE -O3 -DNDEBUG -Wno-cast-qual
 target_link_libraries(${CMAKE_PROJECT_NAME}
     llama
     common
+    pdfium
     android
     log)

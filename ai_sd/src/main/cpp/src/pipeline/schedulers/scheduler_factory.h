@@ -13,6 +13,7 @@
 #include "scheduler.h"
 #include "dpm_solver.h"
 #include "euler_ancestral.h"
+#include "lcm.h"
 
 /// Create a scheduler by type name. Sets v_prediction if pony model.
 inline std::unique_ptr<Scheduler> createScheduler(const std::string& type,
@@ -21,6 +22,10 @@ inline std::unique_ptr<Scheduler> createScheduler(const std::string& type,
     if (type == "euler_a" || type == "eulera") {
         scheduler = std::make_unique<EulerAncestralDiscreteScheduler>(
             1000, 0.00085f, 0.012f, "scaled_linear", "epsilon", "leading");
+    } else if (type == "lcm") {
+        // LCM converges in 1-8 steps; pair with cfg_scale ~= 1.0 for best results.
+        scheduler = std::make_unique<LCMScheduler>(
+            1000, 0.00085f, 0.012f, "scaled_linear", "epsilon");
     } else {
         // Default to DPM solver
         scheduler = std::make_unique<DPMSolverMultistepScheduler>(

@@ -20,7 +20,11 @@ android {
 
         externalNativeBuild {
             cmake {
-                arguments += "-DCMAKE_BUILD_TYPE=Release"
+                arguments += listOf(
+                    "-DCMAKE_BUILD_TYPE=Release",
+                    "-Wno-deprecated",
+                    "-Wno-dev",
+                )
                 targets += "ai_sd"
                 cppFlags += listOf(
                     "-O3",

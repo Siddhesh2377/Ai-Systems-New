@@ -106,4 +106,7 @@ namespace sd_pipeline {
     void cleanup_persistent_sessions();
     void recreateClipSession();
     void recreateUNetSession();
+    /// Clear cached CLIP text embeddings. Call on model load/release/swap so a
+    /// new model never sees a stale embedding from a different tokenizer.
+    void clear_clip_cache();
 }

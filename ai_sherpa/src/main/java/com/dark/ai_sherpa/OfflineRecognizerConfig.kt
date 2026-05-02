@@ -9,7 +9,7 @@ data class OfflineTransducerModelConfig(
 
 data class OfflineParaformerModelConfig(val model: String = "")
 
-data class OfflineNemoCtcModelConfig(val model: String = "")
+data class OfflineNemoEncDecCtcModelConfig(val model: String = "")
 
 data class OfflineWhisperModelConfig(
     val encoder: String = "",
@@ -30,7 +30,7 @@ data class OfflineNemoTransducerModelConfig(
 data class OfflineModelConfig(
     val transducer: OfflineTransducerModelConfig = OfflineTransducerModelConfig(),
     val paraformer: OfflineParaformerModelConfig = OfflineParaformerModelConfig(),
-    val nemoCtc: OfflineNemoCtcModelConfig = OfflineNemoCtcModelConfig(),
+    val nemoCtc: OfflineNemoEncDecCtcModelConfig = OfflineNemoEncDecCtcModelConfig(),
     val whisper: OfflineWhisperModelConfig = OfflineWhisperModelConfig(),
     val tdnn: OfflineTdnnModelConfig = OfflineTdnnModelConfig(),
     val nemoTransducer: OfflineNemoTransducerModelConfig = OfflineNemoTransducerModelConfig(),

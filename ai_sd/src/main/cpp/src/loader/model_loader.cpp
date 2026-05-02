@@ -237,6 +237,9 @@ static int initializeQnnApp(const std::string &modelName,
 namespace sd_pipeline {
 
 bool initialize_models(const SDModelConfig& config) {
+    // Loading a new model invalidates any previously-cached CLIP embeddings.
+    clear_clip_cache();
+
     using namespace qnn::tools;
 
     if (!qnn::log::initializeLogging()) {
@@ -259,10 +262,11 @@ bool initialize_models(const SDModelConfig& config) {
     text_embedding_size = config.textEmbeddingSize;
     modelDir = config.modelDir;
 
-    // Check for clip_v2 variant
-    if (clipPath.length() >= 8 &&
-        clipPath.substr(clipPath.length() - 8) == "clip.mnn") {
-        std::filesystem::path clipPathObj(clipPath);
+    // Check for clip_v2 variant. Match by exact filename (not raw substr) so a
+    // custom name like `myclip.mnn` doesn't accidentally trigger the v2 sibling
+    // lookup.
+    std::filesystem::path clipPathObj(clipPath);
+    if (clipPathObj.filename() == "clip.mnn") {
         std::filesystem::path parentDir = clipPathObj.parent_path();
         std::filesystem::path v2Path = parentDir / "clip_v2.mnn";
 
@@ -331,9 +335,14 @@ bool initialize_models(const SDModelConfig& config) {
             modelPath.parent_path().parent_path() / "embeddings";
         if (std::filesystem::exists(embeddingsPath)) {
             try {
-                promptProcessor.loadEmbeddings(embeddingsPath.string());
-                QNN_INFO("Loaded %zu embeddings from %s",
+                // Pass the model's text embedding dim so TI files that don't
+                // match (e.g. SDXL 1280/2048 in an SD1.5 769 pipeline) are
+                // skipped instead of crashing the memcpy in text_encoder.cpp.
+                promptProcessor.loadEmbeddings(embeddingsPath.string(),
+                                               config.textEmbeddingSize);
+                QNN_INFO("Loaded %zu embeddings (dim=%d filter) from %s",
                          promptProcessor.getEmbeddingCount(),
+                         config.textEmbeddingSize,
                          embeddingsPath.string().c_str());
             } catch (const std::exception& e) {
                 QNN_WARN("Failed to load embeddings: %s", e.what());
@@ -598,6 +607,9 @@ void cleanup() {
 
     // Perf 7: release persistent UNet runner + reset VAE dimension tracking
     cleanup_persistent_sessions();
+    // Drop CLIP embedding cache so a new model never sees stale embeddings
+    // from a different tokenizer / dimension.
+    clear_clip_cache();
 
     if (clipSession && clipInterpreter) {
         clipInterpreter->releaseSession(clipSession);
