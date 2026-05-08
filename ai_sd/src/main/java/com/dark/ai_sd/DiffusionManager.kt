@@ -998,38 +998,41 @@ class DiffusionManager(private val context: Context) {
         }
     }
 
+    // Cached pixel scratch reused across preview steps. At 768² this is
+    // ~2.3 MB; the previous per-call alloc was producing ~65 MB of GC
+    // churn over a 28-step gen, which was the actual trigger for the
+    // Bitmap finalizer race (RenderThread still drawing while GC ran).
+    @Volatile private var pixelScratch: IntArray? = null
+
     private fun createBitmapFromRgb(imageBytes: ByteArray, width: Int, height: Int): Bitmap {
-        val sw = createBitmap(width, height)
-        val pixels = IntArray(width * height)
-
-        for (i in 0 until width * height) {
-            val index = i * 3
-            if (index + 2 < imageBytes.size) {
-                val r = imageBytes[index].toInt() and 0xFF
-                val g = imageBytes[index + 1].toInt() and 0xFF
-                val b = imageBytes[index + 2].toInt() and 0xFF
-                pixels[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-            }
+        val pixelCount = width * height
+        val expectedLen = pixelCount * 3
+        require(imageBytes.size >= expectedLen) {
+            "createBitmapFromRgb: expected $expectedLen RGB bytes for ${width}x${height}, got ${imageBytes.size}"
         }
 
-        sw.setPixels(pixels, 0, width, 0, 0, width, height)
+        val pixels = pixelScratch?.takeIf { it.size == pixelCount }
+            ?: IntArray(pixelCount).also { pixelScratch = it }
 
-        // Copy to a HARDWARE bitmap so the pixel data lives on the GPU.
-        // Software ARGB_8888 bitmaps store their pixels in a native buffer
-        // managed by NativeAllocationRegistry, which the GC can finalize
-        // between the Compose state update and the RenderThread frame —
-        // observed as a SIGSEGV in RenderThread reading a stale pixel
-        // pointer at preview steps 5-6 of a 768² generation.
-        // Hardware bitmaps decouple the bitmap's lifetime from the GPU
-        // texture; rendering uses the texture, finalization just drops the
-        // GPU handle. `copy` returns null if the device can't satisfy the
-        // request (rare on minSdk 27+); fall back to the software bitmap.
-        val hw = sw.copy(Bitmap.Config.HARDWARE, false)
-        return if (hw != null) {
-            sw.recycle()
-            hw
-        } else {
-            sw
+        for (i in 0 until pixelCount) {
+            val idx = i * 3
+            val r = imageBytes[idx].toInt() and 0xFF
+            val g = imageBytes[idx + 1].toInt() and 0xFF
+            val b = imageBytes[idx + 2].toInt() and 0xFF
+            pixels[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
         }
+
+        // Software ARGB_8888 bitmap. The previous HARDWARE copy was added
+        // to dodge a 1024² RenderThread SIGSEGV, but the underlying cause
+        // was the JNI callback cache crossing methodIDs across SDCallback
+        // subclasses — fixed separately. HARDWARE bitmaps brought their
+        // own GraphicBuffer/finalizer race observed in 768² previews:
+        // worker-thread GPU upload + Bitmap finalizer releasing the GPU
+        // texture while RenderThread was still drawing. Software bitmaps'
+        // pixel buffer is reference-counted by RenderThread for the
+        // duration of any pending draw, so finalization waits.
+        val bm = createBitmap(width, height)
+        bm.setPixels(pixels, 0, width, 0, 0, width, height)
+        return bm
     }
 }
