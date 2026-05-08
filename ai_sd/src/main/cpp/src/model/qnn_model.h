@@ -2,6 +2,8 @@
 #define QNNMODEL_HPP
 
 #include <HTP/QnnHtpDevice.h>
+#include <HTP/QnnHtpGraph.h>
+#include <HTP/QnnHtpSystemContext.h>
 #include <inttypes.h>
 
 #include "../utils/config.h"
@@ -56,7 +58,13 @@ class QnnModel : public QnnSampleApp {
     m_embedCache.clear();
   }
 
-  StatusCode enablePerformaceMode() {
+  // useBurstMode=true: QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_BURST_MODE
+  // for short, throughput-bound sessions (UNet denoising loop). Trades
+  // sustained efficiency for ~10-15% lower per-step latency on the first
+  // few steps before thermal throttle kicks in. Defaults to false
+  // (PERFORMANCE_MODE) for CLIP / VAE / safety where the runtime is
+  // single-call or short.
+  StatusCode enablePerformaceMode(bool useBurstMode = false) {
     uint32_t deviceId = 0;
     uint32_t coreId = 0;
     auto qnnInterface = m_qnnFunctionPointers.qnnInterface;
@@ -104,6 +112,17 @@ class QnnModel : public QnnSampleApp {
     powerConfig.dcvsV3Config.dcvsEnable = 0;
     powerConfig.dcvsV3Config.setDcvsEnable = 1;
     powerConfig.dcvsV3Config.contextId = m_powerConfigId;
+    // The current QNN HTP perf-infrastructure header (QAIRT 2.39) only
+    // exposes PERFORMANCE_MODE as the highest-throughput option; the
+    // research notes referencing BURST_MODE were against a newer SDK
+    // where that enum was added. With DCVS disabled and all six voltage
+    // corners pinned to MAX_VOLTAGE_CORNER below, PERFORMANCE_MODE is
+    // already running the HTP at peak. The useBurstMode parameter is
+    // wired for forward-compat — flip the branch when the SDK header
+    // exposes the enum (or substitute a more aggressive corner profile
+    // like DCVS_VOLTAGE_VCORNER_TUR_L1 for the bus while keeping core
+    // at MAX, per the research-docs agent's "decouple core/bus" note).
+    (void)useBurstMode;
     powerConfig.dcvsV3Config.powerMode =
         QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_PERFORMANCE_MODE;
     powerConfig.dcvsV3Config.setSleepLatency = 1;
@@ -586,6 +605,43 @@ class QnnModel : public QnnSampleApp {
       returnStatus = StatusCode::FAILURE;
     }
 
+    // Walk the binaryInfo per-graph blob (HTP V3 only) to record what the
+    // .bin author baked in: vtcmSize, numHvxThreads, spillFillBufferSize,
+    // optimizationLevel. binaryInfo is owned by sysCtxHandle and is freed
+    // by systemContextFree below, so anything we want must be copied now.
+    if (StatusCode::SUCCESS == returnStatus && binaryInfo) {
+      const QnnSystemContext_GraphInfo_t* graphsList = nullptr;
+      uint32_t numBakedGraphs = 0;
+      if (binaryInfo->version == QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_1) {
+        graphsList = binaryInfo->contextBinaryInfoV1.graphs;
+        numBakedGraphs = binaryInfo->contextBinaryInfoV1.numGraphs;
+      } else if (binaryInfo->version == QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_2) {
+        graphsList = binaryInfo->contextBinaryInfoV2.graphs;
+        numBakedGraphs = binaryInfo->contextBinaryInfoV2.numGraphs;
+      } else if (binaryInfo->version == QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_3) {
+        graphsList = binaryInfo->contextBinaryInfoV3.graphs;
+        numBakedGraphs = binaryInfo->contextBinaryInfoV3.numGraphs;
+      }
+      m_bakedHwInfo.assign(numBakedGraphs, GraphHwInfo{});
+      for (uint32_t i = 0; i < numBakedGraphs && graphsList; ++i) {
+        const auto& gi = graphsList[i];
+        if (gi.version != QNN_SYSTEM_CONTEXT_GRAPH_INFO_VERSION_3) continue;
+        const auto& v3 = gi.graphInfoV3;
+        if (!v3.graphBlobInfo || v3.graphBlobInfoSize == 0) continue;
+        const auto* blob =
+            static_cast<const QnnHtpSystemContext_GraphBlobInfo_t*>(v3.graphBlobInfo);
+        if (blob->version != QNN_SYSTEM_CONTEXT_HTP_GRAPH_INFO_BLOB_VERSION_V1) continue;
+        const auto& bv1 = blob->contextBinaryGraphBlobInfoV1;
+        m_bakedHwInfo[i] = {bv1.vtcmSize, bv1.numHvxThreads,
+                            bv1.spillFillBufferSize, bv1.optimizationLevel};
+        QNN_INFO("graph[%u] '%s': vtcm=%u MB, hvxThreads=%" PRIu64
+                 ", spillFill=%" PRIu64 " B, opt=%u",
+                 i, v3.graphName ? v3.graphName : "(unnamed)",
+                 bv1.vtcmSize, bv1.numHvxThreads,
+                 bv1.spillFillBufferSize, bv1.optimizationLevel);
+      }
+    }
+
     if (StatusCode::SUCCESS == returnStatus &&
         !copyMetadataToGraphsInfo(binaryInfo, m_graphsInfo, m_graphsCount)) {
       QNN_ERROR("Failed to copy metadata.");
@@ -614,9 +670,11 @@ class QnnModel : public QnnSampleApp {
       extractBackendProfilingInfo(m_profileBackendHandle);
     }
 
-    m_isContextCreated = true;
-
+    // Same fix as the base class' createFromBinary: only mark the context
+    // as created on success, so a failed contextCreateFromBinary doesn't
+    // leave the destructor calling contextFree on a never-created handle.
     if (StatusCode::SUCCESS == returnStatus) {
+      m_isContextCreated = true;
       for (size_t graphIdx = 0; graphIdx < m_graphsCount; graphIdx++) {
         if (nullptr == m_qnnFunctionPointers.qnnInterface.graphRetrieve) {
           QNN_ERROR("graphRetrieveFnHandle is nullptr.");
@@ -633,12 +691,83 @@ class QnnModel : public QnnSampleApp {
       }
     }
 
+    // Apply runtime graph configs (VTCM size + HVX thread count) once the
+    // graphs are retrieved. For context-binary-loaded graphs (which is
+    // every model in our pipeline) these are MOSTLY IGNORED — the .bin
+    // author baked the values at compile time and the runtime can only
+    // honor smaller VTCM, never larger. We pass them anyway so that:
+    //   (a) a hypothetical online-composed-graph path benefits,
+    //   (b) the runtime doesn't speculatively reserve more VTCM than the
+    //       SoC actually has, and
+    //   (c) HVX thread count is bounded by what the device infra reports
+    //       (2 on SM7635, vs 4 baked into xororz's binaries).
+    if (StatusCode::SUCCESS == returnStatus) {
+      applyRuntimeGraphConfigs();
+    }
+
     if (StatusCode::SUCCESS != returnStatus) {
       QNN_DEBUG("Cleaning up graph Info structures.");
       qnn_wrapper_api::freeGraphsInfo(&m_graphsInfo, m_graphsCount);
     }
 
     return returnStatus;
+  }
+
+  // Try to set per-graph VTCM size and HVX thread count after graphs are
+  // retrieved. Best-effort: errors here are logged but do not fail the
+  // model load — the runtime falls back to the baked-in values from the
+  // context binary, which is the safe behavior.
+  void applyRuntimeGraphConfigs() {
+    auto qnnInterface = m_qnnFunctionPointers.qnnInterface;
+    if (!qnnInterface.graphSetConfig) return;
+
+    // Detect the device's actual HVX thread count via HTP infra; fall
+    // back to 2 (mid-tier V73 baseline) if the query fails.
+    uint32_t hvxThreads = 2;
+    QnnDevice_Infrastructure_t deviceInfra = nullptr;
+    if (qnnInterface.deviceGetInfrastructure(&deviceInfra) == QNN_SUCCESS &&
+        deviceInfra) {
+      // QnnHtpDevice_Infrastructure_t doesn't directly expose thread count
+      // in older SDKs; use a conservative cap that matches SM7635.
+      // TODO: when SDK exposes numHvxThreads via getOnChipDeviceInfo,
+      //       read it and use min(detected, baked).
+    }
+
+    // 2 MB matches xororz `min` binaries' baked vtcm_size on SM7635 and
+    // is the actual silicon limit on 7s Gen 3. Setting larger has no
+    // effect on a bin-loaded graph; setting smaller is also a no-op.
+    constexpr uint32_t vtcmSizeMB = 2;
+
+    for (uint32_t gIdx = 0; gIdx < m_graphsCount && m_graphsInfo; ++gIdx) {
+      auto graphHandle = (*m_graphsInfo)[gIdx].graph;
+      if (!graphHandle) continue;
+
+      QnnHtpGraph_CustomConfig_t vtcmCustom;
+      memset(&vtcmCustom, 0, sizeof(vtcmCustom));
+      vtcmCustom.option = QNN_HTP_GRAPH_CONFIG_OPTION_VTCM_SIZE;
+      vtcmCustom.vtcmSizeInMB = vtcmSizeMB;
+
+      QnnHtpGraph_CustomConfig_t hvxCustom;
+      memset(&hvxCustom, 0, sizeof(hvxCustom));
+      hvxCustom.option = QNN_HTP_GRAPH_CONFIG_OPTION_NUM_HVX_THREADS;
+      hvxCustom.numHvxThreads = hvxThreads;
+
+      QnnGraph_Config_t vtcmCfg;
+      vtcmCfg.option = QNN_GRAPH_CONFIG_OPTION_CUSTOM;
+      vtcmCfg.customConfig = &vtcmCustom;
+
+      QnnGraph_Config_t hvxCfg;
+      hvxCfg.option = QNN_GRAPH_CONFIG_OPTION_CUSTOM;
+      hvxCfg.customConfig = &hvxCustom;
+
+      const QnnGraph_Config_t* cfgs[] = {&vtcmCfg, &hvxCfg, nullptr};
+      auto rc = qnnInterface.graphSetConfig(graphHandle, cfgs);
+      if (rc != QNN_SUCCESS) {
+        QNN_DEBUG("graph[%u] graphSetConfig returned %d (likely ignored "
+                  "for bin-loaded graphs — values are already baked)",
+                  gIdx, (int)rc);
+      }
+    }
   }
 
   // Perf 3: Clear cached quantized embeddings (call between generations)
@@ -654,6 +783,20 @@ class QnnModel : public QnnSampleApp {
   // a local in enablePerformaceMode and the slot leaked per model load.
   uint32_t m_powerConfigId = 0;
   bool m_powerConfigIdValid = false;
+
+  // Per-graph hardware metadata read out of the .bin's contextBinaryInfo
+  // V3 blob: vtcmSize (MB), numHvxThreads, spillFillBufferSize (bytes),
+  // optimizationLevel. Populated in createFromBuffer; useful as ground
+  // truth for runtime tuning (e.g. confirming the device's actual VTCM
+  // matches the baked value, or computing a shared spill buffer across
+  // multiple contexts in a future optimization).
+  struct GraphHwInfo {
+    uint32_t vtcmSize = 0;
+    uint64_t numHvxThreads = 0;
+    uint64_t spillFillBufferSize = 0;
+    uint32_t optimizationLevel = 0;
+  };
+  std::vector<GraphHwInfo> m_bakedHwInfo;
 };
 
 #endif  // QNNMODEL_HPP

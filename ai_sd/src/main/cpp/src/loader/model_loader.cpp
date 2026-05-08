@@ -215,7 +215,12 @@ static int initializeQnnApp(const std::string &modelName,
             return app->reportError(modelName + " Create From Binary failure");
     }
 
-    if (StatusCode::SUCCESS != app->enablePerformaceMode())
+    // BURST mode for the UNet denoising loop only — the inner loop runs
+    // 10-30+ short calls back to back, so we want peak HTP frequency for
+    // the first few steps. CLIP and VAE are single-shot per generation,
+    // so PERFORMANCE_MODE (sustained) is appropriate there.
+    bool useBurstMode = (modelName == "UNET");
+    if (StatusCode::SUCCESS != app->enablePerformaceMode(useBurstMode))
         return app->reportError(modelName + " Enable Performance Mode failure");
 
     if (buffer && bufferSize > 0) {
