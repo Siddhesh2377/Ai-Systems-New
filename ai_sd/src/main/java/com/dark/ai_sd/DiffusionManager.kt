@@ -999,7 +999,7 @@ class DiffusionManager(private val context: Context) {
     }
 
     private fun createBitmapFromRgb(imageBytes: ByteArray, width: Int, height: Int): Bitmap {
-        val bitmap = createBitmap(width, height)
+        val sw = createBitmap(width, height)
         val pixels = IntArray(width * height)
 
         for (i in 0 until width * height) {
@@ -1012,7 +1012,24 @@ class DiffusionManager(private val context: Context) {
             }
         }
 
-        bitmap.setPixels(pixels, 0, width, 0, 0, width, height)
-        return bitmap
+        sw.setPixels(pixels, 0, width, 0, 0, width, height)
+
+        // Copy to a HARDWARE bitmap so the pixel data lives on the GPU.
+        // Software ARGB_8888 bitmaps store their pixels in a native buffer
+        // managed by NativeAllocationRegistry, which the GC can finalize
+        // between the Compose state update and the RenderThread frame —
+        // observed as a SIGSEGV in RenderThread reading a stale pixel
+        // pointer at preview steps 5-6 of a 768² generation.
+        // Hardware bitmaps decouple the bitmap's lifetime from the GPU
+        // texture; rendering uses the texture, finalization just drops the
+        // GPU handle. `copy` returns null if the device can't satisfy the
+        // request (rare on minSdk 27+); fall back to the software bitmap.
+        val hw = sw.copy(Bitmap.Config.HARDWARE, false)
+        return if (hw != null) {
+            sw.recycle()
+            hw
+        } else {
+            sw
+        }
     }
 }
