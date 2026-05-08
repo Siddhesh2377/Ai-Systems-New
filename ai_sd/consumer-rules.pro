@@ -9,7 +9,9 @@
 
 # Public API surface
 -keep class com.dark.ai_sd.StableDiffusionManager { public *; }
+-keep class com.dark.ai_sd.StableDiffusionManager$Companion { *; }
 -keep class com.dark.ai_sd.DiffusionManager { public *; }
+-keep class com.dark.ai_sd.DiffusionManager$Companion { *; }
 
 # Data classes used by consumers
 -keep class com.dark.ai_sd.DiffusionModelConfig { *; }

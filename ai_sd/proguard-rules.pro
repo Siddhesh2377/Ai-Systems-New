@@ -16,9 +16,16 @@
 -keep interface com.dark.ai_sd.SDCallback { *; }
 -keep class * implements com.dark.ai_sd.SDCallback { *; }
 
-# Public API entry points
+# Public API entry points. Companion keeps are explicit because
+# `-keep ... { public *; }` only covers members of the outer class — the
+# nested Companion is a separate type and its `getInstance()` factory is
+# what consumers actually call as `StableDiffusionManager.getInstance(ctx)`.
+# Without `$Companion` keeps, R8 renames the inner class (e.g. to `d`) and
+# downstream Kotlin code can't resolve the symbol at compile time.
 -keep class com.dark.ai_sd.StableDiffusionManager { public *; }
+-keep class com.dark.ai_sd.StableDiffusionManager$Companion { *; }
 -keep class com.dark.ai_sd.DiffusionManager { public *; }
+-keep class com.dark.ai_sd.DiffusionManager$Companion { *; }
 
 # Data classes passed to / returned from the API
 -keep class com.dark.ai_sd.DiffusionModelConfig { *; }
