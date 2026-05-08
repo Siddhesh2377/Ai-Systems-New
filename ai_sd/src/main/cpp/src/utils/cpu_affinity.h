@@ -36,18 +36,26 @@ inline std::vector<int> get_perf_core_ids() {
                  "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i);
         long freq = 0;
         FILE* f = fopen(path, "r");
-        if (f) { fscanf(f, "%ld", &freq); fclose(f); }
+        if (f) {
+            if (fscanf(f, "%ld", &freq) != 1) freq = 0;
+            fclose(f);
+        }
         freq_core.push_back({freq, i});
     }
 
     std::sort(freq_core.begin(), freq_core.end(),
               [](auto& a, auto& b) { return a.first > b.first; });
 
-    // Take top half as "performance" cores
-    long median = freq_core[n_total / 2].first;
+    // Pick the boundary of the big-core cluster: index (n-1)/2 lands on the
+    // LAST big core for the common big.LITTLE shapes (4+4, 1+3+4, 1+5+2),
+    // and on the only-cluster's last core for homogeneous SoCs. The earlier
+    // n/2 picked the FIRST little core, which then pulled the entire little
+    // cluster in via `freq >= median` when little cores share max_freq —
+    // observed live as "Pinned to 8 performance cores" on 7s Gen 3.
+    long boundary = freq_core[(n_total - 1) / 2].first;
     std::vector<int> perf_ids;
     for (auto& [freq, id] : freq_core) {
-        if (freq >= median) perf_ids.push_back(id);
+        if (freq >= boundary) perf_ids.push_back(id);
     }
     return perf_ids;
 }
