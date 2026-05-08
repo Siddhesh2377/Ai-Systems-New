@@ -1,33 +1,24 @@
-# ============================================================================
-# Tool-Neuron gguf_lib — Library ProGuard Rules
-# Applied when building the library with minification enabled (release builds).
-# Consumer rules in consumer-rules.pro are automatically included — no duplication needed.
-# ============================================================================
+# Library ProGuard rules for com.dark.gguf_lib.
+# Applied when building the library itself with minification enabled.
+# Consumer rules in consumer-rules.pro are automatically merged in.
 
-# --- Source map preservation for crash reports ---
+# Crash-report friendly: keep source filenames + line numbers.
 -keepattributes SourceFile,LineNumberTable
 -renamesourcefileattribute SourceFile
 
-# --- Kotlin metadata and signatures ---
 -keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod,RuntimeVisibleAnnotations
 
-# --- Kotlin intrinsics ---
-# R8 can inline these but some versions produce broken bytecode without this guard.
 -dontwarn kotlin.Unit
 -dontwarn kotlin.**
 
-# --- Coroutines ---
-# Keep only what's needed: internal state machine classes and flow infrastructure.
-# Do NOT blanket-keep all of kotlinx.coroutines — that defeats minification.
+# Coroutines: keep flow infrastructure; don't blanket-keep all of kotlinx.coroutines.
 -keep class kotlinx.coroutines.flow.** { *; }
 -keepclassmembers class * {
     @kotlinx.coroutines.** *;
 }
 -dontwarn kotlinx.coroutines.**
 
-# --- Kotlin callbackFlow / awaitClose internals ---
-# Used by GGMLEngine streaming flows — the lambda closures must survive.
+# callbackFlow lambdas extend ProducerScope subclasses; preserve their members.
 -keepclassmembers class * extends kotlinx.coroutines.channels.ProducerScope { *; }
 
-# --- R8 / ProGuard compatibility ---
 -ignorewarnings

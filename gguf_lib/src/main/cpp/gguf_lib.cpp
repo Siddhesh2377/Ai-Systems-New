@@ -1,4 +1,6 @@
-// Tool-Neuron JNI Bridge — llama.cpp JNI interface for GGUFNativeLib
+// JNI bridge for com.dark.gguf_lib. Wraps llama.cpp + the tool-neuron engine
+// helpers (thread-engine, tool-manager, rag-engine, mtmd) and exposes a flat
+// C-callable surface to Kotlin via GGUFNativeLib.
 
 #include <jni.h>
 #include <string>
@@ -6,17 +8,14 @@
 #include <algorithm>
 #include <atomic>
 #include <mutex>
-#include <thread>
 #include <cstring>
 #include <cstdio>
-#include <cstdlib>
 #include <cmath>
 #include <chrono>
 
 #include <unistd.h>
 #include <errno.h>
 #include <sched.h>
-#include <sys/syscall.h>
 #include <android/log.h>
 
 #include "llama.h"
@@ -35,18 +34,15 @@
 
 #include <nlohmann/json.hpp>
 
-#define TAG "ToolNeuron-JNI"
+#define TAG "gguf_lib"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
 using json = nlohmann::ordered_json;
 
-// ── llama.cpp log callback → Android logcat ──
-
 static void llama_android_log_callback(enum ggml_log_level level, const char * text, void * /*user_data*/) {
     if (text == nullptr || text[0] == '\0') return;
-    // Strip trailing newline
     size_t len = strlen(text);
     char buf[2048];
     if (len >= sizeof(buf)) len = sizeof(buf) - 1;
@@ -70,36 +66,32 @@ static void ensure_backend_init() {
     std::call_once(g_backend_init_flag, [] {
         llama_log_set(llama_android_log_callback, nullptr);
         llama_backend_init();
-        LOGI("llama backend initialized, log callback set");
     });
 }
 
-// Cached JNI method IDs (resolved once per callback class, reused across generation calls)
-// Avoids repeated GetObjectClass + GetMethodID (~5-30µs each) on every generation invocation
-static jclass    g_cb_class       = nullptr; // global ref to last-seen callback class
-static jmethodID g_onToken        = nullptr;
-static jmethodID g_onToolCall     = nullptr;
-static jmethodID g_onDone         = nullptr;
-static jmethodID g_onError        = nullptr;
-static jmethodID g_onMetrics      = nullptr;
-static jmethodID g_onProgress     = nullptr; // nullable — added later, default no-op in Kotlin
-static jmethodID g_onTokenBytes   = nullptr; // nullable — zero-copy byte[] fast path
-static jmethodID g_onVlmStageMetrics = nullptr; // nullable — per-stage VLM timings
+// Cached StreamCallback method IDs. JNI GetObjectClass + GetMethodID are
+// re-done only when a different callback class shows up; the hot path is a
+// single IsSameObject check per generate call.
+static jclass    g_cb_class            = nullptr;
+static jmethodID g_onToken             = nullptr;
+static jmethodID g_onToolCall          = nullptr;
+static jmethodID g_onDone              = nullptr;
+static jmethodID g_onError             = nullptr;
+static jmethodID g_onMetrics           = nullptr;
+static jmethodID g_onProgress          = nullptr;
+static jmethodID g_onTokenBytes        = nullptr; // zero-copy byte[] fast path
+static jmethodID g_onVlmStageMetrics   = nullptr;
 
-// Cached EmbeddingCallback method IDs
-static jclass    g_embed_cb_class  = nullptr;
+static jclass    g_embed_cb_class   = nullptr;
 static jmethodID g_embed_onComplete = nullptr;
-static jmethodID g_embed_onError   = nullptr;
+static jmethodID g_embed_onError    = nullptr;
 
-// resolve and cache StreamCallback method IDs from the callback object's class
-// returns true if all required methods are found
 static bool ensure_callback_methods(JNIEnv * env, jobject callback) {
     jclass cls = env->GetObjectClass(callback);
     if (g_cb_class && env->IsSameObject(cls, g_cb_class)) {
         env->DeleteLocalRef(cls);
         return true;
     }
-    // new class — resolve all method IDs
     if (g_cb_class) env->DeleteGlobalRef(g_cb_class);
     g_cb_class = (jclass)env->NewGlobalRef(cls);
     g_onToken    = env->GetMethodID(cls, "onToken",    "(Ljava/lang/String;)V");
@@ -107,20 +99,16 @@ static bool ensure_callback_methods(JNIEnv * env, jobject callback) {
     g_onDone     = env->GetMethodID(cls, "onDone",     "()V");
     g_onError    = env->GetMethodID(cls, "onError",    "(Ljava/lang/String;)V");
     g_onMetrics  = env->GetMethodID(cls, "onMetrics",  "(FFFIIFFFF)V");
-    // onProgress is optional — don't fail if not found
     g_onProgress = env->GetMethodID(cls, "onProgress", "(F)V");
     if (env->ExceptionCheck()) env->ExceptionClear();
-    // onTokenBytes is optional zero-copy fast path — don't fail if not found
     g_onTokenBytes = env->GetMethodID(cls, "onTokenBytes", "([BI)V");
     if (env->ExceptionCheck()) env->ExceptionClear();
-    // onVlmStageMetrics is optional — VLM-only per-stage timings
     g_onVlmStageMetrics = env->GetMethodID(cls, "onVlmStageMetrics", "(FFI)V");
     if (env->ExceptionCheck()) env->ExceptionClear();
     env->DeleteLocalRef(cls);
     return g_onToken && g_onDone && g_onError;
 }
 
-// resolve and cache EmbeddingCallback method IDs
 static bool ensure_embed_callback_methods(JNIEnv * env, jobject callback) {
     jclass cls = env->GetObjectClass(callback);
     if (g_embed_cb_class && env->IsSameObject(cls, g_embed_cb_class)) {
@@ -135,75 +123,58 @@ static bool ensure_embed_callback_methods(JNIEnv * env, jobject callback) {
     return g_embed_onComplete && g_embed_onError;
 }
 
-// Global engine state (singleton — one model at a time, matches AAR behavior)
-
+// Singleton engine state. One model at a time. gen_mutex guards everything;
+// the cancel_flag is the only field touched outside the mutex (atomic).
 static struct {
-    llama_model   * model   = nullptr;
-    llama_context * ctx     = nullptr;
+    llama_model    * model   = nullptr;
+    llama_context  * ctx     = nullptr;
     common_sampler * sampler = nullptr;
 
     common_chat_templates_ptr chat_templates;
+    common_params_sampling    sampling_params;
 
-    // Sampling params (set via nativeSetSampling, updated via nativeUpdateSamplerParams)
-    common_params_sampling sampling_params;
-
-    // Config
     std::string system_prompt;
     std::string chat_template_override;
 
-    // Tool calling
+    // 0 = STRICT (force tool JSON), 1 = LAZY (model decides)
     std::string tools_json;
-    int grammar_mode = 1; // 0=STRICT, 1=LAZY
+    int  grammar_mode  = 1;
     bool typed_grammar = true;
 
-    // Engine subsystems
-    tool_manager_t     * tool_mgr  = nullptr;
+    tool_manager_t * tool_mgr = nullptr;
 
-    // Thread mode (0=power_saving, 1=balanced, 2=performance)
+    // 0 = power_saving, 1 = balanced, 2 = performance — drives thread-engine
     int thread_mode = 1;
 
-    // Control vectors
-    std::vector<llama_adapter_lora *> lora_adapters;
-
-    // Generation state
     std::atomic<bool> cancel_flag{false};
-    std::mutex gen_mutex;
+    std::mutex        gen_mutex;
 
-    // Conversation tokens for state save/load
     std::vector<llama_token> session_tokens;
-
-    // Context position tracking
-    int n_past = 0;
-
-    // Cross-turn prompt prefix cache (multi-turn context reuse)
+    int                      n_past = 0;
     std::vector<llama_token> prev_prompt_tokens;
+    int                      n_system_tokens = 0;
 
-    // System prompt token count (protected region during context shifts)
-    int n_system_tokens = 0;
-
-    // Persona logit biases (set via nativeSetLogitBias, preserved across uncensored toggle)
+    // persona_biases: set by nativeSetLogitBias, preserved across uncensored toggles.
+    // cached_refusal_ids: vocab-scanned once on first uncensored=true; reused thereafter.
     std::vector<llama_logit_bias> persona_biases;
+    std::vector<int32_t>          cached_refusal_ids;
+    bool                          refusal_ids_scanned = false;
 
-    // Cached refusal token IDs (scanned once per model load, reused across setUncensored calls)
-    std::vector<int32_t> cached_refusal_ids;
-    bool refusal_ids_scanned = false;
-
-    // Disk-backed prompt cache directory (set via nativeSetPromptCacheDir)
     std::string prompt_cache_dir;
+    bool        thinking_enabled = true;
 
-    // Thinking mode (set via nativeSetThinkingEnabled)
-    bool thinking_enabled = true;
-
-    // StreamingLLM-style KV eviction policy
-    int kv_n_sink   = 4;   // attention sink tokens, never evicted
-    int kv_n_window = 0;   // 0 = disabled; >0 = max recency window
+    // StreamingLLM-style eviction. nWindow=0 disables → context shift fallback.
+    int  kv_n_sink        = 4;
+    int  kv_n_window      = 0;
     bool kv_evict_at_full = false;
 
+    // Defaults captured from the last load() — used when the user passes -1
+    // for runtime knobs. Lets the caller revert to model-load defaults.
+    bool use_mmap  = true;
+    bool use_mlock = false;
 } g_state;
 
 static void kv_evict_streaming();
-
-// Memory introspection helpers ----------------------------------------------
 
 static float read_proc_status_mb(const char * key) {
     FILE * f = fopen("/proc/self/status", "r");
@@ -246,8 +217,6 @@ static void compute_memory_metrics(float & model_mb, float & ctx_mb, float & pea
     mem_pct  = (total_mb > 0.f && peak_mb > 0.f) ? (peak_mb / total_mb) * 100.f : 0.f;
 }
 
-// Helper: GGML type string to enum
-
 static ggml_type cache_type_from_string(const std::string & s) {
     if (s == "f32")  return GGML_TYPE_F32;
     if (s == "f16")  return GGML_TYPE_F16;
@@ -256,10 +225,9 @@ static ggml_type cache_type_from_string(const std::string & s) {
     if (s == "q4_1") return GGML_TYPE_Q4_1;
     if (s == "q5_0") return GGML_TYPE_Q5_0;
     if (s == "q5_1") return GGML_TYPE_Q5_1;
-    return GGML_TYPE_Q8_0; // default
+    return GGML_TYPE_Q8_0;
 }
 
-// Helper: Apply thread config from thread-engine to llama context.
 // mode: 0=power_saving, 1=balanced, 2=performance
 static void apply_thread_mode(int mode) {
     tn_thread_config cfg = tn_thread_config_for_mode((tn_thread_mode)mode);
@@ -278,24 +246,21 @@ static void apply_thread_mode(int mode) {
             CPU_SET(cfg.perf_core_ids[i], &set);
         }
         if (sched_setaffinity(0, sizeof(set), &set) == 0) {
-            LOGI("Pinned to %d performance cores (mode=%d)", cfg.n_perf_core_ids, mode);
+            LOGI("Pinned to %d perf cores (mode=%d)", cfg.n_perf_core_ids, mode);
         } else {
             LOGW("sched_setaffinity failed: %s", strerror(errno));
         }
     }
 }
 
-// Helper: Rebuild sampler from current params.
-// force=false skips rebuild if only simple params changed (preserves repetition penalty history).
-// force=true always rebuilds (needed when grammar, logit bias, or structural params change).
+// rebuild_sampler(force=false) skips the rebuild if only simple knobs (temp,
+// top_p) changed — preserving the sampler's running state (rep-penalty ring,
+// mirostat mu). force=true is required when grammar / logit bias / preserved
+// tokens change because common_sampler doesn't support in-place edits.
 static bool g_sampler_needs_rebuild = true;
 
 static void rebuild_sampler(bool force = true) {
-    if (!force && !g_sampler_needs_rebuild && g_state.sampler) {
-        // sampler exists and no structural changes — skip rebuild to preserve state
-        // (repetition penalty ring buffer, mirostat mu, etc.)
-        return;
-    }
+    if (!force && !g_sampler_needs_rebuild && g_state.sampler) return;
     if (g_state.sampler) {
         common_sampler_free(g_state.sampler);
         g_state.sampler = nullptr;
@@ -306,13 +271,13 @@ static void rebuild_sampler(bool force = true) {
     g_sampler_needs_rebuild = false;
 }
 
-// Mark sampler as needing rebuild (called when structural params change)
 static void mark_sampler_dirty() {
     g_sampler_needs_rebuild = true;
 }
 
-// Helper: Build chat messages from JSON
-
+// Kotlin sometimes sends persona names ("Luna", "Nova") as the message role
+// for assistant turns. Chat templates only accept the four canonical roles,
+// so anything else is remapped to "assistant".
 static std::vector<common_chat_msg> parse_messages_json(const std::string & messages_json) {
     std::vector<common_chat_msg> msgs;
     try {
@@ -320,19 +285,12 @@ static std::vector<common_chat_msg> parse_messages_json(const std::string & mess
         if (j.is_array()) {
             for (auto & msg : j) {
                 common_chat_msg cm;
-                cm.role = msg.value("role", "user");
+                cm.role    = msg.value("role", "user");
                 cm.content = msg.value("content", "");
-
-                // Remap non-standard roles to "assistant"
-                // The Kotlin app sends persona names (e.g. "Luna", "Nova") as the role
-                // for assistant messages. Chat templates only understand:
-                // "system", "user", "assistant", "tool"
                 if (cm.role != "system" && cm.role != "user" &&
                     cm.role != "assistant" && cm.role != "tool") {
-                    LOGI("Remapping role '%s' -> 'assistant'", cm.role.c_str());
                     cm.role = "assistant";
                 }
-
                 msgs.push_back(cm);
             }
         }
@@ -342,9 +300,8 @@ static std::vector<common_chat_msg> parse_messages_json(const std::string & mess
     return msgs;
 }
 
-// Common EOS strings (safety net, like ChatterUI's commonStopStrings)
-// These catch model turn boundaries across all template formats
-
+// Safety-net stop strings — catch model turn boundaries that aren't part of
+// the chat template's additional_stops list.
 static const std::vector<std::string> COMMON_STOP_STRINGS = {
     "</s>",
     "<|end|>",
@@ -359,83 +316,68 @@ static const std::vector<std::string> COMMON_STOP_STRINGS = {
     "<eos>",
 };
 
-// Helper: Apply chat template to build prompt + stop sequences
-
 struct chat_template_result {
-    std::string prompt;
-    std::vector<std::string> stops;
-    common_chat_format format = COMMON_CHAT_FORMAT_CONTENT_ONLY;
-    // Grammar constraints for tool calling
-    std::string grammar;
-    bool grammar_lazy = false;
-    std::vector<common_grammar_trigger> grammar_triggers;
-    std::vector<std::string> preserved_tokens;
+    std::string                          prompt;
+    std::vector<std::string>             stops;
+    common_chat_format                   format       = COMMON_CHAT_FORMAT_CONTENT_ONLY;
+    std::string                          grammar;
+    bool                                 grammar_lazy = false;
+    std::vector<common_grammar_trigger>  grammar_triggers;
+    std::vector<std::string>             preserved_tokens;
 };
 
-static chat_template_result apply_chat_template(const std::vector<common_chat_msg> & messages, bool add_generation_prompt = true) {
+static chat_template_result apply_chat_template(const std::vector<common_chat_msg> & messages,
+                                                 bool add_generation_prompt = true) {
     chat_template_result out;
 
     if (!g_state.chat_templates) {
-        // Fallback: simple concatenation
         std::string prompt;
         for (auto & msg : messages) {
-            if (msg.role == "system") {
-                prompt += msg.content + "\n";
-            } else if (msg.role == "user") {
-                prompt += "User: " + msg.content + "\n";
-            } else if (msg.role == "assistant") {
-                prompt += "Assistant: " + msg.content + "\n";
-            } else if (msg.role == "tool") {
-                prompt += "Tool result: " + msg.content + "\n";
-            }
+            if (msg.role == "system")         prompt += msg.content + "\n";
+            else if (msg.role == "user")      prompt += "User: " + msg.content + "\n";
+            else if (msg.role == "assistant") prompt += "Assistant: " + msg.content + "\n";
+            else if (msg.role == "tool")      prompt += "Tool result: " + msg.content + "\n";
         }
-        if (add_generation_prompt) {
-            prompt += "Assistant:";
-        }
+        if (add_generation_prompt) prompt += "Assistant:";
         out.prompt = prompt;
-        out.stops = {"\nUser:", "\nuser:", "\n\nUser:"};
-        // Add common EOS strings as safety net
+        out.stops  = {"\nUser:", "\nuser:", "\n\nUser:"};
         out.stops.insert(out.stops.end(), COMMON_STOP_STRINGS.begin(), COMMON_STOP_STRINGS.end());
         return out;
     }
 
     common_chat_templates_inputs inputs;
-    inputs.messages = messages;
+    inputs.messages              = messages;
     inputs.add_generation_prompt = add_generation_prompt;
-    inputs.use_jinja = true;
-    inputs.enable_thinking = g_state.thinking_enabled;
+    inputs.use_jinja             = true;
+    inputs.enable_thinking       = g_state.thinking_enabled;
 
-    // Add tools if configured
     if (!g_state.tools_json.empty()) {
         try {
-            auto tools_j = json::parse(g_state.tools_json);
-            inputs.tools = common_chat_tools_parse_oaicompat(tools_j);
-            if (g_state.grammar_mode == 0) {
-                inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_REQUIRED;
-            } else {
-                inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;
-            }
+            auto tools_j  = json::parse(g_state.tools_json);
+            inputs.tools  = common_chat_tools_parse_oaicompat(tools_j);
+            inputs.tool_choice = (g_state.grammar_mode == 0)
+                ? COMMON_CHAT_TOOL_CHOICE_REQUIRED
+                : COMMON_CHAT_TOOL_CHOICE_AUTO;
         } catch (...) {
             LOGW("Failed to parse tools JSON for template");
         }
     }
 
-    auto result = common_chat_templates_apply(g_state.chat_templates.get(), inputs);
-    out.prompt = result.prompt;
-    out.format = result.format;
-    out.grammar = result.grammar;
-    out.grammar_lazy = result.grammar_lazy;
+    auto result          = common_chat_templates_apply(g_state.chat_templates.get(), inputs);
+    out.prompt           = result.prompt;
+    out.format           = result.format;
+    out.grammar          = result.grammar;
+    out.grammar_lazy     = result.grammar_lazy;
     out.grammar_triggers = result.grammar_triggers;
     out.preserved_tokens = result.preserved_tokens;
 
-    // If the template returned CONTENT_ONLY even though tools are configured,
-    // the model's template doesn't natively support tools.
-    // Inject our ToolManager's tool description as a fallback via prompt engineering.
+    // If the template ignored the tools (CONTENT_ONLY) it means this model's
+    // template has no native tool-call grammar. Fall back to prompt-engineering
+    // by appending the ToolManager-generated description into the system msg.
     if (out.format == COMMON_CHAT_FORMAT_CONTENT_ONLY &&
         !g_state.tools_json.empty() && g_state.tool_mgr) {
         char * tool_prompt = tool_manager_get_prompt(g_state.tool_mgr);
         if (tool_prompt && tool_prompt[0]) {
-            // Rebuild prompt with tool descriptions injected into the system message
             std::vector<common_chat_msg> augmented = messages;
             bool found_system = false;
             for (auto & m : augmented) {
@@ -448,38 +390,30 @@ static chat_template_result apply_chat_template(const std::vector<common_chat_ms
             if (!found_system) {
                 augmented.insert(augmented.begin(), {"system", std::string(tool_prompt)});
             }
-
-            // Re-apply template with augmented messages (no tools this time, we handle it via prompt)
             common_chat_templates_inputs aug_inputs;
-            aug_inputs.messages = augmented;
+            aug_inputs.messages              = augmented;
             aug_inputs.add_generation_prompt = add_generation_prompt;
-            aug_inputs.use_jinja = true;
+            aug_inputs.use_jinja             = true;
             auto aug_result = common_chat_templates_apply(g_state.chat_templates.get(), aug_inputs);
             out.prompt = aug_result.prompt;
-            LOGI("ToolManager prompt injected (model template doesn't support tools natively)");
         }
         tool_manager_free_string(tool_prompt);
     }
 
-    // Collect stop sequences from template
     out.stops = result.additional_stops;
-
-    // Always add common EOS strings as safety net (like ChatterUI)
     out.stops.insert(out.stops.end(), COMMON_STOP_STRINGS.begin(), COMMON_STOP_STRINGS.end());
-
-    LOGI("Template applied: format=%d, %zu stop sequences", (int)out.format, out.stops.size());
     return out;
 }
 
-// Antiprompt detector (two-phase: full match + partial match buffering)
-// Modeled after ChatterUI / llama.rn's findStoppingStrings approach
-
+// Two-phase antiprompt: STOP_FULL hits when a complete stop string lands in
+// the tail; STOP_PARTIAL hits when the tail is a prefix of one — meaning we
+// must hold the unsent tokens until the next decode resolves the ambiguity.
 enum stop_type { STOP_FULL, STOP_PARTIAL };
 
 struct antiprompt_state {
     std::vector<std::string> stops;
-    std::string stopping_word;
-    bool stopped = false;
+    std::string              stopping_word;
+    bool                     stopped = false;
 
     void set_stops(const std::vector<std::string> & s) {
         stops = s;
@@ -487,30 +421,22 @@ struct antiprompt_state {
         stopped = false;
     }
 
-    // Check for a full stop string in the tail of the text.
-    // Only searches within the region that could contain the stop string
-    // (last token_size + max_stop_len chars).
     size_t find_stop(const std::string & text, size_t last_token_size, stop_type type) {
         size_t stop_pos = std::string::npos;
-
         for (auto & word : stops) {
             if (word.empty()) continue;
             size_t pos;
-
             if (type == STOP_FULL) {
-                // Search only in the tail region that could contain the stop string
                 size_t window = word.size() + last_token_size;
-                size_t from = text.size() > window ? text.size() - window : 0;
+                size_t from   = text.size() > window ? text.size() - window : 0;
                 pos = text.find(word, from);
             } else {
-                // Check if the end of text is a prefix of this stop string
                 pos = find_partial(word, text);
             }
-
             if (pos != std::string::npos && (stop_pos == std::string::npos || pos < stop_pos)) {
                 if (type == STOP_FULL) {
                     stopping_word = word;
-                    stopped = true;
+                    stopped       = true;
                 }
                 stop_pos = pos;
             }
@@ -519,11 +445,8 @@ struct antiprompt_state {
     }
 
 private:
-    // Check if the end of text is a partial match (prefix) of a stop string
-    size_t find_partial(const std::string & word, const std::string & text) {
+    static size_t find_partial(const std::string & word, const std::string & text) {
         if (text.empty() || word.empty()) return std::string::npos;
-
-        // Check if text ends with any prefix of word (length 1..word.size()-1)
         size_t max_check = std::min(word.size() - 1, text.size());
         for (size_t len = max_check; len >= 1; len--) {
             if (text.compare(text.size() - len, len, word, 0, len) == 0) {
@@ -534,12 +457,11 @@ private:
     }
 };
 
-// Helper: UTF-8 sanitizer with ASCII fast-path + batched JNI token sender.
+// UTF-8 incomplete-sequence carry buffer. Tokens can split a multibyte glyph
+// across two callbacks; we append the trailing bytes here and prepend on the
+// next flush so Kotlin only sees valid UTF-8.
+static std::string g_utf8_buffer;
 
-static std::string g_utf8_buffer; // persistent buffer for incomplete UTF-8 bytes
-
-// Fast check: returns true if all bytes are printable ASCII (0x01..0x7F).
-// Most English LLM tokens pass this, skipping the expensive full validation.
 static inline bool is_all_ascii(const char * data, size_t len) {
     for (size_t i = 0; i < len; i++) {
         if ((unsigned char)data[i] >= 0x80 || data[i] == 0x00) return false;
@@ -547,11 +469,9 @@ static inline bool is_all_ascii(const char * data, size_t len) {
     return true;
 }
 
-// Sanitize a string to contain only valid, complete UTF-8 sequences.
-// Invalid bytes and overlong encodings are dropped. Incomplete trailing
-// sequences are moved to g_utf8_buffer for the next call.
+// Strip invalid bytes and overlong encodings; carry incomplete trailing
+// multi-byte sequences to g_utf8_buffer for the next call.
 static std::string sanitize_utf8(const std::string & input) {
-    // Fast path: pure ASCII needs no validation
     if (g_utf8_buffer.empty() && is_all_ascii(input.data(), input.size())) {
         return input;
     }
@@ -611,10 +531,10 @@ static std::string sanitize_utf8(const std::string & input) {
     return out;
 }
 
-// Wrapper: create a JNI string that's guaranteed safe (one-shot, no buffering).
+// One-shot sanitization for non-streaming JNI strings. Saves & restores the
+// streaming UTF-8 carry so a model-info call mid-generate doesn't corrupt it.
 static jstring safe_new_string_utf(JNIEnv * env, const char * text) {
     if (!text || !text[0]) return env->NewStringUTF("");
-    // Fast path: if pure ASCII, skip sanitize entirely
     size_t len = strlen(text);
     if (is_all_ascii(text, len)) {
         jstring result = env->NewStringUTF(text);
@@ -624,7 +544,7 @@ static jstring safe_new_string_utf(JNIEnv * env, const char * text) {
     std::string saved = std::move(g_utf8_buffer);
     g_utf8_buffer.clear();
     std::string clean = sanitize_utf8(text);
-    g_utf8_buffer.clear(); // no buffering for one-shot
+    g_utf8_buffer.clear();
     if (!saved.empty()) g_utf8_buffer = std::move(saved);
     if (clean.empty()) return env->NewStringUTF("");
     jstring result = env->NewStringUTF(clean.c_str());
@@ -632,19 +552,15 @@ static jstring safe_new_string_utf(JNIEnv * env, const char * text) {
     return result;
 }
 
-// Batched token sender: accumulates text and only crosses JNI boundary
-// when the buffer reaches a threshold or on explicit flush.
-// This dramatically reduces per-token JNI overhead.
-// Batch threshold before flushing to JNI/AIDL. Larger = fewer Binder transactions.
-// 64 for direct in-process JNI, 256+ for AIDL service (Binder IPC ~20-50µs per call).
+// Token-batching threshold. Larger → fewer Binder/JNI calls but more latency
+// before first visible token. 64 = direct in-process JNI, 256+ = AIDL service.
 static size_t g_token_batch_threshold = 256;
 
-// Pre-allocated byte array for zero-copy token delivery.
-// Reused across all flushes — avoids per-flush jstring alloc/free overhead.
+// Reused jbyteArray for the zero-copy onTokenBytes path. Avoids allocating
+// a fresh array every flush.
 static jbyteArray g_token_byte_buf = nullptr;
 static int        g_token_byte_cap = 0;
 
-// ensure the pre-allocated byte buffer is large enough
 static void ensure_token_byte_buf(JNIEnv * env, int needed) {
     if (g_token_byte_buf && g_token_byte_cap >= needed) return;
     if (g_token_byte_buf) env->DeleteGlobalRef(g_token_byte_buf);
@@ -657,29 +573,22 @@ static void ensure_token_byte_buf(JNIEnv * env, int needed) {
 
 struct token_batcher {
     std::string buf;
-    JNIEnv * env;
-    jobject callback;
-    jmethodID onToken;
+    JNIEnv *    env;
+    jobject     callback;
+    jmethodID   onToken;
 
     token_batcher(JNIEnv * e, jobject cb, jmethodID m)
         : env(e), callback(cb), onToken(m) { buf.reserve(256); }
 
-    // Add text to the batch. Flushes to JNI if threshold reached.
     bool add(const char * text, size_t len) {
         buf.append(text, len);
-        if (buf.size() >= g_token_batch_threshold) {
-            return flush();
-        }
-        return true;
+        return buf.size() >= g_token_batch_threshold ? flush() : true;
     }
-
     bool add(const std::string & text) { return add(text.data(), text.size()); }
 
-    // Flush buffered text to JNI callback. Returns false if JNI exception.
     bool flush() {
         if (buf.empty()) return true;
 
-        // Prepend any leftover UTF-8 bytes from previous flush
         std::string combined;
         if (!g_utf8_buffer.empty()) {
             combined = std::move(g_utf8_buffer);
@@ -693,7 +602,6 @@ struct token_batcher {
         std::string clean = sanitize_utf8(combined);
         if (clean.empty()) return true;
 
-        // fast path: reuse pre-allocated jbyteArray (no alloc per flush)
         if (g_onTokenBytes) {
             int len = (int)clean.size();
             ensure_token_byte_buf(env, len);
@@ -702,7 +610,6 @@ struct token_batcher {
             return !env->ExceptionCheck();
         }
 
-        // fallback: allocate jstring per flush
         jstring jtoken = env->NewStringUTF(clean.c_str());
         if (!jtoken) {
             env->ExceptionClear();
@@ -714,8 +621,6 @@ struct token_batcher {
         return true;
     }
 };
-
-// Helper: Tokenize a string
 
 static std::vector<llama_token> tokenize_string(const std::string & text, bool add_special = true) {
     if (!g_state.model) return {};
@@ -733,26 +638,21 @@ static std::vector<llama_token> tokenize_string(const std::string & text, bool a
     return tokens;
 }
 
-// Helper: Decode batch of tokens
-
-// Reusable batch for prompt evaluation (avoids repeated alloc/free)
-static llama_batch g_prompt_batch = {};
-static int g_prompt_batch_cap = 0;
-
-// Reusable single-token batch for generation loop (avoids per-token alloc/free)
-static llama_batch g_single_batch = {};
-static bool g_single_batch_init = false;
+// Reusable batches: one sized to n_batch for prompt eval, one of size 1 for
+// the autoregressive generation loop. Avoids per-call alloc/free.
+static llama_batch g_prompt_batch     = {};
+static int         g_prompt_batch_cap = 0;
+static llama_batch g_single_batch     = {};
+static bool        g_single_batch_init = false;
 
 static llama_batch & get_single_batch() {
     if (!g_single_batch_init) {
-        g_single_batch = llama_batch_init(1, 0, 1);
+        g_single_batch      = llama_batch_init(1, 0, 1);
         g_single_batch_init = true;
     }
     return g_single_batch;
 }
 
-// progress_fn: optional callback invoked after each batch chunk with progress ratio (0.0-1.0).
-// Used to report prompt evaluation progress to the Kotlin side during long prompts.
 typedef void (*eval_progress_fn)(float progress, void * user_data);
 
 static bool eval_tokens(const std::vector<llama_token> & tokens, int & n_past,
@@ -761,10 +661,9 @@ static bool eval_tokens(const std::vector<llama_token> & tokens, int & n_past,
 
     const int n_batch = llama_n_batch(g_state.ctx);
 
-    // grow the reusable batch if needed
     if (g_prompt_batch_cap < n_batch) {
         if (g_prompt_batch_cap > 0) llama_batch_free(g_prompt_batch);
-        g_prompt_batch = llama_batch_init(n_batch, 0, 1);
+        g_prompt_batch     = llama_batch_init(n_batch, 0, 1);
         g_prompt_batch_cap = n_batch;
     }
 
@@ -785,26 +684,19 @@ static bool eval_tokens(const std::vector<llama_token> & tokens, int & n_past,
 
         n_past += n_eval;
 
-        // report progress to callback (fires once per batch chunk, not per token)
-        if (progress) {
-            float pct = (float)(i + n_eval) / (float)total;
-            progress(pct, progress_data);
-        }
+        if (progress) progress((float)(i + n_eval) / (float)total, progress_data);
 
-        // allow cancellation during long prompt evaluation
         if (g_state.cancel_flag.load()) {
             LOGI("Prompt evaluation cancelled at %d/%d tokens", n_past, total);
             return false;
         }
     }
-
     return true;
 }
 
-// progress callback adapter: calls JNI onProgress from eval_tokens
 struct jni_progress_ctx {
     JNIEnv * env;
-    jobject callback;
+    jobject  callback;
 };
 
 static void jni_eval_progress(float progress, void * user_data) {
@@ -814,19 +706,13 @@ static void jni_eval_progress(float progress, void * user_data) {
     }
 }
 
-// returns the number of matching leading tokens between two sequences
-static int find_common_prefix(
-    const std::vector<llama_token> & a,
-    const std::vector<llama_token> & b) {
+static int find_common_prefix(const std::vector<llama_token> & a, const std::vector<llama_token> & b) {
     int n = std::min((int)a.size(), (int)b.size());
-    for (int i = 0; i < n; i++) {
-        if (a[i] != b[i]) return i;
-    }
+    for (int i = 0; i < n; i++) if (a[i] != b[i]) return i;
     return n;
 }
 
-// check if prompt tokens fit in context window
-// returns 0=ok, -1=prompt exceeds n_ctx (fatal)
+// 0 = fits, -1 = prompt alone overflows the context window (fatal).
 static int check_prompt_fits(int n_prompt_tokens, int max_gen_tokens) {
     if (!g_state.ctx) return -1;
     int n_ctx = (int)llama_n_ctx(g_state.ctx);
@@ -841,13 +727,11 @@ static int check_prompt_fits(int n_prompt_tokens, int max_gen_tokens) {
     return 0;
 }
 
-// shift context when n_past approaches n_ctx
-// removes older half of non-system tokens, shifts positions down
-// returns true if shift succeeded
+// Drops the older half of non-system tokens, shifting tail positions down.
+// When the StreamingLLM policy is active, defers to kv_evict_streaming.
 static bool try_context_shift() {
     if (!g_state.ctx) return false;
 
-    // Prefer StreamingLLM eviction when policy is active
     if (g_state.kv_n_window > 0) {
         kv_evict_streaming();
         return g_state.n_past < (int)llama_n_ctx(g_state.ctx) - 1;
@@ -859,44 +743,40 @@ static bool try_context_shift() {
         return false;
     }
 
-    int n_keep = std::max(g_state.n_system_tokens, 4);
+    int n_keep    = std::max(g_state.n_system_tokens, 4);
     int n_discard = (g_state.n_past - n_keep) / 2;
     if (n_discard <= 0) return false;
-
-    LOGI("Context shift: n_past=%d n_keep=%d n_discard=%d", g_state.n_past, n_keep, n_discard);
 
     llama_memory_seq_rm(mem, 0, n_keep, n_keep + n_discard);
     llama_memory_seq_add(mem, 0, n_keep + n_discard, g_state.n_past, -n_discard);
 
     g_state.n_past -= n_discard;
     g_state.prev_prompt_tokens.clear();
-
-    LOGI("Context shift done: new n_past=%d", g_state.n_past);
+    LOGI("Context shift: n_past -> %d (kept %d sys, dropped %d)",
+         g_state.n_past, n_keep, n_discard);
     return true;
 }
 
-// StreamingLLM-style eviction: keep [0, n_sink) + tail [n_past-n_window, n_past)
+// Keep [0, n_sink) and the tail [n_past-n_window, n_past); evict the middle.
 static void kv_evict_streaming() {
     if (!g_state.ctx || g_state.kv_n_window <= 0) return;
     int n_past   = g_state.n_past;
     int n_sink   = g_state.kv_n_sink;
     int n_window = g_state.kv_n_window;
-
-    if (n_past <= n_sink + n_window) return; // nothing to evict
+    if (n_past <= n_sink + n_window) return;
 
     llama_memory_t mem = llama_get_memory(g_state.ctx);
     if (!mem) return;
 
     int evict_end = n_past - n_window;
     llama_memory_seq_rm(mem, 0, n_sink, evict_end);
-    // shift tail positions so they're contiguous after sinks
     llama_memory_seq_add(mem, 0, evict_end, n_past, -(evict_end - n_sink));
     g_state.n_past = n_sink + n_window;
     g_state.prev_prompt_tokens.clear();
-    LOGI("KV evict: n_past %d -> %d (sink=%d window=%d)", n_past, g_state.n_past, n_sink, n_window);
+    LOGI("KV evict: n_past %d -> %d (sink=%d window=%d)",
+         n_past, g_state.n_past, n_sink, n_window);
 }
 
-// get current context usage as a ratio (0.0 to 1.0)
 static float get_context_usage() {
     if (!g_state.ctx) return 0.0f;
     int n_ctx = (int)llama_n_ctx(g_state.ctx);
@@ -904,8 +784,8 @@ static float get_context_usage() {
     return (float)g_state.n_past / (float)n_ctx;
 }
 
-
-// Generate a hash of a string for prompt cache filenames
+// FNV-1a 64-bit — used purely as a stable filename for the disk-backed prompt
+// cache; not security-sensitive.
 static std::string hash_string(const std::string & s) {
     uint64_t h = 14695981039346656037ULL;
     for (char c : s) {
@@ -917,10 +797,8 @@ static std::string hash_string(const std::string & s) {
     return buf;
 }
 
-// Try to restore system prompt KV cache from disk.
-// Returns true if cache was loaded (TTFT for turn 1 is near-zero).
 static bool try_restore_prompt_cache(const std::string & system_prompt,
-                                      const std::vector<llama_token> & sys_tokens) {
+                                      const std::vector<llama_token> & /*sys_tokens*/) {
     if (g_state.prompt_cache_dir.empty() || system_prompt.empty()) return false;
     std::string cache_path = g_state.prompt_cache_dir + "/prompt_" + hash_string(system_prompt) + ".cache";
 
@@ -935,33 +813,28 @@ static bool try_restore_prompt_cache(const std::string & system_prompt,
     if (ok && (int)n_token_count > 0) {
         g_state.n_past = (int)n_token_count;
         g_state.prev_prompt_tokens.assign(cache_tokens.begin(), cache_tokens.begin() + n_token_count);
-        LOGI("Prompt cache restored: %zu tokens from %s", n_token_count, cache_path.c_str());
+        LOGI("Prompt cache restored: %zu tokens", n_token_count);
         return true;
     }
     LOGW("Prompt cache file exists but failed to load: %s", cache_path.c_str());
     return false;
 }
 
-// Save system prompt KV cache to disk for future warm restarts.
 static void save_prompt_cache(const std::string & system_prompt,
                                const std::vector<llama_token> & tokens, int n_tokens) {
     if (g_state.prompt_cache_dir.empty() || system_prompt.empty()) return;
     std::string cache_path = g_state.prompt_cache_dir + "/prompt_" + hash_string(system_prompt) + ".cache";
-    bool ok = llama_state_save_file(g_state.ctx, cache_path.c_str(), tokens.data(), n_tokens);
-    if (ok) {
-        LOGI("Prompt cache saved: %d tokens to %s", n_tokens, cache_path.c_str());
-    } else {
+    if (!llama_state_save_file(g_state.ctx, cache_path.c_str(), tokens.data(), n_tokens)) {
         LOGW("Failed to save prompt cache to %s", cache_path.c_str());
     }
 }
 
-// JNI: nativeLoadModel
-
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModel(
         JNIEnv * env, jobject,
-        jstring jpath, jint nCtx, jint nThreads,
-        jboolean flashAttn, jstring jCacheTypeK, jstring jCacheTypeV) {
+        jstring jpath, jint nCtx, jint nThreads, jint nBatch,
+        jboolean flashAttn, jboolean useMmap, jboolean useMlock,
+        jstring jCacheTypeK, jstring jCacheTypeV) {
 
     ensure_backend_init();
 
@@ -969,31 +842,31 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModel(
         const char * peek = env->GetStringUTFChars(jpath, nullptr);
         char detail[512];
         snprintf(detail, sizeof(detail),
-            "path=%s ctx=%d threads=%d flash=%d",
-            peek ? peek : "<null>", (int)nCtx, (int)nThreads, (int)flashAttn);
+            "path=%s ctx=%d threads=%d batch=%d flash=%d mmap=%d mlock=%d",
+            peek ? peek : "<null>", (int)nCtx, (int)nThreads, (int)nBatch,
+            (int)flashAttn, (int)useMmap, (int)useMlock);
         tn_error_set_op("loadModel", detail);
         if (peek) env->ReleaseStringUTFChars(jpath, peek);
     }
 
     std::lock_guard<std::mutex> lock(g_state.gen_mutex);
 
-    // Clean up any existing model
     if (g_state.sampler) { common_sampler_free(g_state.sampler); g_state.sampler = nullptr; }
-    if (g_state.ctx) { llama_free(g_state.ctx); g_state.ctx = nullptr; }
-    if (g_state.model) { llama_model_free(g_state.model); g_state.model = nullptr; }
+    if (g_state.ctx)     { llama_free(g_state.ctx); g_state.ctx = nullptr; }
+    if (g_state.model)   { llama_model_free(g_state.model); g_state.model = nullptr; }
     g_state.chat_templates.reset();
     g_state.n_past = 0;
     g_state.session_tokens.clear();
     g_state.prev_prompt_tokens.clear();
     g_state.n_system_tokens = 0;
 
-    // Copy JNI strings into std::string so they survive past the JNI release.
-    // Without this, the context-create error path below dereferenced freed memory.
+    // Copy JNI strings before any early returns — the error-path snprintf below
+    // reads cacheK_s/cacheV_s, which the original code freed too early.
     std::string path_s, cacheK_s, cacheV_s;
     {
-        const char * path  = env->GetStringUTFChars(jpath,        nullptr);
-        const char * ck    = env->GetStringUTFChars(jCacheTypeK,  nullptr);
-        const char * cv    = env->GetStringUTFChars(jCacheTypeV,  nullptr);
+        const char * path = env->GetStringUTFChars(jpath,       nullptr);
+        const char * ck   = env->GetStringUTFChars(jCacheTypeK, nullptr);
+        const char * cv   = env->GetStringUTFChars(jCacheTypeV, nullptr);
         if (path) path_s   = path;
         if (ck)   cacheK_s = ck;
         if (cv)   cacheV_s = cv;
@@ -1002,48 +875,43 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModel(
         if (cv)   env->ReleaseStringUTFChars(jCacheTypeV, cv);
     }
 
-    LOGI("Loading model: %s (ctx=%d threads=%d flash=%d)",
-         path_s.c_str(), nCtx, nThreads, flashAttn);
+    LOGI("Loading model: %s (ctx=%d threads=%d batch=%d flash=%d mmap=%d mlock=%d)",
+         path_s.c_str(), nCtx, nThreads, nBatch, flashAttn, useMmap, useMlock);
 
-    // Model params
     auto mparams = llama_model_default_params();
-    mparams.use_mmap = true;
+    mparams.use_mmap  = (bool)useMmap;
+    mparams.use_mlock = (bool)useMlock;
+    g_state.use_mmap  = mparams.use_mmap;
+    g_state.use_mlock = mparams.use_mlock;
 
     g_state.model = llama_model_load_from_file(path_s.c_str(), mparams);
-
     if (!g_state.model) {
-        LOGE("Failed to load model");
         tn_error_set_last(TN_ERR_MODEL_LOAD, "ModelLoad",
             "llama_model_load_from_file returned null. Likely causes: corrupt or non-GGUF file, unsupported architecture, or out of memory.");
         return JNI_FALSE;
     }
 
-    // Context params — split thread counts for decode (memory-bound) vs batch (compute-bound)
     auto cparams = llama_context_default_params();
     cparams.n_ctx = nCtx > 0 ? nCtx : 4096;
 
     {
         tn_thread_config cfg = tn_thread_config_for_mode((tn_thread_mode)g_state.thread_mode);
         if (nThreads > 0) {
-            cparams.n_threads = nThreads;
+            cparams.n_threads       = nThreads;
             cparams.n_threads_batch = nThreads;
         } else {
-            cparams.n_threads = cfg.n_threads_generation;
+            cparams.n_threads       = cfg.n_threads_generation;
             cparams.n_threads_batch = cfg.n_threads_batch;
         }
-        cparams.n_batch = cfg.n_batch;
+        cparams.n_batch = nBatch > 0 ? nBatch : cfg.n_batch;
     }
 
-    if (flashAttn) {
-        cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-    }
-
+    if (flashAttn) cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     cparams.type_k = cache_type_from_string(cacheK_s);
     cparams.type_v = cache_type_from_string(cacheV_s);
 
     g_state.ctx = llama_init_from_model(g_state.model, cparams);
     if (!g_state.ctx) {
-        LOGE("Failed to create context");
         char msg[256];
         snprintf(msg, sizeof(msg),
             "llama_init_from_model failed (n_ctx=%d, type_k=%s, type_v=%s). "
@@ -1057,19 +925,12 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModel(
         return JNI_FALSE;
     }
 
-    // pin to performance cores via thread-engine
     apply_thread_mode(g_state.thread_mode);
-
-    // initialize chat templates from model
-    g_state.chat_templates = common_chat_templates_init(
-        g_state.model,
-        g_state.chat_template_override);
-
-    // initialize default sampler
+    g_state.chat_templates = common_chat_templates_init(g_state.model, g_state.chat_template_override);
     rebuild_sampler();
 
-    // warm-up pass: decode a single token to fault-in hot weight pages.
-    // without this, the first real query has high TTFT from page faults.
+    // Warm-up: single-token decode to fault-in hot weight pages so the first
+    // real query doesn't pay the page-fault tax in TTFT.
     {
         const llama_vocab * vocab = llama_model_get_vocab(g_state.model);
         llama_token bos = llama_vocab_bos(vocab);
@@ -1079,63 +940,55 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModel(
             common_batch_add(sb, bos, 0, {0}, true);
             llama_decode(g_state.ctx, sb);
             llama_memory_clear(llama_get_memory(g_state.ctx), true);
-            LOGI("Warm-up pass complete (model pages faulted in)");
         }
     }
 
-    LOGI("Model loaded (ctx=%d threads_gen=%d threads_batch=%d mode=%d)",
-         (int)llama_n_ctx(g_state.ctx), cparams.n_threads, cparams.n_threads_batch, g_state.thread_mode);
-
+    LOGI("Model loaded (ctx=%d threads_gen=%d threads_batch=%d batch=%d mode=%d)",
+         (int)llama_n_ctx(g_state.ctx), cparams.n_threads, cparams.n_threads_batch,
+         cparams.n_batch, g_state.thread_mode);
     return JNI_TRUE;
 }
 
-// JNI: nativeLoadModelFromFd
-
+// dup() the caller's fd so /proc/self/fd/<n> stays valid for the entire load —
+// the Kotlin ParcelFileDescriptor may be GC'd before llama.cpp finishes mmap.
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModelFromFd(
         JNIEnv * env, jobject thiz,
-        jint fd, jint nCtx, jint nThreads,
-        jboolean flashAttn, jstring jCacheTypeK, jstring jCacheTypeV) {
+        jint fd, jint nCtx, jint nThreads, jint nBatch,
+        jboolean flashAttn, jboolean useMmap, jboolean useMlock,
+        jstring jCacheTypeK, jstring jCacheTypeV) {
 
     if (fd < 0) {
         LOGE("Invalid file descriptor: %d", fd);
         return JNI_FALSE;
     }
 
-    // Duplicate the fd so we own it — the Kotlin-side ParcelFileDescriptor
-    // may be closed/GC'd while we're still loading.  dup() gives us an
-    // independent copy that survives until we're done.
     int owned_fd = dup(fd);
     if (owned_fd < 0) {
         LOGE("dup() failed for fd %d: %s", fd, strerror(errno));
         return JNI_FALSE;
     }
 
-    // Validate the fd is seekable (required for mmap-based GGUF loading).
-    // SAF fds from pipe-based providers aren't seekable and will fail mmap.
-    off_t pos = lseek(owned_fd, 0, SEEK_CUR);
-    if (pos == (off_t)-1) {
+    // SAF pipe-based providers return non-seekable fds — mmap-loading needs seek.
+    if (lseek(owned_fd, 0, SEEK_CUR) == (off_t)-1) {
         LOGE("fd %d is not seekable (SAF pipe provider?): %s", fd, strerror(errno));
         close(owned_fd);
         return JNI_FALSE;
     }
 
-    // /proc/self/fd/<n> gives llama.cpp a path it can fopen()
     char path[64];
     snprintf(path, sizeof(path), "/proc/self/fd/%d", owned_fd);
 
     jstring jpath = env->NewStringUTF(path);
     jboolean result = Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModel(
-        env, thiz, jpath, nCtx, nThreads, flashAttn, jCacheTypeK, jCacheTypeV);
+        env, thiz, jpath, nCtx, nThreads, nBatch, flashAttn, useMmap, useMlock,
+        jCacheTypeK, jCacheTypeV);
     env->DeleteLocalRef(jpath);
 
+    // Close our dup, not the caller's fd — Kotlin owns the original via PFD.
     close(owned_fd);
-    // Do NOT close the caller's fd here — Kotlin owns it via ParcelFileDescriptor
-    // and will close it when GC'd. dup() above gave us our own copy.
     return result;
 }
-
-// JNI: nativeSetSampling
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetSampling(
@@ -1161,8 +1014,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetSampling(
          temperature, topK, topP, minP, mirostat, seed);
 }
 
-// JNI: nativeSetSystemPrompt
-
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetSystemPrompt(
         JNIEnv * env, jobject, jstring jprompt) {
@@ -1172,8 +1023,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetSystemPrompt(
     env->ReleaseStringUTFChars(jprompt, prompt);
     LOGI("System prompt set (%zu chars)", g_state.system_prompt.size());
 }
-
-// JNI: nativeSetChatTemplate
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetChatTemplate(
@@ -1203,8 +1052,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetChatTemplate(
 
     LOGI("Chat template override set (%zu chars)", g_state.chat_template_override.size());
 }
-
-// JNI: nativeGenerateStream (single-turn)
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStream(
@@ -1425,7 +1272,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStream(
         g_state.n_past++;
         n_generated++;
 
-
     }
 
     // flush any remaining buffered text
@@ -1459,7 +1305,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStream(
 
                 auto parsed = common_chat_parse(generated_text, false, parser_params);
                 for (auto & tc : parsed.tool_calls) {
-                    // Wrap in the format Kotlin expects
                     json wrapped;
                     wrapped["name"] = tc.name;
                     try {
@@ -1530,8 +1375,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStream(
 
     return JNI_TRUE;
 }
-
-// JNI: nativeGenerateStreamMultiTurn
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStreamMultiTurn(
@@ -1725,8 +1568,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStreamMultiTurn(
     generated_text.reserve(maxTokens * 4);
     size_t sent_count = 0;
 
-
-
     token_batcher batcher(env, callback, g_onToken);
 
     while (n_generated < maxTokens && !g_state.cancel_flag.load()) {
@@ -1744,7 +1585,10 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStreamMultiTurn(
             generated_text.append(buf, n);
 
             size_t unsent_start = std::min(sent_count, generated_text.size());
-            size_t unsent_len = generated_text.size() - unsent_start;
+            size_t unsent_len   = generated_text.size() - unsent_start;
+            // Hot path: this runs on every token. The std::string ctor copies
+            // unsent_len bytes; antiprompt.find_stop only reads within that
+            // window. Per-token cost is negligible (typically <128 bytes).
             std::string unsent(generated_text.data() + unsent_start, unsent_len);
 
             size_t stop_pos = antiprompt.find_stop(unsent, (size_t)n, STOP_FULL);
@@ -1778,7 +1622,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStreamMultiTurn(
         if (llama_decode(g_state.ctx, sb) != 0) break;
         g_state.n_past++;
         n_generated++;
-
 
     }
 
@@ -1867,15 +1710,11 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStreamMultiTurn(
     return JNI_TRUE;
 }
 
-// JNI: nativeStopGeneration
-
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeStopGeneration(JNIEnv *, jobject) {
     g_state.cancel_flag = true;
     LOGI("Generation stop requested");
 }
-
-// JNI: nativeRelease
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRelease(JNIEnv *, jobject) {
@@ -1901,14 +1740,10 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRelease(JNIEnv *, jobject) {
     g_state.system_prompt.clear();
     g_state.chat_template_override.clear();
     g_state.tools_json.clear();
-
-    // clean up persona and optimization state
     g_state.persona_biases.clear();
-    g_state.lora_adapters.clear();
     g_state.cached_refusal_ids.clear();
     g_state.refusal_ids_scanned = false;
 
-    // Free reusable batches
     if (g_prompt_batch_cap > 0) {
         llama_batch_free(g_prompt_batch);
         g_prompt_batch = {};
@@ -1920,15 +1755,12 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRelease(JNIEnv *, jobject) {
         g_single_batch_init = false;
     }
 
-    // Clean up engine subsystems
     if (g_state.tool_mgr) {
         tool_manager_free(g_state.tool_mgr);
         g_state.tool_mgr = nullptr;
     }
     LOGI("Model released");
 }
-
-// JNI: nativeGetModelInfo
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGetModelInfo(JNIEnv * env, jobject) {
@@ -1977,8 +1809,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGetModelInfo(JNIEnv * env, jobject) 
     }
 }
 
-// JNI: nativeIsToolCallingSupported
-
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeIsToolCallingSupported(JNIEnv *, jobject) {
     if (!g_state.model) return JNI_FALSE;
@@ -1989,8 +1819,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeIsToolCallingSupported(JNIEnv *, job
     }
     return JNI_FALSE;
 }
-
-// JNI: nativeSetToolsJson
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetToolsJson(
@@ -2089,23 +1917,17 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetToolsJson(
     LOGI("Tools JSON set (%zu chars), ToolManager registered", g_state.tools_json.size());
 }
 
-// JNI: nativeSetGrammarMode
-
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetGrammarMode(JNIEnv *, jobject, jint mode) {
     g_state.grammar_mode = mode;
     LOGI("Grammar mode set to %d", mode);
 }
 
-// JNI: nativeSetTypedGrammar
-
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetTypedGrammar(JNIEnv *, jobject, jboolean enabled) {
     g_state.typed_grammar = enabled;
     LOGI("Typed grammar %s", enabled ? "enabled" : "disabled");
 }
-
-// JNI: nativeUpdateSamplerParams
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeUpdateSamplerParams(
@@ -2171,8 +1993,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeUpdateSamplerParams(
     }
 }
 
-// JNI: nativeSetLogitBias
-
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetLogitBias(
         JNIEnv * env, jobject, jstring jbiasJson) {
@@ -2237,8 +2057,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetLogitBias(
         LOGE("Failed to parse logit bias JSON: %s", e.what());
     }
 }
-
-// JNI: nativeLoadControlVectors
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadControlVectors(
@@ -2309,8 +2127,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadControlVectors(
     }
 }
 
-// JNI: nativeClearControlVector
-
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeClearControlVector(JNIEnv *, jobject) {
     if (!g_state.ctx) return;
@@ -2321,20 +2137,16 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeClearControlVector(JNIEnv *, jobject
     LOGI("Control vector cleared");
 }
 
-// JNI: nativeGetStateSize
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGetStateSize(JNIEnv *, jobject) {
     if (!g_state.ctx) return 0;
     return (jlong)llama_state_get_size(g_state.ctx);
 }
 
-// JNI: nativeGetContextUsage
 extern "C" JNIEXPORT jfloat JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGetContextUsage(JNIEnv *, jobject) {
     return (jfloat)get_context_usage();
 }
-
-// JNI: nativeStateSaveToFile
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeStateSaveToFile(
@@ -2349,8 +2161,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeStateSaveToFile(
     env->ReleaseStringUTFChars(jpath, path);
     return ok ? JNI_TRUE : JNI_FALSE;
 }
-
-// JNI: nativeStateLoadFromFile
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeStateLoadFromFile(
@@ -2380,12 +2190,12 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeStateLoadFromFile(
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 
-// Embedding Engine (separate model instance for text embeddings)
-
+// Embedding engine: independent model + context. Runs in parallel with the
+// chat engine — its own mutex, no shared state.
 static struct {
     llama_model   * model = nullptr;
     llama_context * ctx   = nullptr;
-    std::mutex mutex;
+    std::mutex      mutex;
 } g_embed;
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -2437,7 +2247,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeEncodeText(
 
     std::lock_guard<std::mutex> lock(g_embed.mutex);
 
-    // resolve and cache embedding callback method IDs
     ensure_embed_callback_methods(env, callback);
 
     if (!g_embed.model || !g_embed.ctx) {
@@ -2451,7 +2260,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeEncodeText(
     std::string text(text_cstr);
     env->ReleaseStringUTFChars(jtext, text_cstr);
 
-    // Tokenize using embedding model's vocab
     const llama_vocab * vocab = llama_model_get_vocab(g_embed.model);
     int n_tokens_max = text.size() + 256;
     std::vector<llama_token> tokens(n_tokens_max);
@@ -2549,8 +2357,8 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeReleaseEmbeddingModel(JNIEnv *, jobj
     LOGI("Embedding model released");
 }
 
-// Character / Personality JNI bindings — implemented directly via sampler params
-
+// Personality / mood: implemented purely as sampler-param presets — no
+// separate model, no extra memory.
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetPersonality(
         JNIEnv * env, jobject, jstring jparamsJson) {
@@ -2561,33 +2369,30 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetPersonality(
 
     try {
         auto j = json::parse(json_str);
-        // Map personality traits directly to sampler params — no separate character engine needed
-        g_state.sampling_params.temp          = j.value("temperature", 0.7f);
-        g_state.sampling_params.top_p         = j.value("topP", j.value("top_p", 0.9f));
+        g_state.sampling_params.temp           = j.value("temperature", 0.7f);
+        g_state.sampling_params.top_p          = j.value("topP", j.value("top_p", 0.9f));
         g_state.sampling_params.penalty_repeat = j.value("repetitionPenalty", j.value("repetition_penalty", 1.1f));
-        // creativity → min_p (higher creativity = lower min_p filter = more token diversity)
+        // creativity ∈ [0,1] → min_p ∈ [0.10, 0.02]. Higher creativity = looser filter.
         float creativity = j.value("creativity", 0.5f);
-        g_state.sampling_params.min_p = 0.1f - creativity * 0.08f; // 0.5 → 0.06, 1.0 → 0.02
+        g_state.sampling_params.min_p = 0.1f - creativity * 0.08f;
         rebuild_sampler();
-        LOGI("Personality applied: temp=%.2f top_p=%.2f",
-             g_state.sampling_params.temp, g_state.sampling_params.top_p);
     } catch (const std::exception & e) {
         LOGE("Failed to set personality: %s", e.what());
     }
 }
 
+// mood index: 0=NEUTRAL 1=HAPPY 2=SAD 3=EXCITED 4=CALM 5=ANGRY 6=CURIOUS
+//             7=CREATIVE 8=FOCUSED 9=CUSTOM
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetMood(JNIEnv *, jobject, jint mood) {
     std::lock_guard<std::mutex> lock(g_state.gen_mutex);
-    // 0=NEUTRAL 1=HAPPY 2=SAD 3=EXCITED 4=CALM 5=ANGRY 6=CURIOUS 7=CREATIVE 8=FOCUSED 9=CUSTOM
     static const float mood_temp[]    = { 0.7f, 0.8f, 0.6f, 0.9f, 0.5f, 0.85f, 0.75f, 0.9f, 0.6f, 0.7f };
     static const float mood_penalty[] = { 1.1f, 1.05f,1.15f,1.0f, 1.2f, 1.0f,  1.1f,  1.0f, 1.15f,1.1f };
     int m = (int)mood;
     if (m < 0 || m > 9) m = 0;
-    g_state.sampling_params.temp = mood_temp[m];
+    g_state.sampling_params.temp           = mood_temp[m];
     g_state.sampling_params.penalty_repeat = mood_penalty[m];
     rebuild_sampler();
-    LOGI("Mood set: %d (temp=%.2f)", m, mood_temp[m]);
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -2666,8 +2471,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGetUncensored(JNIEnv *, jobject) {
     return g_uncensored ? JNI_TRUE : JNI_FALSE;
 }
 
-// JNI: nativeSupportsThinking — detect from chat template
-
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSupportsThinking(JNIEnv *, jobject) {
     if (!g_state.chat_templates) return JNI_FALSE;
@@ -2675,15 +2478,12 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSupportsThinking(JNIEnv *, jobject) 
            ? JNI_TRUE : JNI_FALSE;
 }
 
-// JNI: nativeSetThinkingEnabled — enable/disable thinking in chat template
-
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetThinkingEnabled(JNIEnv *, jobject, jboolean enabled) {
     g_state.thinking_enabled = (enabled == JNI_TRUE);
     LOGI("Thinking %s", g_state.thinking_enabled ? "enabled" : "disabled");
 }
 
-// JNI: nativeSetThreadMode — switch thread mode at runtime (0=power_saving 1=balanced 2=performance)
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetThreadMode(JNIEnv *, jobject, jint mode) {
     std::lock_guard<std::mutex> lock(g_state.gen_mutex);
@@ -2692,15 +2492,11 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetThreadMode(JNIEnv *, jobject, jin
     LOGI("Thread mode set: %d", mode);
 }
 
-// JNI: nativeSetTokenBatchSize — tune Binder IPC batch size for AIDL service use
-// Larger = fewer IPC calls, higher latency to first visible token. Default=256.
-
+// Larger threshold = fewer IPC calls, higher latency to first visible token.
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetTokenBatchSize(JNIEnv *, jobject, jint bytes) {
     if (bytes >= 1) g_token_batch_threshold = (size_t)bytes;
 }
-
-// JNI: nativeSetPromptCacheDir — set directory for disk-backed prompt cache
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetPromptCacheDir(
@@ -2710,8 +2506,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetPromptCacheDir(
     env->ReleaseStringUTFChars(jpath, path);
     LOGI("Prompt cache dir set: %s", g_state.prompt_cache_dir.c_str());
 }
-
-// JNI: nativeWarmUp — run a warm-up decode pass to fault-in model weight pages
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeWarmUp(JNIEnv *, jobject) {
@@ -2733,10 +2527,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeWarmUp(JNIEnv *, jobject) {
     return rc == 0 ? JNI_TRUE : JNI_FALSE;
 }
 
-// ============================================================================
-// RAG Engine JNI bindings (separate model instance for retrieval-augmented generation)
-// ============================================================================
-
+// RAG engine state — separate from g_state, has its own embedding model.
 static struct {
     rag_engine_t * engine = nullptr;
     std::mutex     mutex;
@@ -3171,13 +2962,8 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRagImportIndex(
     return rc;
 }
 
-// ════════════════════════════════════════════
-//  AGENT ENGINE — Native orchestrator
-//  Plan → Execute (tool calls) → Summarize
-//  Uses the already-loaded g_state model
-// ════════════════════════════════════════════
-
-// Agent callback JNI method IDs (cached like StreamCallback)
+// Agent engine: plan → execute (tool calls) → summarize, on top of g_state.
+// Cached AgentCallback method IDs.
 static jclass    g_agent_cb_class       = nullptr;
 static jmethodID g_agent_onPlan         = nullptr;
 static jmethodID g_agent_onToolCall     = nullptr;
@@ -3186,7 +2972,7 @@ static jmethodID g_agent_onToken        = nullptr;
 static jmethodID g_agent_onSummary      = nullptr;
 static jmethodID g_agent_onComplete     = nullptr;
 static jmethodID g_agent_onError        = nullptr;
-static jmethodID g_agent_executeTool    = nullptr; // synchronous upcall
+static jmethodID g_agent_executeTool    = nullptr; // synchronous Kotlin upcall
 
 static bool ensure_agent_callback_methods(JNIEnv * env, jobject callback) {
     jclass cls = env->GetObjectClass(callback);
@@ -3213,19 +2999,16 @@ static bool ensure_agent_callback_methods(JNIEnv * env, jobject callback) {
            g_agent_onError && g_agent_executeTool;
 }
 
-// Agent state (separate from g_state — agent orchestration only)
 static struct {
-    jobject  callback_ref = nullptr;  // global ref to Kotlin AgentCallback
-    std::string tool_schemas_json;
+    jobject           callback_ref = nullptr;
+    std::string       tool_schemas_json;
     std::atomic<bool> cancel_flag{false};
-    std::mutex mutex;
-    bool initialized = false;
+    std::mutex        mutex;
+    bool              initialized = false;
 } g_agent;
 
-// ── Agent helper: generate text and return as string ──
-// Uses the existing g_state model/context. Caller must hold g_state.gen_mutex.
-// If stream_to_callback is true, also streams tokens to agent callback.
-
+// Caller must hold g_state.gen_mutex. Reads/writes g_state's KV cache directly,
+// so callers must not interleave a chat generation while this runs.
 static std::string agent_generate_text(
         JNIEnv * env,
         const std::vector<common_chat_msg> & messages,
@@ -3236,64 +3019,61 @@ static std::string agent_generate_text(
 
     if (!g_state.model || !g_state.ctx) return "";
 
+    // Per-phase tools/grammar swap. The plan/summarize phases pass
+    // use_grammar=false and want free-form text — so we drop tools_json from
+    // the template inputs for those phases. The execute phase forces STRICT
+    // grammar mode so the model produces a valid tool-call JSON.
     chat_template_result tmpl_result;
+    int  saved_grammar_mode = g_state.grammar_mode;
+    bool tools_swapped      = false;
+    std::string saved_tools;
     try {
-        // Temporarily set grammar mode for tool calling phase
-        int saved_grammar_mode = g_state.grammar_mode;
         if (use_grammar && !g_state.tools_json.empty()) {
-            g_state.grammar_mode = 0; // STRICT
+            g_state.grammar_mode = 0;
         } else {
-            // Clear tools temporarily for free-form generation
-            std::string saved_tools = g_state.tools_json;
+            saved_tools = g_state.tools_json;
             g_state.tools_json.clear();
-            tmpl_result = apply_chat_template(messages, true);
-            g_state.tools_json = saved_tools;
-            g_state.grammar_mode = saved_grammar_mode;
-            goto after_template;
+            tools_swapped = true;
         }
         tmpl_result = apply_chat_template(messages, true);
-        g_state.grammar_mode = saved_grammar_mode;
     } catch (const std::exception & e) {
+        if (tools_swapped) g_state.tools_json = saved_tools;
+        g_state.grammar_mode = saved_grammar_mode;
         LOGE("Agent template error: %s", e.what());
         return "";
     }
+    if (tools_swapped) g_state.tools_json = saved_tools;
+    g_state.grammar_mode = saved_grammar_mode;
 
-after_template:
     auto tokens = tokenize_string(tmpl_result.prompt, true);
     if (tokens.empty()) return "";
 
-    // Check prompt fits
     if (check_prompt_fits((int)tokens.size(), max_tokens) == -1) {
         LOGW("Agent prompt exceeds context window");
         return "";
     }
 
-    // Apply grammar if needed
-    bool grammar_applied = false;
+    bool                   grammar_applied = false;
     common_params_sampling saved_params;
     if (use_grammar && !tmpl_result.grammar.empty() && !g_state.tools_json.empty()) {
-        saved_params = g_state.sampling_params;
-        g_state.sampling_params.grammar = tmpl_result.grammar;
-        g_state.sampling_params.grammar_lazy =
+        saved_params                              = g_state.sampling_params;
+        g_state.sampling_params.grammar           = tmpl_result.grammar;
+        g_state.sampling_params.grammar_lazy      =
             (g_state.grammar_mode == 0) ? tmpl_result.grammar_lazy : true;
-        g_state.sampling_params.grammar_triggers = tmpl_result.grammar_triggers;
+        g_state.sampling_params.grammar_triggers  = tmpl_result.grammar_triggers;
         for (auto & tok_str : tmpl_result.preserved_tokens) {
             auto ids = tokenize_string(tok_str, false);
-            for (auto id : ids) {
-                g_state.sampling_params.preserved_tokens.insert(id);
-            }
+            for (auto id : ids) g_state.sampling_params.preserved_tokens.insert(id);
         }
         grammar_applied = true;
     }
 
-    // Clear KV cache for fresh generation (agent generates independent prompts)
+    // Each agent phase is its own prompt — start with a clean KV cache.
     llama_memory_t mem = llama_get_memory(g_state.ctx);
     llama_memory_clear(mem, true);
     g_state.n_past = 0;
-
     rebuild_sampler();
 
-    // Evaluate prompt
     if (!eval_tokens(tokens, g_state.n_past, nullptr, nullptr)) {
         if (grammar_applied) {
             g_state.sampling_params = saved_params;
@@ -3302,13 +3082,11 @@ after_template:
         return "";
     }
 
-    // Set up antiprompt
     antiprompt_state antiprompt;
     antiprompt.set_stops(tmpl_result.stops);
 
-    // Generate
     const llama_vocab * vocab = llama_model_get_vocab(g_state.model);
-    std::string generated;
+    std::string         generated;
     generated.reserve(max_tokens * 4);
     int n_generated = 0;
 
@@ -3368,63 +3146,58 @@ after_template:
     return generated;
 }
 
-// ── Agent helper: parse tool call from generated text ──
-
 struct agent_tool_call {
     std::string name;
     std::string args_json;
-    bool valid = false;
+    bool        valid = false;
 };
 
+// Tries four strategies in order: chat-template parser, ToolManager
+// fallback, whole-text JSON, embedded JSON object scan.
 static agent_tool_call agent_parse_tool_call(const std::string & text) {
     agent_tool_call result;
 
-    // Strategy 1: llama.cpp template-aware parser
     if (g_state.chat_templates) {
         try {
             common_chat_parser_params params;
-            // Use default format
             auto parsed = common_chat_parse(text, false, params);
             if (!parsed.tool_calls.empty()) {
                 auto & tc = parsed.tool_calls[0];
-                result.name = tc.name;
+                result.name      = tc.name;
                 result.args_json = tc.arguments;
-                result.valid = true;
+                result.valid     = true;
                 return result;
             }
         } catch (...) {}
     }
 
-    // Strategy 2: ToolManager fallback
     if (g_state.tool_mgr) {
         auto tm_result = tool_manager_parse_output(g_state.tool_mgr, text.c_str());
         if (tm_result.is_valid) {
-            result.name = tm_result.tool_name;
+            result.name      = tm_result.tool_name;
             result.args_json = tm_result.arguments_json;
-            result.valid = true;
+            result.valid     = true;
             tool_manager_free_string((char *)tm_result.tool_name);
             tool_manager_free_string((char *)tm_result.arguments_json);
             return result;
         }
     }
 
-    // Strategy 3: Raw JSON extraction
     try {
         auto j = json::parse(text);
         if (j.contains("name") && j.contains("arguments")) {
-            result.name = j["name"].get<std::string>();
+            result.name      = j["name"].get<std::string>();
             result.args_json = j["arguments"].dump();
-            result.valid = true;
+            result.valid     = true;
             return result;
         }
     } catch (...) {}
 
-    // Strategy 4: Find JSON in text
     auto pos = text.find("{\"name\"");
     if (pos == std::string::npos) pos = text.find("{\"tool_call");
     if (pos != std::string::npos) {
-        int depth = 0;
-        size_t end = pos;
+        int    depth = 0;
+        size_t end   = pos;
         for (size_t i = pos; i < text.size(); i++) {
             if (text[i] == '{') depth++;
             else if (text[i] == '}') { depth--; if (depth == 0) { end = i + 1; break; } }
@@ -3434,9 +3207,7 @@ static agent_tool_call agent_parse_tool_call(const std::string & text) {
                 auto j = json::parse(text.substr(pos, end - pos));
                 if (j.contains("name")) {
                     result.name = j["name"].get<std::string>();
-                    if (j.contains("arguments")) {
-                        result.args_json = j["arguments"].dump();
-                    }
+                    if (j.contains("arguments")) result.args_json = j["arguments"].dump();
                     result.valid = true;
                     return result;
                 }
@@ -3446,8 +3217,6 @@ static agent_tool_call agent_parse_tool_call(const std::string & text) {
 
     return result;
 }
-
-// ── JNI: nativeInitAgentSystem ──
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeInitAgentSystem(
@@ -3484,8 +3253,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeInitAgentSystem(
     return JNI_TRUE;
 }
 
-// ── JNI: nativeRunAgentStep ──
-
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRunAgentStep(
         JNIEnv * env, jobject,
@@ -3516,14 +3283,14 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRunAgentStep(
     std::string system_prompt(sys_cstr);
     env->ReleaseStringUTFChars(jsystemPrompt, sys_cstr);
 
-    // Ensure tools are configured in g_state for grammar-constrained generation
+    // Inject the agent's tool schemas into g_state so apply_chat_template()
+    // sees them during the execute phase. Restored before we return.
     std::string saved_tools = g_state.tools_json;
     if (!g_agent.tool_schemas_json.empty()) {
         g_state.tools_json = g_agent.tool_schemas_json;
     }
 
-    // ── Phase 1: Plan ──
-    LOGI("Agent phase: PLAN");
+    LOGI("Agent: PLAN phase");
     {
         std::vector<common_chat_msg> plan_msgs;
         plan_msgs.push_back({"system", system_prompt + "\n\nCreate a brief 1-2 sentence plan for this request. Do NOT call any tools yet."});
@@ -3543,7 +3310,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRunAgentStep(
         }
     }
 
-    // ── Phase 2: Execute tool calls ──
+    // Execute phase: up to maxRounds tool-call iterations.
     LOGI("Agent phase: EXECUTE (max %d rounds)", maxRounds);
     struct tool_step {
         int round;
@@ -3576,14 +3343,12 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRunAgentStep(
         if (g_agent.cancel_flag.load()) break;
         if (output.empty()) break;
 
-        // Parse tool call
         auto parsed = agent_parse_tool_call(output);
         if (!parsed.valid) {
-            LOGI("Agent round %d: no tool call found, ending execution", round);
+            LOGI("Agent round %d: no tool call, ending execute phase", round);
             break;
         }
 
-        // Notify Kotlin of tool call
         jstring jname = safe_new_string_utf(env, parsed.name.c_str());
         jstring jargs = safe_new_string_utf(env, parsed.args_json.c_str());
         env->CallVoidMethod(g_agent.callback_ref, g_agent_onToolCall,
@@ -3591,7 +3356,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRunAgentStep(
         env->DeleteLocalRef(jname);
         env->DeleteLocalRef(jargs);
 
-        // Execute tool via synchronous upcall to Kotlin
         auto t_start = std::chrono::steady_clock::now();
 
         jstring jexec_name = safe_new_string_utf(env, parsed.name.c_str());
@@ -3601,8 +3365,8 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRunAgentStep(
         env->DeleteLocalRef(jexec_name);
         env->DeleteLocalRef(jexec_args);
 
-        // JNI spec: any pending exception from the upcall must be cleared before
-        // making further JNI calls — otherwise the next call hits UB.
+        // Pending exceptions from the synchronous upcall MUST be cleared before
+        // any other JNI call — otherwise we hit undefined behaviour.
         std::string result_str;
         if (env->ExceptionCheck()) {
             env->ExceptionDescribe();
@@ -3618,14 +3382,13 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRunAgentStep(
             result_str = "{\"error\":\"null result\"}";
         }
 
-        auto t_end = std::chrono::steady_clock::now();
+        auto t_end   = std::chrono::steady_clock::now();
         long elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
 
         bool success = result_str.find("\"error\"") == std::string::npos;
         steps.push_back({round, parsed.name, parsed.args_json, result_str, success, elapsed});
 
-        // Notify Kotlin of tool result
-        jstring jresult_str = safe_new_string_utf(env, result_str.c_str());
+        jstring jresult_str  = safe_new_string_utf(env, result_str.c_str());
         jstring jresult_name = safe_new_string_utf(env, parsed.name.c_str());
         env->CallVoidMethod(g_agent.callback_ref, g_agent_onToolResult,
                             (jint)round, jresult_name, jresult_str,
@@ -3642,8 +3405,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRunAgentStep(
         return;
     }
 
-    // ── Phase 3: Summarize ──
-    LOGI("Agent phase: SUMMARIZE");
+    // Summarize phase.
     {
         std::vector<common_chat_msg> sum_msgs;
         std::string steps_text;
@@ -3651,7 +3413,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRunAgentStep(
             steps_text += "- " + s.tool_name + "(" + s.args_json + ") → " +
                           s.result_json.substr(0, 500) + "\n";
         }
-
         sum_msgs.push_back({"system", "Summarize what was accomplished. Be concise and helpful."});
         sum_msgs.push_back({"user", user_message});
         sum_msgs.push_back({"assistant", "I executed the following steps:\n" + steps_text});
@@ -3666,18 +3427,13 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRunAgentStep(
         }
     }
 
-    // Restore tools
     g_state.tools_json = saved_tools;
 
-    // Complete
     if (!g_agent.cancel_flag.load()) {
         env->CallVoidMethod(g_agent.callback_ref, g_agent_onComplete);
     }
-
     LOGI("Agent step complete: %zu tool calls", steps.size());
 }
-
-// ── JNI: nativeStopAgent ──
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeStopAgent(JNIEnv *, jobject) {
@@ -3685,8 +3441,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeStopAgent(JNIEnv *, jobject) {
     g_state.cancel_flag = true; // also stop any in-progress generation
     LOGI("Agent stop requested");
 }
-
-// ── JNI: nativeReleaseAgentSystem ──
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeReleaseAgentSystem(JNIEnv * env, jobject) {
@@ -3703,21 +3457,18 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeReleaseAgentSystem(JNIEnv * env, job
     LOGI("Agent system released");
 }
 
-// ════════════════════════════════════════════
-//  VLM (Vision Language Model) JNI Bridge
-// ════════════════════════════════════════════
-
+// VLM (Vision Language Model) state. The mtmd projector context binds n_threads
+// at init time; if the caller switches thread mode after loading, the projector
+// keeps the old count. Reload via releaseVlmProjector() + loadVlmProjector() to
+// pick up the new mode.
 static struct {
     mtmd_context * ctx = nullptr;
     std::mutex     mutex;
 } g_vlm;
 
-// ── JNI: nativeVlmLoadProjector ──
-//
-// imageMinTokens / imageMaxTokens let the caller cap the mmproj token budget.
-// Pass -1 for either to use the model default. Lowering imageMaxTokens reduces
-// the overview resolution but does NOT cap the per-tile count for LFM2-VL;
-// the tile cap is a compile-time constant in clip.cpp.
+// imageMinTokens / imageMaxTokens (-1 = model default) cap the mmproj token
+// budget for the *overview* image. For LFM2-VL the per-tile count is a
+// compile-time constant in clip.cpp; lowering imageMaxTokens does not cap it.
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmLoadProjector(
         JNIEnv * env, jobject, jstring jpath, jint nThreads,
@@ -3730,7 +3481,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmLoadProjector(
         return JNI_FALSE;
     }
 
-    // release previous projector if any
     if (g_vlm.ctx) {
         mtmd_free(g_vlm.ctx);
         g_vlm.ctx = nullptr;
@@ -3739,8 +3489,10 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmLoadProjector(
     const char * path = env->GetStringUTFChars(jpath, nullptr);
 
     auto params = mtmd_context_params_default();
-    params.use_gpu       = false;  // CPU only on mobile
-    params.n_threads     = nThreads > 0 ? nThreads : tn_thread_config_for_mode((tn_thread_mode)g_state.thread_mode).n_threads_batch;
+    params.use_gpu       = false;
+    params.n_threads     = nThreads > 0
+        ? nThreads
+        : tn_thread_config_for_mode((tn_thread_mode)g_state.thread_mode).n_threads_batch;
     params.print_timings = false;
     params.warmup        = true;
     if (imageMinTokens > 0) params.image_min_tokens = imageMinTokens;
@@ -3754,13 +3506,11 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmLoadProjector(
         return JNI_FALSE;
     }
 
-    LOGI("VLM: projector loaded (vision=%d, audio=%d, img_tokens=[%d..%d])",
+    LOGI("VLM: projector loaded (vision=%d, audio=%d, img_tokens=[%d..%d], threads=%d)",
          mtmd_support_vision(g_vlm.ctx), mtmd_support_audio(g_vlm.ctx),
-         imageMinTokens, imageMaxTokens);
+         imageMinTokens, imageMaxTokens, params.n_threads);
     return JNI_TRUE;
 }
-
-// ── JNI: nativeVlmLoadProjectorFromFd ──
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmLoadProjectorFromFd(
@@ -3772,15 +3522,12 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmLoadProjectorFromFd(
         return JNI_FALSE;
     }
 
-    // Own the fd so /proc/self/fd/<n> stays valid across the load — Kotlin's
-    // ParcelFileDescriptor may close the original mid-load.
     int owned_fd = dup(fd);
     if (owned_fd < 0) {
         LOGE("VLM: dup() failed for fd %d: %s", fd, strerror(errno));
         return JNI_FALSE;
     }
 
-    // mmap-based loading requires a seekable fd; SAF pipe providers fail this.
     if (lseek(owned_fd, 0, SEEK_CUR) == (off_t)-1) {
         LOGE("VLM: fd %d is not seekable: %s", fd, strerror(errno));
         close(owned_fd);
@@ -3789,7 +3536,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmLoadProjectorFromFd(
 
     char fd_path[64];
     snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", owned_fd);
-    jstring jpath = env->NewStringUTF(fd_path);
+    jstring  jpath  = env->NewStringUTF(fd_path);
     jboolean result = Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmLoadProjector(
         env, thiz, jpath, nThreads, imageMinTokens, imageMaxTokens);
     env->DeleteLocalRef(jpath);
@@ -3797,8 +3544,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmLoadProjectorFromFd(
     close(owned_fd);
     return result;
 }
-
-// ── JNI: nativeVlmRelease ──
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmRelease(JNIEnv *, jobject) {
@@ -3810,14 +3555,10 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmRelease(JNIEnv *, jobject) {
     }
 }
 
-// ── JNI: nativeVlmIsLoaded ──
-
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmIsLoaded(JNIEnv *, jobject) {
     return g_vlm.ctx != nullptr ? JNI_TRUE : JNI_FALSE;
 }
-
-// ── JNI: nativeVlmGetInfo ──
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGetInfo(JNIEnv * env, jobject) {
@@ -3832,21 +3573,15 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGetInfo(JNIEnv * env, jobject) {
     return env->NewStringUTF(s.c_str());
 }
 
-// ── JNI: nativeVlmGetDefaultMarker ──
-
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGetDefaultMarker(JNIEnv * env, jobject) {
     return env->NewStringUTF(mtmd_default_marker());
 }
 
-// ── JNI: nativeVlmGenerateStream ──
-//
-// Generates a response from text + images. The prompt should contain
-// image markers (from nativeVlmGetDefaultMarker) where images go.
-//
-// imageDataArray: array of byte[] — each is raw file bytes (JPEG/PNG)
-// This clears the KV cache and starts fresh (VLM doesn't support multi-turn context reuse).
-
+// Generates a response from text + images. messagesJson must include the
+// default media marker where images appear; raw image bytes (JPEG/PNG) are
+// passed in imageDataArray. The KV cache is cleared at the start — VLM does
+// not support multi-turn context reuse here.
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGenerateStream(
         JNIEnv * env, jobject,
@@ -4073,7 +3808,10 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGenerateStream(
             generated_text.append(buf, n);
 
             size_t unsent_start = std::min(sent_count, generated_text.size());
-            size_t unsent_len = generated_text.size() - unsent_start;
+            size_t unsent_len   = generated_text.size() - unsent_start;
+            // Hot path: this runs on every token. The std::string ctor copies
+            // unsent_len bytes; antiprompt.find_stop only reads within that
+            // window. Per-token cost is negligible (typically <128 bytes).
             std::string unsent(generated_text.data() + unsent_start, unsent_len);
 
             size_t stop_pos = antiprompt.find_stop(unsent, (size_t)n, STOP_FULL);
@@ -4142,7 +3880,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGenerateStream(
     return JNI_TRUE;
 }
 
-// ── KV Eviction Policy ────────────────────────────────────────────────────────
+// KV Eviction Policy
 
 // nativeSetKvPolicy(nSink, nWindow, evictAtFull)
 extern "C" JNIEXPORT void JNICALL
@@ -4160,9 +3898,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeEvictToBudget(JNIEnv *, jobject) {
     kv_evict_streaming();
 }
 
-
-
-// ── Error Tracker JNI ──────────────────────────────────────────────────────
+// Error Tracker JNI
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeErrorInit(JNIEnv *, jobject) {

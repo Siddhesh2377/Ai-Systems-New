@@ -1,204 +1,137 @@
 # gguf_lib
 
-Android AAR module providing a Kotlin SDK + JNI bridge for on-device LLM/VLM inference.
-Built on the Tool-Neuron GGML Backend — a CPU-only, ARM-optimized fork of llama.cpp.
+Android AAR module providing a Kotlin SDK + JNI bridge for on-device LLM/VLM
+inference. Built on llama.cpp + the tool-neuron engine helpers (CPU-only,
+ARM-optimized).
 
 ## Architecture
 
 ```
 Kotlin SDK
-  GGMLEngine          model load/unload, generation, KV cache, thread mode
+  GGMLEngine          model load/unload, generation, KV cache, thread mode, VLM
   CharacterEngine     personality, mood, uncensored mode (sampler-level)
   ToolManager         tool registration, grammar mode, multi-format parsing
   RAGEngine           late-chunking retrieval, binary quantization index
   EmbeddingEngine     standalone text embedding
+  TextDigest          extractive summarization (CPU-only, no model)
+    |                 (GGUFNativeLib — internal JNI bridge)
+gguf_lib.so           JNI + engine sources compiled into a single .so
     |
-GGUFNativeLib         JNI bridge (extern "C", method ID caching, zero-copy tokens)
-    |
-gguf_lib.so           JNI bridge + engine sources compiled into single .so
-    |
-llama.cpp engine/     GGMLEngine, ThreadEngine, ToolManager, RAGEngine, VLM
+llama.cpp engine/     thread-engine, tool-manager, rag-engine, mtmd (VLM)
 llama.cpp src/        model loading, tokenization, inference, sampling
-ggml/                 CPU backend — NEON, i8mm, dotprod, KleidiAI ARM micro-kernels
+ggml/                 CPU backend — NEON, i8mm, dotprod, KleidiAI ARM kernels
 ```
 
----
-
-## Model Loading
+## Loading
 
 ```kotlin
 val engine = GGMLEngine()
-
-// From file path
 engine.load(
     path        = "/data/local/tmp/model.gguf",
     contextSize = 4096,
-    threadMode  = 1,        // 0=power_saving, 1=balanced, 2=performance
+    threads     = 0,           // 0 = auto from current thread mode
+    batchSize   = 0,           // 0 = auto
     flashAttn   = false,
-    cacheTypeK  = "q8_0",  // KV quantization (q4_0, q8_0, f16)
-    cacheTypeV  = "q8_0"
+    useMmap     = true,
+    useMlock    = false,
+    cacheTypeK  = "q8_0",
+    cacheTypeV  = "q8_0",
 )
 
-// From Android SAF content:// URI
-engine.load(context, uri, contextSize = 4096, threadMode = 1)
-
-// From file descriptor (AIDL service / SAF)
-engine.loadFromFd(fd, contextSize = 4096, threadMode = 1)
+// SAF / file descriptor variants
+engine.loadFromFd(fd)
+engine.load(context, uri)
 ```
 
-### KV Cache Quantization
+### KV cache quantization
 
-KV cache is the biggest memory consumer for long contexts. Always quantize:
+| Type   | KV memory | Quality          |
+|--------|-----------|------------------|
+| `f16`  | 100%      | lossless         |
+| `q8_0` | ~50%      | near-lossless (default) |
+| `q4_0` | ~25%      | slight quality loss; use on low-RAM devices |
 
-| Type | KV Memory | Quality |
-|------|-----------|---------|
-| `f16` | 100% | lossless |
-| `q8_0` | ~50% | near-lossless — recommended default |
-| `q4_0` | ~25% | slight quality loss — use on low-RAM devices |
+Memory: `n_layers x n_ctx x 2 x n_kv_heads x d_head x dtype_bytes`. A 7B model
+with 4096 ctx and `q8_0` uses ~500 MB for KV vs ~1 GB for `f16`.
 
-The KV memory formula: `n_layers × n_ctx × 2 × n_kv_heads × d_head × dtype_bytes`.
-A 7B model with 4096 ctx and q8_0 uses roughly **~500 MB** for KV vs ~1 GB for f16.
-
----
-
-## Thread Mode
-
-Controls big.LITTLE core usage. Switch at runtime without reloading:
+### Thread mode
 
 ```kotlin
-engine.setThreadMode(0) // power saving — 1 thread, E-cores, n_batch=128
-engine.setThreadMode(1) // balanced   — 2 P-cores gen, all P-cores batch (default)
-engine.setThreadMode(2) // performance — 4 P-cores gen, all cores batch, n_batch=512
+engine.setThreadMode(0)  // power saving
+engine.setThreadMode(1)  // balanced (default)
+engine.setThreadMode(2)  // performance
 ```
 
-| Mode | Value | Gen Threads | Batch Threads | Pins to P-cores |
-|------|-------|-------------|---------------|-----------------|
-| Power Saving | 0 | 1 | E-cores only | No |
-| Balanced | 1 | 2 P-cores | All P-cores | Yes |
-| Performance | 2 | min(4, P) | All cores | Yes |
+| Mode        | Gen threads | Batch threads | Pins to P-cores |
+|-------------|-------------|---------------|-----------------|
+| Power saving | 1          | E-cores only  | no              |
+| Balanced    | 2 P-cores   | All P-cores   | yes             |
+| Performance | min(4, P)   | All cores     | yes             |
 
----
+Note: the VLM projector binds `n_threads` at init. After `setThreadMode()` you
+must `releaseVlmProjector()` then `loadVlmProjector()` to re-bind.
 
 ## Generation
 
 ```kotlin
-// Streaming (single-turn)
-engine.generateRawFlow("Hello!", maxTokens = 512).collect { event ->
+// Single-turn streaming
+engine.generateFlow("Hello!", maxTokens = 512).collect { event ->
     when (event) {
         is GenerationEvent.Token    -> print(event.text)
-        is GenerationEvent.Done     -> println("\nDone")
-        is GenerationEvent.Metrics  -> println("${event.metrics.tokensPerSecond} t/s")
+        is GenerationEvent.Done     -> {}
+        is GenerationEvent.Metrics  -> log(event.metrics.tokensPerSecond)
         is GenerationEvent.ToolCall -> handleTool(event.name, event.argsJson)
-        is GenerationEvent.Error    -> println("Error: ${event.message}")
+        is GenerationEvent.Error    -> log(event.message)
+        is GenerationEvent.Progress -> updateProgress(event.progress)
         else -> {}
     }
 }
 
-// Streaming (multi-turn)
+// Multi-turn streaming
 val messages = """[{"role":"user","content":"Hi"}]"""
-engine.generateMultiTurnRawFlow(messages, maxTokens = 512).collect { ... }
+engine.generateMultiTurnFlow(messages, maxTokens = 512).collect { /* ... */ }
 
 // Non-streaming
 val result = engine.generate("Hello!", maxTokens = 512)
-println(result.text)
 ```
 
----
+Cancellation: closing the collecting coroutine calls `nativeStopGeneration()`
+and the in-flight generate returns immediately.
 
 ## Sampling
 
 ```kotlin
-engine.setSampling(
-    temperature = 0.7f,
-    topK        = 40,
-    topP        = 0.9f,
-    minP        = 0.05f,
-    seed        = -1
-)
-
-// JSON update — supports camelCase and snake_case keys
+engine.setSampling(temperature = 0.7f, topK = 40, topP = 0.9f, minP = 0.05f)
 engine.updateSamplerParams("""{"temperature":0.8,"top_p":0.95}""")
-
-// Per-token logit bias (token id → bias float)
 engine.setLogitBias("""{"1234": -100.0}""")
 ```
 
----
+`updateSamplerParams` accepts both camelCase and snake_case; recognized keys:
+`temperature`, `topK`/`top_k`, `topP`/`top_p`, `minP`/`min_p`,
+`repeatPenalty`, `frequencyPenalty`, `presencePenalty`, `penaltyLastN`,
+`dryMultiplier`, `dryBase`, `dryAllowedLength`, `dryPenaltyLastN`,
+`xtcProbability`, `xtcThreshold`, `mirostat`, `mirostatTau`, `mirostatEta`,
+`seed`.
 
-## KV Cache Management
-
-### Context Usage
-
-```kotlin
-val usage = engine.getContextUsage()  // 0.0 = empty, 1.0 = full
-val info  = engine.getContextInfo()   // total, used, remaining, promptEstimate
-```
-
-### StreamingLLM Eviction Policy
-
-For long conversations that exceed the context window, instead of hard stopping,
-the StreamingLLM policy continuously evicts old tokens while keeping two regions:
-
-- **Sink tokens** `[0, nSink)` — first few tokens contain critical attention anchors; never evict
-- **Recency window** `[nPast-nWindow, nPast)` — the most recent tokens; always kept
-
-Everything in between is dropped and tail positions are shifted to stay contiguous.
+## KV cache management
 
 ```kotlin
-// Keep 4 sink tokens + last 512 tokens. Auto-evict when context fills.
-engine.setKvPolicy(
-    nSink       = 4,
-    nWindow     = 512,
-    evictAtFull = true
-)
-```
+val usage = engine.getContextUsage()  // 0.0..1.0
 
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `nSink` | Tokens at start to never evict (attention sinks) | 4 |
-| `nWindow` | Recency tail kept after eviction | 0 (disabled) |
-| `evictAtFull` | Auto-evict when context would overflow at generation start | false |
+// StreamingLLM eviction: keep [0, nSink) + tail of nWindow tokens, drop middle.
+engine.setKvPolicy(nSink = 4, nWindow = 512, evictAtFull = true)
+engine.evictToBudget()  // SnapKV-style post-prefill trim
 
-Set `nWindow = 0` to disable and fall back to the default half-discard context shift.
+// Session save/restore
+engine.stateSaveToFile("$filesDir/session.bin")
+engine.stateLoadFromFile("$filesDir/session.bin")
 
-### Post-Prefill Budget (SnapKV-style)
-
-After feeding a long system prompt, trim the KV cache immediately to the window budget:
-
-```kotlin
-engine.setSystemPrompt(longSystemPrompt)
-engine.evictToBudget()  // apply eviction right now, free KV memory for generation
-```
-
-Useful when you know the system prompt is the longest thing you'll process.
-
-### Session Save / Restore
-
-Save the full KV cache state to disk and restore it later with the same model —
-eliminates the prompt re-processing cost on cold start:
-
-```kotlin
-// Save after building up context
-engine.stateSaveToFile(context.filesDir.absolutePath + "/session.bin")
-
-// Restore on next launch — skips prompt re-decode
-engine.stateLoadFromFile(context.filesDir.absolutePath + "/session.bin")
-```
-
-### Disk-Backed Prompt Cache
-
-Automatically caches the system prompt KV state to disk. On subsequent loads with
-the same system prompt, the KV cache is restored from disk instead of re-decoded:
-
-```kotlin
+// Disk-backed prompt cache: system prompt KV is auto-saved on first eval and
+// restored on subsequent loads with the same prompt.
 engine.setPromptCacheDir(context.cacheDir.absolutePath)
-// Now the first generate() after load will write the prompt KV to disk.
-// All future loads with the same prompt skip re-evaluation entirely.
 ```
 
----
-
-## Tool Calling
+## Tool calling
 
 ```kotlin
 val weather = ToolDefinitionBuilder("get_weather", "Get current weather")
@@ -206,212 +139,118 @@ val weather = ToolDefinitionBuilder("get_weather", "Get current weather")
     .build()
 
 val toolManager = ToolManager(engine)
-toolManager.registerTools(
-    listOf(weather),
-    ToolCallingConfig(grammarMode = GrammarMode.LAZY)
-)
+toolManager.registerTools(listOf(weather), ToolCallingConfig(grammarMode = GrammarMode.LAZY))
 
-engine.generateRawFlow(prompt, 512).collect { event ->
-    if (event is GenerationEvent.ToolCall) {
-        val result = callTool(event.name, event.argsJson)
-        // Feed result back as a new turn
-    }
-}
+// Tool calls arrive via GenerationEvent.ToolCall during generate flows.
 ```
 
-Grammar modes:
-- `NONE` — prompt-only, JSON extraction via regex
-- `LAZY` — grammar activates only when a tool call is detected mid-stream
-- `STRICT` — grammar-constrained from the first token
-
----
+Grammar modes: `STRICT` forces tool-call output; `LAZY` lets the model choose.
 
 ## Vision (VLM)
 
 ```kotlin
-// Load text model first, then the vision projector
 engine.load("/path/to/model.gguf")
 engine.loadVlmProjector(
-    path            = "/path/to/mmproj.gguf",
-    threads         = 0,     // 0 = auto
-    imageMinTokens  = -1,    // -1 = model default
-    imageMaxTokens  = 128,   // cap overview resolution (model default may be 256+)
+    path           = "/path/to/mmproj.gguf",
+    threads        = 0,
+    imageMinTokens = -1,
+    imageMaxTokens = 128,
 )
 
-val imageBytes = File("/path/to/image.jpg").readBytes()
-val marker     = engine.getVlmDefaultMarker()   // e.g. "<__media__>"
+val marker   = engine.getVlmDefaultMarker()
+val messages = """[{"role":"user","content":"Describe: $marker"}]"""
+engine.generateVlmFlow(messages, listOf(imageBytes), maxTokens = 256).collect { /* ... */ }
 
-val messages = """[{"role":"user","content":"Describe this: $marker"}]"""
-engine.generateVlmFlow(messages, listOf(imageBytes), maxTokens = 512).collect { event ->
-    when (event) {
-        is GenerationEvent.Token -> print(event.text)
-        is GenerationEvent.VlmStageMetrics -> println(
-            "encode=${event.vlmEncodeMs}ms decode=${event.vlmDecodeMs}ms " +
-            "image_tokens=${event.imageTokens}"
-        )
-        else -> {}
-    }
-}
+engine.releaseVlmProjector()
 ```
 
-Listen for `GenerationEvent.VlmStageMetrics` to see how time was spent — `vlmEncodeMs` is the vision-encoder forward pass, `vlmDecodeMs` is the LLM running prompt-eval on the image embeddings, `imageTokens` is how many embedding tokens the model produced for your image.
+`imageMaxTokens` caps the *overview* image budget. For LFM2-VL the per-tile
+grid is a compile-time constant in `clip.cpp` and is unaffected by this knob.
 
-### Tuning VLM performance
+`GenerationEvent.VlmStageMetrics` reports `vlmEncodeMs` (ViT forward), `vlmDecodeMs`
+(LLM running prompt-eval on image embeddings) and `imageTokens` once per call.
 
-- `imageMaxTokens` caps the **overview image** pixel budget. Lower = smaller overview, faster ViT. Default in upstream models is often 256.
-- For **LFM2-VL** specifically, the tile grid (which multiplies the per-tile ViT forward + LLM decode cost) is capped by a compile-time constant `lfm2_vl_image_processor::max_tiles` in `engine/vlm/clip.cpp`. This fork sets it to `4`; the upstream default was `10`. Changing `imageMaxTokens` alone will not change tile count.
-- Larger `n_batch` (from `threadMode = 1` or `2`) halves the number of `llama_decode` calls during prompt-eval on image embeddings.
-
----
-
-## RAG (Retrieval-Augmented Generation)
+## RAG
 
 ```kotlin
 val rag = RAGEngine()
 rag.create(dims = 256, topK = 32, topN = 5, lateChunking = true)
 rag.loadModel("/path/to/embedding-model.gguf")
-
-// Index
 rag.addDocument("Full document text...", docId = "doc-1")
 
-// Query
 val results = rag.query("search query")
-results.forEach { println("${it.docId} (${it.score}): ${it.text}") }
+val prompt  = rag.buildPrompt("user question", "Answer based on context:")
 
-// Or build an augmented prompt directly
-val prompt = rag.buildPrompt("user question", "Answer based on context:")
+// Persist & restore
+val blob = rag.exportIndex()
+rag.importIndex(blob!!)
+
 rag.close()
 ```
 
----
-
-## Character / Personality
-
-All personality/mood/uncensored state lives purely in sampler params — no separate model, no extra memory.
+## Character / personality
 
 ```kotlin
 val character = CharacterEngine(engine)
 
-// Personality — maps creativity/temperature/topP to sampler params
 character.setPersonality(Personality(
     name        = "Luna",
     persona     = "A warm, empathetic assistant",
     temperature = 0.8f,
-    creativity  = 0.7f
+    creativity  = 0.7f,
 ))
-
-// Mood — shifts temperature and repetition penalty via lookup table
 character.setMood(Mood.HAPPY)
-
-// Uncensored mode — vocab-scan for refusal tokens on first call,
-// then applies logit bias -100 to suppress them. Cached after first scan.
-character.setUncensored(true)
+character.setUncensored(true)  // vocab-scan + logit bias on first call, cached
 ```
 
----
+All personality/mood/uncensored state lives purely in sampler params — no
+extra model, no extra memory.
 
-## AIDL Service Optimization
-
-When running inside an AIDL service, each `onToken` callback crosses the Binder boundary (~20–50 µs per call). Increase the token batch size:
+## Embedding (standalone)
 
 ```kotlin
-// Default: 256 bytes. Tune per use case:
-engine.setTokenBatchSize(64)   // direct in-process JNI — low latency
+EmbeddingEngine().use { embedder ->
+    embedder.load("/path/to/embedding.gguf")
+    val v = embedder.embed("hello world")
+}
+```
+
+Independent of `GGMLEngine` — both can run concurrently.
+
+## AIDL service tuning
+
+When running inside an AIDL service, each token callback crosses Binder
+(~20-50 us per call). Increase the token batch threshold:
+
+```kotlin
+engine.setTokenBatchSize(64)   // direct in-process JNI
 engine.setTokenBatchSize(256)  // default
 engine.setTokenBatchSize(512)  // AIDL service — amortize Binder overhead
 ```
 
-Tokens accumulate in native memory until the threshold is reached, then one Binder
-transaction delivers the batch. The delivery buffer is pre-allocated and reused
-(zero-copy `SetByteArrayRegion`).
+Tokens accumulate in native memory until the threshold is reached, then a
+single Binder transaction delivers the batch via a pre-allocated, reused
+`byte[]` (zero-copy `SetByteArrayRegion`).
 
----
-
-## Device Sizing
+## Device sizing
 
 ```kotlin
-val tier   = GGMLEngine.detectDeviceTier(context)   // LOW_END / MID_RANGE / HIGH_END
+val tier   = GGMLEngine.detectDeviceTier(context)        // LOW_END / MID_RANGE / HIGH_END
 val params = GGMLEngine.getRecommendedParams(context)
-engine.load(path, params.contextSize, params.threadMode, cacheTypeK = params.cacheTypeK)
+engine.load(path, params.contextSize, cacheTypeK = params.cacheTypeK, cacheTypeV = params.cacheTypeV)
 ```
 
-| Tier | RAM | threadMode | contextSize | KV Cache |
-|------|-----|------------|-------------|----------|
-| LOW_END | < 4 GB | 0 | 2048 | q4_0 |
-| MID_RANGE | 4–8 GB | 1 | 4096 | q8_0 |
-| HIGH_END | > 8 GB | 2 | 8192 | q8_0 |
+| Tier      | RAM   | contextSize | KV cache |
+|-----------|-------|-------------|----------|
+| LOW_END   | <4 GB | 2048        | q4_0     |
+| MID_RANGE | 4-8 GB| 4096        | q8_0     |
+| HIGH_END  | >8 GB | 8192        | q8_0     |
 
----
+## Build integration
 
-## JNI Optimizations
-
-| Optimization | Description |
-|---|---|
-| Method ID caching | Callback method IDs resolved once per class, stored globally |
-| Pre-allocated ByteArray | Token bytes written via `SetByteArrayRegion` — no alloc per flush |
-| Token batcher | Text accumulated in C++ to threshold, then one JNI/Binder call |
-| Prompt batch reuse | Prompt decode batch allocated once at load, reused per generate |
-| Single-token batch | Generation loop batch allocated once, reused per token step |
-| Sampler reuse | Sampler rebuilt only on structural param changes |
-| Refusal token cache | Vocab scan runs once on first `setUncensored`, IDs reused forever |
-| KV eviction | Native `llama_memory_seq_rm` + `seq_add` — no KV re-copy, just pointer removal |
-| VLM per-chunk timed loop | Walks `mtmd_input_chunks` manually and times `mtmd_encode_chunk` vs `llama_decode` separately, so `GenerationEvent.VlmStageMetrics` can report an honest breakdown |
-| VLM streamed progress | `onProgress` fires after each image/text chunk during prompt-eval instead of a single blocking `mtmd_helper_eval_chunks` call |
-
-## What changed on 2026-04-24 (VLM perf pass)
-
-Measured on LFM2-VL-450M Q4_0 + mmproj Q8_0, 8-core ARM, BALANCED mode, one 236 KB screenshot:
-
-| Config                                     | ViT encode | LLM decode | Total prompt | vs baseline |
-|--------------------------------------------|-----------:|-----------:|-------------:|------------:|
-| Baseline                                   |      47 s  |      58 s  |      105 s   |       1.0×  |
-| Optimized                                  |    ~19 s   |    ~32 s   |      ~51 s   |       2.1×  |
-
-Changes in `llama.cpp/engine/`:
-- `lfm2_vl_image_processor::max_tiles` 10 → 4 in `vlm/clip.cpp` — **the dominant win** for LFM2-VL.
-- `normalize_image_u8_to_f32` unrolled by 3 (removes `i % 3`, fuses div/mul, no SIMD intrinsics yet).
-- BALANCED `n_batch` 256 → 512, PERFORMANCE 512 → 1024.
-- `ggml_engine_perf` gained `vlm_tokenize_ms / vlm_encode_ms / vlm_decode_ms / vlm_image_tokens`.
-- `mtmd-helper.cpp` logs now go through `TN_LOG_*` → Android logcat (previously stderr, invisible).
-- New `engine/vlm-bench.cpp` CLI for reproducible on-device measurement.
-- Build fix: `ggml_engine_kv_evict_internal` shim so the inline `ggml_engine_generate_loop` links from all TUs.
-
-Changes in this module (`gguf_lib`):
-- `nativeVlmLoadProjector` / `nativeVlmLoadProjectorFromFd` gained `imageMinTokens, imageMaxTokens`.
-- `GGMLEngine.loadVlmProjector*` exposes the new params (default `-1` = model default).
-- New `StreamCallback.onVlmStageMetrics(vlmEncodeMs, vlmDecodeMs, imageTokens)` — no-op default, binary-compatible.
-- New `GenerationEvent.VlmStageMetrics` routed through `generateVlmFlow`.
-- VLM JNI path rewritten as a timed per-chunk loop; per-chunk progress updates; logcat line with full breakdown.
-
----
-
-## Build Integration
-
-```cmake
-set(LLAMA_DIR "/path/to/llama.cpp")
-add_subdirectory(${LLAMA_DIR} ${CMAKE_CURRENT_BINARY_DIR}/llama)
-
-add_library(gguf_lib SHARED
-    gguf_lib.cpp
-    ${LLAMA_DIR}/engine/tool-manager.cpp
-    ${LLAMA_DIR}/engine/thread-engine.cpp
-    ${LLAMA_DIR}/engine/rag-engine.cpp
-)
-
-target_link_libraries(gguf_lib llama common android log)
-```
-
-Key CMake variables:
-
-| Variable | Value | Purpose |
-|---|---|---|
-| `GGML_CPU_ARM_ARCH` | `armv8-a` | Baseline ARM — KleidiAI dispatches to i8mm/dotprod at runtime |
-| `GGML_CPU_KLEIDIAI` | ON | ARM KleidiAI micro-kernels for Q4/Q8 GEMM |
-| `GGML_LTO` | ON | Link-time optimization |
-| `BUILD_SHARED_LIBS` | OFF | Static link all into single .so |
-
----
-
-## License
-
-MIT — see root LICENSE.
+1. Add this module as a Gradle subproject or copy the `gguf_lib` directory.
+2. Update `LLAMA_DIR` in `src/main/cpp/CMakeLists.txt` to point at your
+   llama.cpp checkout.
+3. The native library loads via `System.loadLibrary("gguf_lib")` automatically
+   on first access to `GGUFNativeLib` (called from `GGMLEngine`).
+4. All public APIs live in `com.dark.gguf_lib.*`.

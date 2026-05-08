@@ -9,6 +9,8 @@ android {
             minorApiLevel = 1
         }
     }
+    // Pinned NDK version. AGP picks the wrong default NDK on this machine,
+    // and CMake 3.22.1 has broken FetchContent (KleidiAI download fails).
     ndkVersion = "27.3.13750724"
 
     defaultConfig {
@@ -39,7 +41,7 @@ android {
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
-                "consumer-rules.pro"
+                "consumer-rules.pro",
             )
         }
         debug {

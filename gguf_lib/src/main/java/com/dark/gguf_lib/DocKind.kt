@@ -1,5 +1,9 @@
 package com.dark.gguf_lib
 
+/**
+ * Document type detected by the native ingester. Values must stay in sync
+ * with `rag_ingest_kind_t` in `rag_ingest.h`.
+ */
 enum class DocKind(val nativeValue: Int, val label: String) {
     Unknown(0, "Unknown"),
     Text(1, "Text"),
