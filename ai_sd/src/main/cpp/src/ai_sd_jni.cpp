@@ -18,6 +18,7 @@
 #include "style/style_transfer.h"
 #include "pipeline/pipeline_globals.h"
 #include "model/qnn_model.h"  // full type needed for unique_ptr<QnnModel>::reset()
+#include "loader/model_loader.h"  // ensureQnnSystemReady + loadStandaloneQnnUpscaler
 #include "utils/cpu_affinity.h"
 #include "utils/jni_utils.h"
 #include "utils/sd_logger.h"
@@ -41,6 +42,10 @@ static DiffusionState g_sd_state;
 // This prevents release-during-generate race (Bug 5 fix).
 static std::shared_mutex g_sd_mtx;
 static std::atomic<bool> g_sd_stop{false};
+
+// QNN runtime lib dir captured by nativeInitRuntime — used by the standalone
+// QNN upscaler load to compute libQnnHtp.so / libQnnSystem.so paths.
+static std::string g_qnn_lib_dir;
 
 // Helper: convert jstring to std::string
 static std::string jstring_to_string(JNIEnv* env, jstring jstr) {
@@ -93,6 +98,19 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeInitRuntime(
     setenv("ADSP_LIBRARY_PATH", adsp_path.c_str(), 1);
 
     SD_LOG_INFO("ADSP_LIBRARY_PATH set to: %s", adsp_path.c_str());
+
+    // Cache the lib dir so standalone helpers (e.g. QNN upscaler load)
+    // can resolve libQnnHtp.so / libQnnSystem.so paths without a separate
+    // diffusion-model load. Best-effort populate the QNN system funcs now;
+    // failures here don't block runtime init since callers may still use
+    // CPU/MNN paths.
+    g_qnn_lib_dir = libDir;
+    std::string qnnSystemLibPath = libDir + "/libQnnSystem.so";
+    std::string qnnBackendPath = libDir + "/libQnnHtp.so";
+    if (!sd_pipeline::ensureQnnSystemReady(qnnSystemLibPath, qnnBackendPath)) {
+        SD_LOG_WARN("ensureQnnSystemReady failed — QNN-only paths will fail "
+                    "until a diffusion model load succeeds");
+    }
     return JNI_TRUE;
 }
 
@@ -409,11 +427,23 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeLoadUpscaler(
     }
 
     if (!useMnn) {
-        // QNN path: upscalerApp is a global managed by model_loader
-        // It should be loaded during nativeLoadModel if upscaler_path was provided
-        // For standalone upscaler loading, we'd need to create QnnModel here
-        // For now, check if it's already loaded via the pipeline
-        SD_LOG_INFO("[UPSCALER] QNN upscaler path set: %s", g_upscaler_model_path.c_str());
+        // Standalone QNN upscaler load: createQnnModel + initializeQnnApp,
+        // mirroring LocalDream's per-request /upscale handler.
+        // ensureQnnSystemReady was best-effort'd inside nativeInitRuntime;
+        // re-attempt here if it didn't take (e.g. caller skipped init).
+        if (!g_qnn_lib_dir.empty()) {
+            std::string sys = g_qnn_lib_dir + "/libQnnSystem.so";
+            std::string bk = g_qnn_lib_dir + "/libQnnHtp.so";
+            (void)sd_pipeline::ensureQnnSystemReady(sys, bk);
+        }
+        if (!sd_pipeline::loadStandaloneQnnUpscaler(g_upscaler_model_path)) {
+            SD_LOG_ERROR("[UPSCALER] Standalone QNN load failed for %s",
+                         g_upscaler_model_path.c_str());
+            g_upscaler_loaded = false;
+            return JNI_FALSE;
+        }
+        SD_LOG_INFO("[UPSCALER] QNN upscaler loaded: %s",
+                    g_upscaler_model_path.c_str());
     } else {
         // MNN path: model is loaded on-demand in upscaleImageWithMNN()
         SD_LOG_INFO("[UPSCALER] MNN upscaler path set: %s (opencl=%d)",

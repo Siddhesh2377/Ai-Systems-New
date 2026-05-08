@@ -653,4 +653,75 @@ void cleanup() {
     QNN_INFO("Pipeline resources cleaned up");
 }
 
+// ============================================================================
+// Standalone QNN upscaler load — mirrors LocalDream's per-request /upscale
+// handler so the upscaler can be loaded without first loading a diffusion
+// model.
+// ============================================================================
+
+bool ensureQnnSystemReady(const std::string& qnnSystemLibPath,
+                           const std::string& qnnBackendPath) {
+    using namespace qnn::tools;
+    if (qnnSystemLibPath.empty() || qnnBackendPath.empty()) {
+        QNN_ERROR("ensureQnnSystemReady: empty paths (system='%s' backend='%s')",
+                  qnnSystemLibPath.c_str(), qnnBackendPath.c_str());
+        return false;
+    }
+    if (!g_backendPathCmd.empty()) {
+        // Already initialized by initialize_models() or a prior call.
+        return true;
+    }
+    g_backendPathCmd = qnnBackendPath;
+    dynamicloadutil::StatusCode sysStatus =
+        dynamicloadutil::getQnnSystemFunctionPointers(qnnSystemLibPath,
+                                                       &g_qnnSystemFuncs);
+    if (sysStatus != dynamicloadutil::StatusCode::SUCCESS) {
+        QNN_ERROR("ensureQnnSystemReady: getQnnSystemFunctionPointers failed");
+        g_backendPathCmd.clear();
+        return false;
+    }
+    QNN_INFO("ensureQnnSystemReady: QNN system funcs loaded from %s",
+             qnnSystemLibPath.c_str());
+    return true;
+}
+
+bool loadStandaloneQnnUpscaler(const std::string& modelPath) {
+    if (g_backendPathCmd.empty()) {
+        QNN_ERROR("loadStandaloneQnnUpscaler: QNN system not initialized; "
+                  "call ensureQnnSystemReady() first");
+        return false;
+    }
+    if (modelPath.empty()) {
+        QNN_ERROR("loadStandaloneQnnUpscaler: empty modelPath");
+        return false;
+    }
+
+    upscalerApp = createQnnModel(modelPath, "upscaler");
+    if (!upscalerApp) {
+        QNN_ERROR("loadStandaloneQnnUpscaler: createQnnModel failed for %s",
+                  modelPath.c_str());
+        return false;
+    }
+
+    int status = initializeQnnApp("Upscaler", upscalerApp,
+                                  /*buffer=*/nullptr, /*bufferSize=*/0);
+    if (status != EXIT_SUCCESS) {
+        QNN_ERROR("loadStandaloneQnnUpscaler: initializeQnnApp failed "
+                  "(status=%d)", status);
+        upscalerApp.reset();
+        return false;
+    }
+
+    QNN_INFO("loadStandaloneQnnUpscaler: upscaler ready at %s",
+             modelPath.c_str());
+    return true;
+}
+
+void releaseStandaloneQnnUpscaler() {
+    if (upscalerApp) {
+        upscalerApp.reset();
+        QNN_INFO("releaseStandaloneQnnUpscaler: released");
+    }
+}
+
 }  // namespace sd_pipeline
