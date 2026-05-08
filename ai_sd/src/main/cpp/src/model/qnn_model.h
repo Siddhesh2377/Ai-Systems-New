@@ -170,6 +170,70 @@ class QnnModel : public QnnSampleApp {
     return StatusCode::SUCCESS;
   }
 
+  // Element count derived from a tensor's actual dims rather than the
+  // C++ global config. Loading a model whose UNet was exported at a
+  // different resolution than `sample_width`/`sample_height` previously
+  // walked off the end of the QNN client buffer with no diagnostic.
+  static uint32_t tensorElementCount(const Qnn_Tensor_t &t) {
+    uint32_t rank = QNN_TENSOR_GET_RANK(t);
+    uint32_t *dims = QNN_TENSOR_GET_DIMENSIONS(t);
+    if (!dims || rank == 0) return 0;
+    uint32_t count = 1;
+    for (uint32_t i = 0; i < rank; ++i) count *= dims[i];
+    return count;
+  }
+
+  static size_t tensorElementBytes(Qnn_DataType_t dtype) {
+    switch (dtype) {
+      case QNN_DATATYPE_INT_8:
+      case QNN_DATATYPE_UINT_8:
+      case QNN_DATATYPE_UFIXED_POINT_8:
+      case QNN_DATATYPE_SFIXED_POINT_8:
+      case QNN_DATATYPE_BOOL_8:
+        return 1;
+      case QNN_DATATYPE_INT_16:
+      case QNN_DATATYPE_UINT_16:
+      case QNN_DATATYPE_FLOAT_16:
+      case QNN_DATATYPE_UFIXED_POINT_16:
+      case QNN_DATATYPE_SFIXED_POINT_16:
+        return 2;
+      case QNN_DATATYPE_INT_32:
+      case QNN_DATATYPE_UINT_32:
+      case QNN_DATATYPE_FLOAT_32:
+      case QNN_DATATYPE_UFIXED_POINT_32:
+      case QNN_DATATYPE_SFIXED_POINT_32:
+        return 4;
+      case QNN_DATATYPE_INT_64:
+      case QNN_DATATYPE_UINT_64:
+      case QNN_DATATYPE_FLOAT_64:
+        return 8;
+      default:
+        return 0;
+    }
+  }
+
+  // Bounds-checked memcpy into a QNN input client buffer. Returns false
+  // if the source byte length exceeds the buffer's declared dataSize —
+  // i.e. the model expected a different shape/dtype than the caller is
+  // supplying. Logs the mismatch for diagnostic purposes.
+  static bool writeInputBytes(Qnn_Tensor_t &t, const void *src,
+                              size_t srcBytes, const char *what) {
+    auto buf = QNN_TENSOR_GET_CLIENT_BUF(t);
+    if (!buf.data || buf.dataSize == 0) {
+      QNN_ERROR("writeInputBytes(%s): tensor client buffer not allocated",
+                what);
+      return false;
+    }
+    if (srcBytes > buf.dataSize) {
+      QNN_ERROR("writeInputBytes(%s): src=%zu B > tensor dataSize=%u B "
+                "— shape/dtype mismatch?",
+                what, srcBytes, buf.dataSize);
+      return false;
+    }
+    memcpy(buf.data, src, srcBytes);
+    return true;
+  }
+
   void releasePerformanceMode() {
     if (!m_powerConfigIdValid) return;
     auto qnnInterface = m_qnnFunctionPointers.qnnInterface;
@@ -214,11 +278,47 @@ class QnnModel : public QnnSampleApp {
       return returnStatus;
     }
 
-    // input_ids
+    // input_ids — branch on the actual tensor dtype rather than blindly
+    // memcpy'ing INT_32. Different CLIP exports use INT_32 (most), INT_64
+    // (LLaMA-style tokenizers), UINT_32, or even FLOAT_32 (clip_v2 path
+    // takes pre-computed embeddings). Hardcoding 77*sizeof(int32_t) was
+    // half-populating the buffer for INT_64 and overshooting for narrower
+    // types, both silent.
     {
-      uint32_t elementCount = 1 * 77;
-      memcpy(QNN_TENSOR_GET_CLIENT_BUF(inputs[0]).data, input_ids,
-             elementCount * sizeof(int32_t));
+      Qnn_Tensor_t &in0 = inputs[0];
+      uint32_t elementCount = tensorElementCount(in0);
+      Qnn_DataType_t dtype = QNN_TENSOR_GET_DATA_TYPE(in0);
+      size_t elemBytes = tensorElementBytes(dtype);
+      if (dtype == QNN_DATATYPE_INT_32 || dtype == QNN_DATATYPE_UINT_32) {
+        if (!writeInputBytes(in0, input_ids,
+                             size_t(elementCount) * sizeof(int32_t),
+                             "clip.input_ids[i32]")) {
+          return StatusCode::FAILURE;
+        }
+      } else if (dtype == QNN_DATATYPE_INT_64 ||
+                 dtype == QNN_DATATYPE_UINT_64) {
+        std::vector<int64_t> ids64(elementCount);
+        for (uint32_t i = 0; i < elementCount; ++i)
+          ids64[i] = static_cast<int64_t>(input_ids[i]);
+        if (!writeInputBytes(in0, ids64.data(),
+                             ids64.size() * sizeof(int64_t),
+                             "clip.input_ids[i64]")) {
+          return StatusCode::FAILURE;
+        }
+      } else if (dtype == QNN_DATATYPE_FLOAT_32) {
+        std::vector<float> idsf(elementCount);
+        for (uint32_t i = 0; i < elementCount; ++i)
+          idsf[i] = static_cast<float>(input_ids[i]);
+        if (!writeInputBytes(in0, idsf.data(),
+                             idsf.size() * sizeof(float),
+                             "clip.input_ids[f32]")) {
+          return StatusCode::FAILURE;
+        }
+      } else {
+        QNN_ERROR("clip.input_ids: unsupported tensor dtype=%d (elemBytes=%zu)",
+                  (int)dtype, elemBytes);
+        return StatusCode::FAILURE;
+      }
     }
 
     // execute graph
@@ -279,15 +379,23 @@ class QnnModel : public QnnSampleApp {
       return returnStatus;
     }
 
-    // latents
+    // latents — derive elementCount from the tensor's actual dims rather
+    // than the C++ globals (sample_width/sample_height), so loading a
+    // model whose UNet was exported at a different resolution doesn't
+    // walk off the end of the QNN client buffer.
     {
-      uint16_t *latents_uint16 =
-          static_cast<uint16_t *>(QNN_TENSOR_GET_CLIENT_BUF(inputs[0]).data);
-      int elementCount = 1 * 4 * sample_width * sample_height;
+      Qnn_Tensor_t &in0 = inputs[0];
+      uint32_t elementCount = tensorElementCount(in0);
+      auto buf = QNN_TENSOR_GET_CLIENT_BUF(in0);
+      if (buf.dataSize < elementCount * sizeof(uint16_t)) {
+        QNN_ERROR("unet.latents: tensor dataSize=%u < %u B (shape mismatch?)",
+                  buf.dataSize, elementCount * 2);
+        return StatusCode::FAILURE;
+      }
+      uint16_t *latents_uint16 = static_cast<uint16_t *>(buf.data);
+      auto qp = in0.v1.quantizeParams.scaleOffsetEncoding;
       qnn::tools::datautil::floatToTfN(
-          latents_uint16, latents,
-          inputs[0].v1.quantizeParams.scaleOffsetEncoding.offset,
-          inputs[0].v1.quantizeParams.scaleOffsetEncoding.scale, elementCount);
+          latents_uint16, latents, qp.offset, qp.scale, elementCount);
     }
 
     // position/timestep
@@ -297,19 +405,24 @@ class QnnModel : public QnnSampleApp {
       positionData[0] = timestep;
     }
 
-    // text_embedding — Perf 3: cache quantized embeddings per source pointer
-    // (embeddings are constant across all denoising steps)
+    // text_embedding — Perf 3: cache quantized embeddings per source
+    // pointer (embeddings are constant across all denoising steps).
     {
-      uint16_t *text_embedding_uint16 =
-          static_cast<uint16_t *>(QNN_TENSOR_GET_CLIENT_BUF(inputs[2]).data);
-      int elementCount = 1 * 77 * text_embedding_size;
+      Qnn_Tensor_t &in2 = inputs[2];
+      uint32_t elementCount = tensorElementCount(in2);
+      auto buf = QNN_TENSOR_GET_CLIENT_BUF(in2);
+      if (buf.dataSize < elementCount * sizeof(uint16_t)) {
+        QNN_ERROR("unet.text_embed: tensor dataSize=%u < %u B",
+                  buf.dataSize, elementCount * 2);
+        return StatusCode::FAILURE;
+      }
+      uint16_t *text_embedding_uint16 = static_cast<uint16_t *>(buf.data);
       auto& cache = m_embedCache[text_embedding];
       if (cache.empty()) {
         cache.resize(elementCount);
+        auto qp = in2.v1.quantizeParams.scaleOffsetEncoding;
         qnn::tools::datautil::floatToTfN(
-            cache.data(), text_embedding,
-            inputs[2].v1.quantizeParams.scaleOffsetEncoding.offset,
-            inputs[2].v1.quantizeParams.scaleOffsetEncoding.scale, elementCount);
+            cache.data(), text_embedding, qp.offset, qp.scale, elementCount);
       }
       memcpy(text_embedding_uint16, cache.data(),
              elementCount * sizeof(uint16_t));
@@ -336,7 +449,7 @@ class QnnModel : public QnnSampleApp {
 
     // get output — Perf 4: write directly into caller buffer
     if (StatusCode::SUCCESS == returnStatus) {
-      int elementCount = 1 * 4 * sample_width * sample_height;
+      uint32_t elementCount = tensorElementCount(outputs[0]);
       if (qnn::tools::iotensor::StatusCode::SUCCESS !=
           m_ioTensor.convertToFloat(latents_pred, elementCount, &outputs[0])) {
         returnStatus = StatusCode::FAILURE;
@@ -373,15 +486,20 @@ class QnnModel : public QnnSampleApp {
       return returnStatus;
     }
 
-    // pixel_values
+    // pixel_values — element count from tensor dims, not globals.
     {
-      uint16_t *pixel_values_uint16 =
-          static_cast<uint16_t *>(QNN_TENSOR_GET_CLIENT_BUF(inputs[0]).data);
-      int elementCount = 1 * 3 * output_width * output_height;
+      Qnn_Tensor_t &in0 = inputs[0];
+      uint32_t elementCount = tensorElementCount(in0);
+      auto buf = QNN_TENSOR_GET_CLIENT_BUF(in0);
+      if (buf.dataSize < elementCount * sizeof(uint16_t)) {
+        QNN_ERROR("vae_enc.input: tensor dataSize=%u < %u B",
+                  buf.dataSize, elementCount * 2);
+        return StatusCode::FAILURE;
+      }
+      uint16_t *pixel_values_uint16 = static_cast<uint16_t *>(buf.data);
+      auto qp = in0.v1.quantizeParams.scaleOffsetEncoding;
       qnn::tools::datautil::floatToTfN(
-          pixel_values_uint16, pixel_values,
-          inputs[0].v1.quantizeParams.scaleOffsetEncoding.offset,
-          inputs[0].v1.quantizeParams.scaleOffsetEncoding.scale, elementCount);
+          pixel_values_uint16, pixel_values, qp.offset, qp.scale, elementCount);
     }
 
     // execute graph
@@ -405,14 +523,15 @@ class QnnModel : public QnnSampleApp {
 
     // get output — Perf 4: write directly into caller buffers
     if (StatusCode::SUCCESS == returnStatus) {
-      int elementCount = 1 * 4 * sample_width * sample_height;
+      uint32_t meanCount = tensorElementCount(outputs[0]);
+      uint32_t stdCount = tensorElementCount(outputs[1]);
       if (qnn::tools::iotensor::StatusCode::SUCCESS !=
-          m_ioTensor.convertToFloat(mean, elementCount, &outputs[0])) {
+          m_ioTensor.convertToFloat(mean, meanCount, &outputs[0])) {
         returnStatus = StatusCode::FAILURE;
         return returnStatus;
       }
       if (qnn::tools::iotensor::StatusCode::SUCCESS !=
-          m_ioTensor.convertToFloat(std, elementCount, &outputs[1])) {
+          m_ioTensor.convertToFloat(std, stdCount, &outputs[1])) {
         returnStatus = StatusCode::FAILURE;
         return returnStatus;
       }
@@ -446,15 +565,20 @@ class QnnModel : public QnnSampleApp {
       return returnStatus;
     }
 
-    // latents
+    // latents — element count from tensor dims, not globals.
     {
-      uint16_t *latents_uint16 =
-          static_cast<uint16_t *>(QNN_TENSOR_GET_CLIENT_BUF(inputs[0]).data);
-      int elementCount = 1 * 4 * sample_width * sample_height;
+      Qnn_Tensor_t &in0 = inputs[0];
+      uint32_t elementCount = tensorElementCount(in0);
+      auto buf = QNN_TENSOR_GET_CLIENT_BUF(in0);
+      if (buf.dataSize < elementCount * sizeof(uint16_t)) {
+        QNN_ERROR("vae_dec.input: tensor dataSize=%u < %u B",
+                  buf.dataSize, elementCount * 2);
+        return StatusCode::FAILURE;
+      }
+      uint16_t *latents_uint16 = static_cast<uint16_t *>(buf.data);
+      auto qp = in0.v1.quantizeParams.scaleOffsetEncoding;
       qnn::tools::datautil::floatToTfN(
-          latents_uint16, latents,
-          inputs[0].v1.quantizeParams.scaleOffsetEncoding.offset,
-          inputs[0].v1.quantizeParams.scaleOffsetEncoding.scale, elementCount);
+          latents_uint16, latents, qp.offset, qp.scale, elementCount);
     }
 
     // execute graph
@@ -478,7 +602,7 @@ class QnnModel : public QnnSampleApp {
 
     // get output — Perf 4: write directly into caller buffer
     if (StatusCode::SUCCESS == returnStatus) {
-      size_t elementCount = 1 * 3 * output_width * output_height;
+      uint32_t elementCount = tensorElementCount(outputs[0]);
       if (qnn::tools::iotensor::StatusCode::SUCCESS !=
           m_ioTensor.convertToFloat(pixel_values, elementCount, &outputs[0])) {
         returnStatus = StatusCode::FAILURE;
@@ -514,18 +638,50 @@ class QnnModel : public QnnSampleApp {
       return returnStatus;
     }
 
-    // input_image (quantized to uint8, 1x3x192x192)
+    // Input. Branch on the actual tensor dtype: a HTP-quantized upscaler
+    // expects UFIXED_POINT_8 / _16, an FP32-export expects FLOAT_32. The
+    // prior code assumed FLOAT_32 unconditionally (the dequant block was
+    // commented out) — so a uint8-quantized upscaler was being fed raw
+    // float bit patterns reinterpreted as bytes, producing pure garbage.
     {
-      // uint8_t *input_uint8 =
-      //     static_cast<uint8_t *>(QNN_TENSOR_GET_CLIENT_BUF(inputs[0]).data);
-      // int elementCount = 1 * 3 * 192 * 192;
-      // qnn::tools::datautil::floatToTfN(
-      //     input_uint8, input_image,
-      //     inputs[0].v1.quantizeParams.scaleOffsetEncoding.offset,
-      //     inputs[0].v1.quantizeParams.scaleOffsetEncoding.scale,
-      //     elementCount);
-      memcpy(static_cast<float *>(QNN_TENSOR_GET_CLIENT_BUF(inputs[0]).data),
-             input_image, 1 * 3 * 192 * 192 * sizeof(float));
+      Qnn_Tensor_t &in0 = inputs[0];
+      uint32_t elementCount = tensorElementCount(in0);
+      Qnn_DataType_t dtype = QNN_TENSOR_GET_DATA_TYPE(in0);
+      auto buf = QNN_TENSOR_GET_CLIENT_BUF(in0);
+      if (!buf.data || elementCount == 0) {
+        QNN_ERROR("upscaler.input: bad tensor (data=%p elem=%u)",
+                  buf.data, elementCount);
+        return StatusCode::FAILURE;
+      }
+      auto qp = in0.v1.quantizeParams.scaleOffsetEncoding;
+      if (dtype == QNN_DATATYPE_UFIXED_POINT_8) {
+        if (buf.dataSize < elementCount * sizeof(uint8_t)) {
+          QNN_ERROR("upscaler.input[u8]: tensor dataSize=%u < %u B",
+                    buf.dataSize, elementCount);
+          return StatusCode::FAILURE;
+        }
+        qnn::tools::datautil::floatToTfN(
+            static_cast<uint8_t *>(buf.data), input_image,
+            qp.offset, qp.scale, elementCount);
+      } else if (dtype == QNN_DATATYPE_UFIXED_POINT_16) {
+        if (buf.dataSize < elementCount * sizeof(uint16_t)) {
+          QNN_ERROR("upscaler.input[u16]: tensor dataSize=%u < %u B",
+                    buf.dataSize, elementCount * 2);
+          return StatusCode::FAILURE;
+        }
+        qnn::tools::datautil::floatToTfN(
+            static_cast<uint16_t *>(buf.data), input_image,
+            qp.offset, qp.scale, elementCount);
+      } else if (dtype == QNN_DATATYPE_FLOAT_32) {
+        if (!writeInputBytes(in0, input_image,
+                             size_t(elementCount) * sizeof(float),
+                             "upscaler.input[f32]")) {
+          return StatusCode::FAILURE;
+        }
+      } else {
+        QNN_ERROR("upscaler.input: unsupported dtype=%d", (int)dtype);
+        return StatusCode::FAILURE;
+      }
     }
 
     // execute graph
@@ -547,21 +703,26 @@ class QnnModel : public QnnSampleApp {
       QNN_ERROR("upscaler graph execution failed!");
     }
 
-    // get output
-    // if (StatusCode::SUCCESS == returnStatus) {
-    //   float *tmp = nullptr;
-    //   int elementCount = 1 * 3 * 768 * 768;
-    //   if (qnn::tools::iotensor::StatusCode::SUCCESS !=
-    //       m_ioTensor.convertToFloat(&tmp, &outputs[0])) {
-    //     returnStatus = StatusCode::FAILURE;
-    //     return returnStatus;
-    //   }
-    //   memcpy(output_image, tmp, elementCount * sizeof(float));
-    //   free(tmp);
-    // }
-    memcpy(output_image,
-           static_cast<float *>(QNN_TENSOR_GET_CLIENT_BUF(outputs[0]).data),
-           1 * 3 * 768 * 768 * sizeof(float));
+    // Output. Same dtype-branching as input. convertToFloat handles the
+    // dequantization for fixed-point types into our caller-owned float
+    // buffer (no malloc, no free — reuses the Perf 4 caller-buffer
+    // overload).
+    if (StatusCode::SUCCESS == returnStatus) {
+      Qnn_Tensor_t &out0 = outputs[0];
+      uint32_t outElementCount = tensorElementCount(out0);
+      Qnn_DataType_t outDtype = QNN_TENSOR_GET_DATA_TYPE(out0);
+      if (outDtype == QNN_DATATYPE_FLOAT_32) {
+        auto outBuf = QNN_TENSOR_GET_CLIENT_BUF(out0);
+        memcpy(output_image, outBuf.data,
+               size_t(outElementCount) * sizeof(float));
+      } else {
+        if (qnn::tools::iotensor::StatusCode::SUCCESS !=
+            m_ioTensor.convertToFloat(output_image, outElementCount,
+                                       &outputs[0])) {
+          returnStatus = StatusCode::FAILURE;
+        }
+      }
+    }
     return returnStatus;
   }
 
