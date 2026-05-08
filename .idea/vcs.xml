@@ -3,7 +3,8 @@
   <component name="VcsDirectoryMappings">
     <mapping directory="$PROJECT_DIR$" vcs="Git" />
     <mapping directory="$USER_HOME$/CLionProjects/rm-graph" vcs="Git" />
+    <mapping directory="$USER_HOME$/dev/include/edge-ai-studio" vcs="Git" />
+    <mapping directory="$USER_HOME$/dev/include/edge-ai-studio/ggml" vcs="Git" />
     <mapping directory="$USER_HOME$/dev/include/llama.cpp" vcs="Git" />
-    <mapping directory="$USER_HOME$/dev/include/sherpa-onnx" vcs="Git" />
   </component>
 </project>
