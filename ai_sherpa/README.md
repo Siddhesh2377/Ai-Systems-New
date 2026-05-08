@@ -1,73 +1,46 @@
 # ai_sherpa
 
-Android JNI module wrapping [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) for on-device
-speech recognition (STT), text-to-speech (TTS), and voice activity detection (VAD).
+Android library wrapping [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)
+for on-device, offline speech-to-text and text-to-speech.
 
-Package: `com.dark.ai_sherpa`  
-Min SDK: 29  
-ABI: `arm64-v8a`, `armeabi-v7a`
+- Package: `com.dark.ai_sherpa`
+- Min SDK: 29
+- ABIs: `arm64-v8a`, `armeabi-v7a`
 
-## Features
+## Scope
 
-- **Online ASR** — streaming speech recognition (Transducer, Paraformer, Zipformer2 CTC, NeMo CTC)
-- **Offline ASR** — non-streaming recognition (Transducer, Paraformer, Whisper, SenseVoice, Moonshine, and more)
-- **TTS** — offline text-to-speech (VITS, Kokoro)
-- **VAD** — voice activity detection (Silero VAD, Ten VAD)
-- **Wave I/O** — read/write `.wav` files
+Only the offline (non-streaming) recognizer and offline TTS are exposed. Online
+streaming ASR and Voice Activity Detection were removed in the Apr 2026 cleanup
+because no consumer used them; reintroduce by reverting through git history if
+needed.
+
+| Surface              | Supported model families                                 |
+| -------------------- | -------------------------------------------------------- |
+| `OfflineRecognizer`  | Whisper, Paraformer, Transducer, NeMo CTC, TDNN          |
+| `OfflineTts`         | VITS, Kokoro                                              |
+| `SherpaLib`          | Process-wide native crash + last-error JSON              |
 
 ## Usage
-
-### Streaming ASR
-
-```kotlin
-val config = OnlineRecognizerConfig(
-    modelConfig = OnlineModelConfig(
-        transducer = OnlineTransducerModelConfig(
-            encoder = "/path/to/encoder.onnx",
-            decoder = "/path/to/decoder.onnx",
-            joiner  = "/path/to/joiner.onnx"
-        ),
-        tokens = "/path/to/tokens.txt",
-        provider = "cpu",
-        numThreads = 2
-    ),
-    decodingMethod = "greedy_search",
-    enableEndpoint = true
-)
-
-OnlineRecognizer.fromFile(config).use { recognizer ->
-    recognizer.createStream().use { stream ->
-        stream.acceptWaveform(sampleRate = 16000, samples = floatArray)
-        stream.inputFinished()
-        while (recognizer.isReady(stream)) {
-            recognizer.decode(stream)
-        }
-        val result = recognizer.getResult(stream)
-        println(result.text)
-    }
-}
-```
 
 ### Offline ASR (Whisper)
 
 ```kotlin
-val config = OfflineRecognizerConfig(
+val cfg = OfflineRecognizerConfig(
     modelConfig = OfflineModelConfig(
         whisper = OfflineWhisperModelConfig(
             encoder = "/path/to/encoder.onnx",
             decoder = "/path/to/decoder.onnx",
             language = "en",
-            task = "transcribe"
+            task = "transcribe",
         ),
         tokens = "/path/to/tokens.txt",
-        provider = "cpu",
-        numThreads = 2
-    )
+        // numThreads defaults to min(cpus, 4); override only if needed.
+    ),
 )
 
-OfflineRecognizer.fromFile(config).use { recognizer ->
+OfflineRecognizer.fromFile(cfg).use { recognizer ->
     recognizer.createStream().use { stream ->
-        stream.acceptWaveform(sampleRate = 16000, samples = floatArray)
+        stream.acceptWaveform(sampleRate = 16_000, samples = floatArray)
         recognizer.decode(stream)
         val result = recognizer.getResult(stream)
         println(result.text)
@@ -75,77 +48,87 @@ OfflineRecognizer.fromFile(config).use { recognizer ->
 }
 ```
 
-### TTS
+`createStream()` allocates a single-utterance decoder. Reuse the recognizer
+across utterances; create a fresh stream per utterance.
+
+### TTS (VITS)
 
 ```kotlin
-val config = OfflineTtsConfig(
+val cfg = OfflineTtsConfig(
     model = OfflineTtsModelConfig(
         vits = OfflineTtsVitsModelConfig(
             model  = "/path/to/model.onnx",
-            tokens = "/path/to/tokens.txt"
+            tokens = "/path/to/tokens.txt",
         ),
-        numThreads = 2,
-        provider = "cpu"
-    )
-)
-
-OfflineTts.fromFile(config).use { tts ->
-    val audio = tts.generate(text = "Hello world", sid = 0, speed = 1.0f)
-    // audio.samples: FloatArray, audio.sampleRate: Int
-}
-```
-
-### VAD
-
-```kotlin
-val config = VadModelConfig(
-    sileroVadModelConfig = SileroVadModelConfig(
-        model = "/path/to/silero_vad.onnx",
-        threshold = 0.5f,
-        minSilenceDuration = 0.5f,
-        minSpeechDuration = 0.25f,
-        windowSize = 512
     ),
-    sampleRate = 16000,
-    numThreads = 1,
-    provider = "cpu"
 )
 
-VoiceActivityDetector.fromFile(config, bufferSizeInSeconds = 30).use { vad ->
-    vad.acceptWaveform(samples = floatArray)
-    while (!vad.isEmpty()) {
-        val segment = vad.front()
-        vad.pop()
-        // segment.samples: FloatArray, segment.start: Int
-    }
+OfflineTts.fromFile(cfg).use { tts ->
+    val audio = tts.generate(text = "Hello world", sid = 0, speed = 1.0f)
+    // audio.samples: FloatArray, audio.sampleRate: Int (model-defined)
 }
 ```
 
-### Wave I/O
+### Crash + error tracker
 
 ```kotlin
-val wave = WaveReader.read("/path/to/file.wav")
-// wave.samples: FloatArray, wave.sampleRate: Int
+SherpaLib.nativeErrorInit() // installs SIGSEGV/SIGABRT/... handlers, idempotent
+SherpaLib.nativeErrorSetCrashLogPath(File(filesDir, "sherpa_crash.json").absolutePath)
 
-WaveWriter.write("/output/path.wav", samples = floatArray, sampleRate = 16000)
+// after a failure:
+val json = SherpaLib.nativeErrorGetLastJson() // "{}" if none
+SherpaLib.nativeErrorClear()
 ```
 
-## Architecture
+The crash handler writes a small JSON blob and re-raises with the default
+handler so Android's tombstone path still produces a `tombstone_NN` file.
 
-- **JNI layer** (`src/main/cpp/`) — C++ bridging sherpa-onnx C API to Java
-  - `jni_cache.cpp` — `JNI_OnLoad` caches all class refs and method IDs
-  - `jni_common.h` — shared helpers (field getters, CHECK_PTR macro)
-  - `online_recognizer.cpp`, `offline_recognizer.cpp`, `offline_tts.cpp`, `vad.cpp`, `wave_io.cpp`
-- **Kotlin layer** (`src/main/java/com/dark/ai_sherpa/`) — idiomatic `AutoCloseable` wrappers
+## Threading and lifecycle
 
-## Build requirements
+- `fromFile`, `decode`, `getResult`, `generate` are blocking. Call them from
+  a background dispatcher (`Dispatchers.IO`).
+- All native handles are `AutoCloseable`. Forgetting to close leaks the ONNX
+  session, which can be 50–500 MB.
+- After `close()`, calling any method throws — this is deliberate, to surface
+  use-after-close bugs early.
 
-- Android NDK 28+
+## Memory notes
+
+- `numThreads` defaults to `min(availableProcessors, 4)` and is clamped to
+  `>= 1` both in Kotlin and again in C++ defensively.
+- Audio buffers passed to `acceptWaveform` are read via
+  `GetPrimitiveArrayCritical` (zero-copy when the JVM allows). The buffer is
+  not retained — reuse or free it immediately after the call.
+- Generated TTS audio is copied into a fresh Java `FloatArray`; the native
+  buffer is destroyed before the call returns.
+
+## Build prerequisites
+
+- Android NDK 27.3.13750724
 - CMake 3.22.1
-- ONNX Runtime Android prebuilt at `/home/home/dev/include/ort-android-1.24.3/`
-- sherpa-onnx fork at `/home/home/dev/include/sherpa-onnx`
+- Pre-built ONNX Runtime Android at `/home/home/dev/include/ort-android-1.24.3/`
+- sherpa-onnx checkout at `/home/home/dev/include/sherpa-onnx`
 
-## Dependencies
+These paths are hard-coded in `src/main/cpp/CMakeLists.txt`. Adjust there if
+your environment differs.
 
-- `sherpa-onnx-c-api`, `sherpa-onnx-core` (static, built from source fork)
-- `libonnxruntime.so` (prebuilt per-ABI)
+## Layout
+
+```
+src/main/
+├── cpp/
+│   ├── CMakeLists.txt        sherpa-onnx subbuild + JNI shared lib
+│   ├── jni_cache.{h,cpp}     JNI_OnLoad: cached jclass / jmethodID refs
+│   ├── jni_common.h          field-getter helpers, CHECK_PTR macro
+│   ├── offline_recognizer.cpp
+│   ├── offline_tts.cpp
+│   ├── error_tracker.{h,cpp} signal handlers + last-error JSON store
+│   └── error_jni.cpp         JNI bindings for the error tracker
+└── java/com/dark/ai_sherpa/
+    ├── SherpaLib.kt              library loader + error API
+    ├── OfflineRecognizer.kt      recognizer + stream
+    ├── OfflineRecognizerConfig.kt
+    ├── OfflineTts.kt
+    ├── OfflineTtsConfig.kt
+    └── Models.kt                 result data classes
+```
