@@ -38,8 +38,25 @@ class QnnModel : public QnnSampleApp {
                      inputDataType, profilingLevel, dumpOutputs,
                      cachedBinaryPath, saveBinaryName) {}
 
+  ~QnnModel() override {
+    // Tear down per-graph I/O tensors before the base class frees the
+    // graph metadata that owns the tensor descriptors.
+    if (inputs && outputs && m_graphsInfo && m_graphsCount > 0) {
+      auto graphInfo = (*m_graphsInfo)[0];
+      m_ioTensor.tearDownInputAndOutputTensors(
+          inputs, outputs,
+          graphInfo.numInputTensors, graphInfo.numOutputTensors);
+      inputs = nullptr;
+      outputs = nullptr;
+    }
+    // Release the HTP power-config ID so its slot becomes available to
+    // the next QnnModel that loads. Without this, repeated model swaps
+    // exhaust the device's perf-config pool.
+    releasePerformanceMode();
+    m_embedCache.clear();
+  }
+
   StatusCode enablePerformaceMode() {
-    uint32_t powerConfigId;
     uint32_t deviceId = 0;
     uint32_t coreId = 0;
     auto qnnInterface = m_qnnFunctionPointers.qnnInterface;
@@ -55,11 +72,13 @@ class QnnModel : public QnnSampleApp {
         static_cast<QnnHtpDevice_Infrastructure_t *>(deviceInfra);
     QnnHtpDevice_PerfInfrastructure_t perfInfra = htpInfra->perfInfra;
     Qnn_ErrorHandle_t perfInfraErr =
-        perfInfra.createPowerConfigId(deviceId, coreId, &powerConfigId);
+        perfInfra.createPowerConfigId(deviceId, coreId, &m_powerConfigId);
     if (perfInfraErr != QNN_SUCCESS) {
       QNN_ERROR("createPowerConfigId failed");
       return StatusCode::FAILURE;
     }
+    m_powerConfigIdValid = true;
+
     QnnHtpPerfInfrastructure_PowerConfig_t rpcControlLatency;
     memset(&rpcControlLatency, 0, sizeof(rpcControlLatency));
     rpcControlLatency.option =
@@ -67,31 +86,24 @@ class QnnModel : public QnnSampleApp {
     rpcControlLatency.rpcControlLatencyConfig = 100;
     const QnnHtpPerfInfrastructure_PowerConfig_t *powerConfigs1[] = {
         &rpcControlLatency, NULL};
-    perfInfraErr = perfInfra.setPowerConfig(powerConfigId, powerConfigs1);
+    perfInfraErr = perfInfra.setPowerConfig(m_powerConfigId, powerConfigs1);
     if (perfInfraErr != QNN_SUCCESS) {
       QNN_ERROR("setPowerConfig failed");
       return StatusCode::FAILURE;
     }
 
-    QnnHtpPerfInfrastructure_PowerConfig_t rpcPollingTime;
-    memset(&rpcPollingTime, 0, sizeof(rpcPollingTime));
-    rpcPollingTime.option =
-        QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_RPC_POLLING_TIME;
-    rpcPollingTime.rpcPollingTimeConfig = 9999;
-    const QnnHtpPerfInfrastructure_PowerConfig_t *powerConfigs2[] = {
-        &rpcPollingTime, NULL};
-    perfInfraErr = perfInfra.setPowerConfig(powerConfigId, powerConfigs2);
-    if (perfInfraErr != QNN_SUCCESS) {
-      QNN_ERROR("setPowerConfig failed");
-      return StatusCode::FAILURE;
-    }
+    // The static RPC_POLLING_TIME knob (formerly 9999µs) is dropped: it
+    // pinned a CPU core spinning for ~10 ms per call, was overridden by
+    // the ADAPTIVE_POLLING_TIME below anyway, and produced one
+    // "fastrpc_wait_for_completion: poll mode timeout (9999 us)" log line
+    // per UNet step. Adaptive is the right knob for SD's bursty pattern.
 
     QnnHtpPerfInfrastructure_PowerConfig_t powerConfig;
     memset(&powerConfig, 0, sizeof(powerConfig));
     powerConfig.option = QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_DCVS_V3;
     powerConfig.dcvsV3Config.dcvsEnable = 0;
     powerConfig.dcvsV3Config.setDcvsEnable = 1;
-    powerConfig.dcvsV3Config.contextId = powerConfigId;
+    powerConfig.dcvsV3Config.contextId = m_powerConfigId;
     powerConfig.dcvsV3Config.powerMode =
         QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_PERFORMANCE_MODE;
     powerConfig.dcvsV3Config.setSleepLatency = 1;
@@ -114,7 +126,7 @@ class QnnModel : public QnnSampleApp {
         DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER;
     const QnnHtpPerfInfrastructure_PowerConfig_t *powerConfigs3[] = {
         &powerConfig, NULL};
-    perfInfraErr = perfInfra.setPowerConfig(powerConfigId, powerConfigs3);
+    perfInfraErr = perfInfra.setPowerConfig(m_powerConfigId, powerConfigs3);
     if (perfInfraErr != QNN_SUCCESS) {
       QNN_ERROR("setPowerConfig failed");
       return StatusCode::FAILURE;
@@ -124,16 +136,33 @@ class QnnModel : public QnnSampleApp {
     memset(&adaptivePollingTime, 0, sizeof(adaptivePollingTime));
     adaptivePollingTime.option =
         QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_ADAPTIVE_POLLING_TIME;
-    adaptivePollingTime.adaptivePollingTimeConfig = 1000;
+    // 100 µs target: short enough to avoid burning CPU on idle waits,
+    // long enough to skip an interrupt for sub-100µs ops. Matches QNN
+    // sample app guidance for high-throughput inference paths.
+    adaptivePollingTime.adaptivePollingTimeConfig = 100;
     const QnnHtpPerfInfrastructure_PowerConfig_t *powerConfigs4[] = {
         &adaptivePollingTime, NULL};
-    perfInfraErr = perfInfra.setPowerConfig(powerConfigId, powerConfigs4);
+    perfInfraErr = perfInfra.setPowerConfig(m_powerConfigId, powerConfigs4);
     if (perfInfraErr != QNN_SUCCESS) {
       QNN_ERROR("setPowerConfig failed");
       return StatusCode::FAILURE;
     }
 
     return StatusCode::SUCCESS;
+  }
+
+  void releasePerformanceMode() {
+    if (!m_powerConfigIdValid) return;
+    auto qnnInterface = m_qnnFunctionPointers.qnnInterface;
+    QnnDevice_Infrastructure_t deviceInfra = nullptr;
+    if (qnnInterface.deviceGetInfrastructure(&deviceInfra) == QNN_SUCCESS &&
+        deviceInfra) {
+      auto *htpInfra =
+          static_cast<QnnHtpDevice_Infrastructure_t *>(deviceInfra);
+      htpInfra->perfInfra.destroyPowerConfigId(m_powerConfigId);
+    }
+    m_powerConfigIdValid = false;
+    m_powerConfigId = 0;
   }
 
   StatusCode executeClipGraphs(int32_t *input_ids, float *text_embedding) {
@@ -619,6 +648,12 @@ class QnnModel : public QnnSampleApp {
   // Perf 3: Cached quantized CLIP embeddings keyed by source pointer
   // (uncond + cond are two distinct pointers, both constant across steps)
   std::unordered_map<const float*, std::vector<uint16_t>> m_embedCache;
+
+  // HTP power-config slot owned by this model. Held as a member so the
+  // destructor can release it via destroyPowerConfigId; previously it was
+  // a local in enablePerformaceMode and the slot leaked per model load.
+  uint32_t m_powerConfigId = 0;
+  bool m_powerConfigIdValid = false;
 };
 
 #endif  // QNNMODEL_HPP

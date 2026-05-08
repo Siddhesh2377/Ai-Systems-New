@@ -42,6 +42,8 @@ class QnnSampleApp {
                std::string saveBinaryName              = "",
                unsigned int numInferences              = 1);
 
+  virtual ~QnnSampleApp();
+
   // @brief Print a message to STDERR then return a nonzero
   //  exit status.
   int32_t reportError(const std::string &err);
@@ -108,17 +110,22 @@ class QnnSampleApp {
   ProfilingLevel m_profilingLevel;
   bool m_dumpOutputs;
   qnn_wrapper_api::GraphInfo_t **m_graphsInfo = nullptr;
-  uint32_t m_graphsCount;
+  uint32_t m_graphsCount = 0;
   iotensor::IOTensor m_ioTensor;
   bool m_isBackendInitialized;
   bool m_isContextCreated;
+  bool m_isDeviceCreated = false;
   Qnn_ProfileHandle_t m_profileBackendHandle              = nullptr;
   qnn_wrapper_api::GraphConfigInfo_t **m_graphConfigsInfo = nullptr;
-  uint32_t m_graphConfigsInfoCount;
+  uint32_t m_graphConfigsInfoCount = 0;
   Qnn_LogHandle_t m_logHandle         = nullptr;
   Qnn_BackendHandle_t m_backendHandle = nullptr;
   Qnn_DeviceHandle_t m_deviceHandle   = nullptr;
   unsigned int m_numInferences;
+  // dlopen handle for the QNN backend .so. Stored so the destructor can
+  // dlclose; previously it was passed to the ctor and dropped, leaving
+  // libQnnHtp.so mapped for the process lifetime per model load.
+  void *m_backendLibraryHandle = nullptr;
 };
 }  // namespace sample_app
 }  // namespace tools
