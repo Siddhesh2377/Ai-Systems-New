@@ -14,7 +14,6 @@
             <option value="$PROJECT_DIR$/ai_sherpa" />
             <option value="$PROJECT_DIR$/app" />
             <option value="$PROJECT_DIR$/gguf_lib" />
-            <option value="$PROJECT_DIR$/ml-schedular" />
           </set>
         </option>
       </GradleProjectSettings>
