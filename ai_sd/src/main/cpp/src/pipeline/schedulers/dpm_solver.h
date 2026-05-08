@@ -117,10 +117,17 @@ class DPMSolverMultistepScheduler : public Scheduler {
       // Karras et al. 2022 sigma schedule:
       //   sigma_i = (sigma_max^(1/rho) + i/(N-1) *
       //              (sigma_min^(1/rho) - sigma_max^(1/rho)))^rho
-      // sigma_max = sigma at t=0 of the original train grid (highest
-      // noise, decoder-side). sigma_min = sigma at t=last_train_t.
-      float sigma_max = train_sigmas(0);
-      float sigma_min = train_sigmas(last_train_t);
+      // train_sigmas is the un-flipped full schedule built from
+      // sqrt((1-alpha_cumprod)/alpha_cumprod), so sigmas grow with t:
+      // train_sigmas(0) ≈ 0.029 (almost no noise, end of the diffusion
+      // process) and train_sigmas(num_train-1) ≈ 14.6 (full noise, the
+      // start). The decoder iterates high→low, so the schedule runs
+      // from sigma_max=train_sigmas(last_train_t) down to
+      // sigma_min=train_sigmas(0). Previous version had these inverted
+      // — the schedule went low→high and the loop never denoised, so
+      // every output was pure noise.
+      float sigma_max = train_sigmas(last_train_t);
+      float sigma_min = train_sigmas(0);
       float inv_rho = 1.0f / karras_rho_;
       float min_inv = std::pow(sigma_min, inv_rho);
       float max_inv = std::pow(sigma_max, inv_rho);
