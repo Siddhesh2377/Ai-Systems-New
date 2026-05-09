@@ -129,6 +129,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
     ${LLAMA_DIR}/engine/thread-engine.cpp
     ${LLAMA_DIR}/engine/rag-engine.cpp
     ${LLAMA_DIR}/engine/vt_cache.cpp
+    ${LLAMA_DIR}/engine/vlm_kv_cache.cpp
     ${RAG_INGEST_SOURCES}
     ${TEXT_DIGEST_SOURCES}
     ${VLM_SOURCES})

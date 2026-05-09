@@ -5,6 +5,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -19,8 +20,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AssistChip
-import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -52,11 +51,9 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.dark.demon_system.data.VlmModelSpec
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.rememberCoroutineScope
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -321,62 +318,100 @@ private fun OutputCard(state: VlmState) {
                 fontFamily = FontFamily.Monospace,
             )
 
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(12.dp))
             HorizontalDivider()
             Spacer(Modifier.height(8.dp))
-            MetricsRow(state)
+            MetricsGrid(state)
         }
     }
 }
 
 @Composable
-private fun MetricsRow(state: VlmState) {
+private fun MetricsGrid(state: VlmState) {
     val m = when (state) {
         is VlmState.Generating -> MetricsTuple(
             state.vlmEncodeMs, state.vlmDecodeMs, state.imageTokens,
-            null, null, state.vtCacheHit
+            null, null, state.vtCacheHit, state.vlmKvCacheHit,
         )
         is VlmState.GenerationDone -> MetricsTuple(
             state.vlmEncodeMs, state.vlmDecodeMs, state.imageTokens,
             state.metrics?.tokensPerSecond, state.metrics?.timeToFirstTokenMs,
-            state.vtCacheHit
+            state.vtCacheHit, state.vlmKvCacheHit,
         )
-        else -> MetricsTuple(null, null, null, null, null, null)
+        else -> MetricsTuple(null, null, null, null, null, null, null)
     }
 
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        if (m.cacheHit == true) AssistChip(
-            onClick = {},
-            label = { Text("VT ⚡ cached") },
-        ) else if (m.cacheHit == false) AssistChip(
-            onClick = {},
-            label = { Text("VT miss") },
+    fun chip(hit: Boolean?): String = when (hit) {
+        true  -> "⚡ cached"
+        false -> "miss"
+        null  -> "—"
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text("Metrics", style = MaterialTheme.typography.labelMedium)
+        MetricsGridRow(
+            left  = MetricsCellData("VLM-KV cache", chip(m.vlmKvHit), accent = m.vlmKvHit == true),
+            right = MetricsCellData("VT cache",     chip(m.cacheHit), accent = m.cacheHit == true),
         )
-        if (m.tps != null) AssistChip(
-            onClick = {},
-            label = { Text("%.1f tok/s".format(m.tps)) },
+        MetricsGridRow(
+            left  = MetricsCellData("Encode (ViT)", m.encodeMs?.let { "%.0f ms".format(it) } ?: "—"),
+            right = MetricsCellData("Decode (LLM prefill)", m.decodeMs?.let { "%.0f ms".format(it) } ?: "—"),
         )
-        if (m.ttft != null) AssistChip(
-            onClick = {},
-            label = { Text("ttft %.0f ms".format(m.ttft)) },
+        MetricsGridRow(
+            left  = MetricsCellData("TTFT", m.ttft?.let { "%.0f ms".format(it) } ?: "—"),
+            right = MetricsCellData("Throughput", m.tps?.let { "%.1f tok/s".format(it) } ?: "—"),
         )
-        if (m.imgTokens != null) AssistChip(
-            onClick = {},
-            label = { Text("img ${m.imgTokens} tok") },
-        )
-        if (m.encodeMs != null) AssistChip(
-            onClick = {},
-            label = { Text("enc %.0f ms".format(m.encodeMs)) },
-        )
-        if (m.decodeMs != null) AssistChip(
-            onClick = {},
-            label = { Text("dec %.0f ms".format(m.decodeMs)) },
+        MetricsGridRow(
+            left  = MetricsCellData("Image tokens", m.imgTokens?.toString() ?: "—"),
+            right = MetricsCellData(" ", " "),
         )
     }
 }
+
+@Composable
+private fun MetricsGridRow(left: MetricsCellData, right: MetricsCellData) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        MetricsCell(left,  Modifier.weight(1f))
+        MetricsCell(right, Modifier.weight(1f))
+    }
+}
+
+@Composable
+private fun MetricsCell(data: MetricsCellData, modifier: Modifier = Modifier) {
+    val bg = if (data.accent) MaterialTheme.colorScheme.primaryContainer
+             else             MaterialTheme.colorScheme.surface
+    val fg = if (data.accent) MaterialTheme.colorScheme.onPrimaryContainer
+             else             MaterialTheme.colorScheme.onSurface
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(bg)
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+    ) {
+        Text(
+            data.label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(2.dp))
+        Text(
+            data.value,
+            style = MaterialTheme.typography.bodyMedium,
+            color = fg,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Medium,
+        )
+    }
+}
+
+private data class MetricsCellData(
+    val label: String,
+    val value: String,
+    val accent: Boolean = false,
+)
 
 private data class MetricsTuple(
     val encodeMs: Float?,
@@ -385,6 +420,7 @@ private data class MetricsTuple(
     val tps: Float?,
     val ttft: Float?,
     val cacheHit: Boolean?,
+    val vlmKvHit: Boolean?,
 )
 
 private fun Long.humanBytes(): String {

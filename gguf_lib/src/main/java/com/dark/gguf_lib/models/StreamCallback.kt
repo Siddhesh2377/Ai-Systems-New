@@ -50,4 +50,15 @@ interface StreamCallback {
      * @param nEmbd   Per-token embedding dimension (`llama_model_n_embd_inp`)
      */
     fun onVlmCacheStatus(hit: Boolean, nTokens: Int, nEmbd: Int) {}
+
+    /**
+     * VLM-KV cache hit/miss. Fired once per VLM call when a vlmKvKey was
+     * supplied. On hit, the LLM context state captured at the post-image
+     * boundary is restored — BOTH the vision encoder AND the ~9s image-prefill
+     * llama_decode are skipped, taking TTFT from ~10s to ~hundreds of ms.
+     *
+     * @param hit     true → cached state restored; false → fresh decode path
+     * @param nTokens Number of tokens in the restored prefix (n_past)
+     */
+    fun onVlmKvCacheStatus(hit: Boolean, nTokens: Int) {}
 }

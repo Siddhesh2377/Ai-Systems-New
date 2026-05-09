@@ -28,6 +28,7 @@ internal object GGUFNativeLib {
         useMlock: Boolean,
         cacheTypeK: String,
         cacheTypeV: String,
+        opOffload: Boolean,
     ): Boolean
 
     external fun nativeLoadModelFromFd(
@@ -40,6 +41,7 @@ internal object GGUFNativeLib {
         useMlock: Boolean,
         cacheTypeK: String,
         cacheTypeV: String,
+        opOffload: Boolean,
     ): Boolean
 
     external fun nativeRelease()
@@ -204,11 +206,18 @@ internal object GGUFNativeLib {
      *   Pass null (or null entries) to skip the VT cache for that image.
      *   When the cache is initialised and a key is provided, native first
      *   tries [vt_cache_lookup]; on hit it skips the ~10s ViT pass entirely.
+     * @param vlmKvKey Optional single 32-byte SHA256 covering the *whole*
+     *   pre-question state (system prompt + chat template + image bytes +
+     *   projector + image_max_tokens + model fingerprint). On hit, the LLM
+     *   context state captured at the post-image-chunk boundary is restored
+     *   and BOTH the ViT pass AND the ~9s LLM image-prefill are skipped.
+     *   Pass null to disable.
      */
     external fun nativeVlmGenerateStream(
         messagesJson: String,
         imageData: Array<ByteArray>,
         vtKeys: Array<ByteArray>?,
+        vlmKvKey: ByteArray?,
         maxTokens: Int,
         callback: StreamCallback,
     ): Boolean
@@ -237,4 +246,47 @@ internal object GGUFNativeLib {
 
     /** Drop a single entry by 32-byte hash. Returns true if it was present. */
     external fun nativeVtCacheRemove(hash: ByteArray): Boolean
+
+    // ── VLM-KV cache ────────────────────────────────────────────────────────
+    //
+    // Stores the LLM context state captured at the post-image-chunk boundary
+    // during VLM prompt-eval. On hit, both the vision encoder AND the
+    // image-prefill llama_decode are skipped. Survives process restarts.
+
+    /** Open the cache at [dir] with [budgetBytes] (0 = default 300 MB). */
+    external fun nativeVlmKvCacheInit(dir: String, budgetBytes: Long): Boolean
+
+    /** Close the cache. Files on disk persist; only the in-memory index is freed. */
+    external fun nativeVlmKvCacheRelease()
+
+    /** Drop every entry from disk and reset stats. */
+    external fun nativeVlmKvCacheClear()
+
+    external fun nativeVlmKvCacheSetBudget(bytes: Long)
+
+    /** Returns JSON: `{initialized, total_bytes, budget_bytes, entry_count, hits, misses}`. */
+    external fun nativeVlmKvCacheStatsJson(): String
+
+    /** Returns JSON array of `{hash, n_tokens, size_bytes, last_access_ms}`. */
+    external fun nativeVlmKvCacheListEntriesJson(): String
+
+    /** Drop a single entry by 32-byte hash. Returns true if it was present. */
+    external fun nativeVlmKvCacheRemove(hash: ByteArray): Boolean
+
+    /**
+     * Returns a JSON snapshot of every ggml backend + device registered at
+     * startup. Purely diagnostic — calling this does not change which backend
+     * llama.cpp uses for compute.
+     *
+     * Shape:
+     * ```
+     * {
+     *   "backends": [{"name": "CPU"}, {"name": "Vulkan"}, ...],
+     *   "devices":  [{"name": "...", "description": "...", "type": "cpu|gpu|igpu|accel",
+     *                 "memory_free": 1234567, "memory_total": 12345678,
+     *                 "async": false, "events": false}, ...]
+     * }
+     * ```
+     */
+    external fun nativeListBackendsJson(): String
 }

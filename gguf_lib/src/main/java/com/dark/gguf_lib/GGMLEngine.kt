@@ -69,6 +69,13 @@ class GGMLEngine {
      * @param cacheTypeK  KV cache type for keys: `f32`, `f16`, `q8_0`, `q4_0`,
      *                    `q4_1`, `q5_0`, `q5_1`. Defaults to `q8_0` (~50% of f16).
      * @param cacheTypeV  KV cache type for values. Same options as [cacheTypeK].
+     * @param opOffload   Per-op CPU/GPU routing. When true and a non-CPU
+     *                    backend (Vulkan, etc.) is registered with ggml,
+     *                    large ops (batch ≥ 32 by default) route to GPU
+     *                    while single-token decode stays on CPU. No layer
+     *                    weights are moved — purely a compute hint, so
+     *                    decode latency is preserved. See VLM.md
+     *                    "Per-op routing" for the full trade-off.
      *
      * @return true on success. On failure, see [com.dark.gguf_lib.error] via
      *         `GGUFNativeLib.nativeErrorGetLastJson()` (used internally).
@@ -83,10 +90,11 @@ class GGMLEngine {
         useMlock: Boolean = false,
         cacheTypeK: String = "q8_0",
         cacheTypeV: String = "q8_0",
+        opOffload: Boolean = false,
     ): Boolean = withContext(Dispatchers.IO) {
         loaded = GGUFNativeLib.nativeLoadModel(
             path, contextSize, threads, batchSize,
-            flashAttn, useMmap, useMlock, cacheTypeK, cacheTypeV,
+            flashAttn, useMmap, useMlock, cacheTypeK, cacheTypeV, opOffload,
         )
         loaded
     }
@@ -108,10 +116,11 @@ class GGMLEngine {
         useMlock: Boolean = false,
         cacheTypeK: String = "q8_0",
         cacheTypeV: String = "q8_0",
+        opOffload: Boolean = false,
     ): Boolean = withContext(Dispatchers.IO) {
         loaded = GGUFNativeLib.nativeLoadModelFromFd(
             fd, contextSize, threads, batchSize,
-            flashAttn, useMmap, useMlock, cacheTypeK, cacheTypeV,
+            flashAttn, useMmap, useMlock, cacheTypeK, cacheTypeV, opOffload,
         )
         loaded
     }
@@ -133,12 +142,13 @@ class GGMLEngine {
         useMlock: Boolean = false,
         cacheTypeK: String = "q8_0",
         cacheTypeV: String = "q8_0",
+        opOffload: Boolean = false,
     ): Boolean = withContext(Dispatchers.IO) {
         val pfd = context.contentResolver.openFileDescriptor(uri, "r") ?: return@withContext false
         try {
             loadFromFd(
                 pfd.fd, contextSize, threads, batchSize,
-                flashAttn, useMmap, useMlock, cacheTypeK, cacheTypeV,
+                flashAttn, useMmap, useMlock, cacheTypeK, cacheTypeV, opOffload,
             )
         } finally {
             pfd.close()
@@ -425,12 +435,18 @@ class GGMLEngine {
      * @param vtKeys Optional 32-byte SHA256 keys, parallel to [imageData]. When
      *   non-null and the VT cache is initialised, cached embeddings short-circuit
      *   the vision encoder. Use [computeVtKey] to derive a canonical key.
+     * @param vlmKvKey Optional single 32-byte key for the VLM-KV cache. Stronger
+     *   than [vtKeys] — on hit, the LLM context state captured at the post-image
+     *   boundary is restored, skipping BOTH the ViT pass AND the ~9s LLM
+     *   image-prefill. TTFT drops from ~10s to a few hundred ms. The key must
+     *   cover everything that goes into the cached prefix: see [computeVlmKvKey].
      */
     fun generateVlmFlow(
         messagesJson: String,
         imageData: List<ByteArray>,
         maxTokens: Int = 4096,
         vtKeys: List<ByteArray?>? = null,
+        vlmKvKey: ByteArray? = null,
     ): Flow<GenerationEvent> = callbackFlow {
         val cb = streamCallback(::trySend, ::close)
         val keysArray: Array<ByteArray>? = vtKeys?.let { keys ->
@@ -440,7 +456,7 @@ class GGMLEngine {
         }
         val job = launch(Dispatchers.IO) {
             GGUFNativeLib.nativeVlmGenerateStream(
-                messagesJson, imageData.toTypedArray(), keysArray, maxTokens, cb,
+                messagesJson, imageData.toTypedArray(), keysArray, vlmKvKey, maxTokens, cb,
             )
         }
         awaitClose {
@@ -488,6 +504,70 @@ class GGMLEngine {
     fun vtCacheListEntriesJson(): String  = GGUFNativeLib.nativeVtCacheListEntriesJson()
     fun vtCacheRemove(hash: ByteArray): Boolean = GGUFNativeLib.nativeVtCacheRemove(hash)
 
+    // ── VLM-KV cache management ──────────────────────────────────────────
+
+    /**
+     * Initialise the VLM-KV cache. Default budget 300 MB (entries are typically
+     * 5–15 MB each). Open after [load] + [loadVlmProjector], close before unload.
+     */
+    fun vlmKvCacheInit(dir: String, budgetBytes: Long = 300L * 1024L * 1024L): Boolean =
+        GGUFNativeLib.nativeVlmKvCacheInit(dir, budgetBytes)
+
+    fun vlmKvCacheRelease()                      = GGUFNativeLib.nativeVlmKvCacheRelease()
+    fun vlmKvCacheClear()                        = GGUFNativeLib.nativeVlmKvCacheClear()
+    fun vlmKvCacheSetBudget(bytes: Long)         = GGUFNativeLib.nativeVlmKvCacheSetBudget(bytes)
+    fun vlmKvCacheStatsJson(): String            = GGUFNativeLib.nativeVlmKvCacheStatsJson()
+    fun vlmKvCacheListEntriesJson(): String      = GGUFNativeLib.nativeVlmKvCacheListEntriesJson()
+    fun vlmKvCacheRemove(hash: ByteArray): Boolean = GGUFNativeLib.nativeVlmKvCacheRemove(hash)
+
+    /**
+     * JSON snapshot of registered ggml backends + devices. Diagnostic only —
+     * the engine does not currently route ops to GPU; per-op routing is parked
+     * pending upstream llama.cpp changes. See VLM.md "Per-op routing" for the
+     * design notes.
+     */
+    fun listBackendsJson(): String = GGUFNativeLib.nativeListBackendsJson()
+
+    /**
+     * Canonical VLM-KV cache key.
+     *
+     * SHA256 of: image bytes ∥ projector path ∥ image_max_tokens ∥
+     * model fingerprint ∥ system prompt ∥ chat-template prefix.
+     *
+     * The cached LLM state is bound to *all* of these inputs — change any and
+     * the cached prefix is no longer valid. The host app is responsible for
+     * passing a stable [chatTemplatePrefix] (typically the verbatim text the
+     * user puts before the image marker, e.g. an empty string if the marker
+     * is the first thing in the user message).
+     */
+    fun computeVlmKvKey(
+        imageBytes: ByteArray,
+        projectorPath: String,
+        imageMaxTokens: Int,
+        modelFingerprint: String,
+        systemPrompt: String,
+        chatTemplatePrefix: String,
+    ): ByteArray {
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+        md.update(imageBytes)
+        md.update(byteArrayOf(0))                                 // separator
+        md.update(projectorPath.toByteArray(Charsets.UTF_8))
+        md.update(byteArrayOf(0))
+        md.update(byteArrayOf(
+            (imageMaxTokens shr 24).toByte(),
+            (imageMaxTokens shr 16).toByte(),
+            (imageMaxTokens shr 8).toByte(),
+            imageMaxTokens.toByte(),
+        ))
+        md.update(byteArrayOf(0))
+        md.update(modelFingerprint.toByteArray(Charsets.UTF_8))
+        md.update(byteArrayOf(0))
+        md.update(systemPrompt.toByteArray(Charsets.UTF_8))
+        md.update(byteArrayOf(0))
+        md.update(chatTemplatePrefix.toByteArray(Charsets.UTF_8))
+        return md.digest()
+    }
+
     companion object {
         /** Categorize the host device by total RAM. */
         fun detectDeviceTier(context: Context): DeviceTier {
@@ -534,6 +614,9 @@ private inline fun streamCallback(
     }
     override fun onVlmCacheStatus(hit: Boolean, nTokens: Int, nEmbd: Int) {
         send(GenerationEvent.VtCacheStatus(hit, nTokens, nEmbd))
+    }
+    override fun onVlmKvCacheStatus(hit: Boolean, nTokens: Int) {
+        send(GenerationEvent.VlmKvCacheStatus(hit, nTokens))
     }
 }
 

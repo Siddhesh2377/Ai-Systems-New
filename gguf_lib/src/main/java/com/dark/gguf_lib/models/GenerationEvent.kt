@@ -34,4 +34,14 @@ sealed class GenerationEvent {
         val nTokens: Int,
         val nEmbd: Int,
     ) : GenerationEvent()
+
+    /**
+     * VLM-KV cache result. Fired once per VLM call when a vlmKvKey was
+     * supplied. On hit, BOTH the ViT pass AND the ~9s LLM image-prefill are
+     * skipped — TTFT drops from ~10s to a few hundred ms.
+     */
+    data class VlmKvCacheStatus(
+        val hit: Boolean,
+        val nTokens: Int,
+    ) : GenerationEvent()
 }

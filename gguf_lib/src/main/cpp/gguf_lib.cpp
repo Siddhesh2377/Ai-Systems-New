@@ -22,10 +22,15 @@
 #include "common.h"
 #include "sampling.h"
 #include "chat.h"
+#include "ggml-backend.h"
+#ifdef GGML_USE_VULKAN
+#include "ggml-vulkan.h"
+#endif
 
 #include "thread-engine.h"
 #include "rag-engine.h"
 #include "vt_cache.h"
+#include "vlm_kv_cache.h"
 #include "rag_ingest/rag_ingest.h"
 #include "text_digest/text_digest.h"
 #include "error_tracker.h"
@@ -66,6 +71,21 @@ static void ensure_backend_init() {
     std::call_once(g_backend_init_flag, [] {
         llama_log_set(llama_android_log_callback, nullptr);
         llama_backend_init();
+
+        // ggml's static-link build only auto-registers CPU. With GGML_BACKEND_DL=OFF
+        // (our config — single .so, no separate libggml-vulkan.so to dlopen), the
+        // Vulkan backend stays silent unless we call its reg() manually here.
+#ifdef GGML_USE_VULKAN
+        if (auto * reg = ggml_backend_vk_reg()) {
+            ggml_backend_register(reg);
+            LOGI("Vulkan backend registered (devices=%zu)",
+                 ggml_backend_reg_dev_count(reg));
+        } else {
+            LOGW("Vulkan backend reg returned null (libvulkan missing or device unsupported)");
+        }
+#endif
+        LOGI("ggml backends registered: %zu, devices: %zu",
+             ggml_backend_reg_count(), ggml_backend_dev_count());
     });
 }
 
@@ -81,6 +101,7 @@ static jmethodID g_onProgress          = nullptr;
 static jmethodID g_onTokenBytes        = nullptr; // zero-copy byte[] fast path
 static jmethodID g_onVlmStageMetrics   = nullptr;
 static jmethodID g_onVlmCacheStatus    = nullptr; // VT cache hit/miss feedback
+static jmethodID g_onVlmKvCacheStatus  = nullptr; // VLM-KV cache hit/miss feedback
 
 static jclass    g_embed_cb_class   = nullptr;
 static jmethodID g_embed_onComplete = nullptr;
@@ -105,6 +126,8 @@ static bool ensure_callback_methods(JNIEnv * env, jobject callback) {
     g_onVlmStageMetrics = env->GetMethodID(cls, "onVlmStageMetrics", "(FFI)V");
     if (env->ExceptionCheck()) env->ExceptionClear();
     g_onVlmCacheStatus = env->GetMethodID(cls, "onVlmCacheStatus", "(ZII)V");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    g_onVlmKvCacheStatus = env->GetMethodID(cls, "onVlmKvCacheStatus", "(ZI)V");
     if (env->ExceptionCheck()) env->ExceptionClear();
     env->DeleteLocalRef(cls);
     return g_onToken && g_onDone && g_onError;
@@ -769,7 +792,8 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModel(
         JNIEnv * env, jobject,
         jstring jpath, jint nCtx, jint nThreads, jint nBatch,
         jboolean flashAttn, jboolean useMmap, jboolean useMlock,
-        jstring jCacheTypeK, jstring jCacheTypeV) {
+        jstring jCacheTypeK, jstring jCacheTypeV,
+        jboolean opOffload) {
 
     ensure_backend_init();
 
@@ -819,6 +843,13 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModel(
     g_state.use_mmap  = mparams.use_mmap;
     g_state.use_mlock = mparams.use_mlock;
 
+    // Default n_gpu_layers is -1 (= all layers offloaded). On a UMA SoC like
+    // Adreno 810 that's the wrong trade-off: weight-on-GPU forces every op
+    // through Vulkan including single-token decode, which destroys tok/s.
+    // We keep all layer weights on CPU and rely on op_offload (below) to
+    // route only the *large* ops to GPU per-tensor.
+    mparams.n_gpu_layers = 0;
+
     g_state.model = llama_model_load_from_file(path_s.c_str(), mparams);
     if (!g_state.model) {
         tn_error_set_last(TN_ERR_MODEL_LOAD, "ModelLoad",
@@ -844,6 +875,16 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModel(
     if (flashAttn) cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     cparams.type_k = cache_type_from_string(cacheK_s);
     cparams.type_v = cache_type_from_string(cacheV_s);
+
+    // Per-op CPU/GPU routing. When true and a non-CPU backend (Vulkan, etc.)
+    // is registered with ggml, large ops (batch ≥ 32 by default) get offloaded
+    // to GPU while single-token decode stays on CPU. No layer weights are
+    // moved — purely a compute-side hint. See VLM.md "Per-op routing" for the
+    // trade-off discussion. Override the threshold via GGML_OP_OFFLOAD_MIN_BATCH.
+    cparams.op_offload = (bool)opOffload;
+    if (cparams.op_offload) {
+        LOGI("op_offload: enabled — large ops will be routed to GPU when available");
+    }
 
     g_state.ctx = llama_init_from_model(g_state.model, cparams);
     if (!g_state.ctx) {
@@ -891,7 +932,8 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModelFromFd(
         JNIEnv * env, jobject thiz,
         jint fd, jint nCtx, jint nThreads, jint nBatch,
         jboolean flashAttn, jboolean useMmap, jboolean useMlock,
-        jstring jCacheTypeK, jstring jCacheTypeV) {
+        jstring jCacheTypeK, jstring jCacheTypeV,
+        jboolean opOffload) {
 
     if (fd < 0) {
         LOGE("Invalid file descriptor: %d", fd);
@@ -917,7 +959,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModelFromFd(
     jstring jpath = env->NewStringUTF(path);
     jboolean result = Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModel(
         env, thiz, jpath, nCtx, nThreads, nBatch, flashAttn, useMmap, useMlock,
-        jCacheTypeK, jCacheTypeV);
+        jCacheTypeK, jCacheTypeV, opOffload);
     env->DeleteLocalRef(jpath);
 
     // Close our dup, not the caller's fd — Kotlin owns the original via PFD.
@@ -2502,6 +2544,159 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVtCacheRemove(
     return vt_cache_remove(g_vt.cache, hash) ? JNI_TRUE : JNI_FALSE;
 }
 
+// VLM-KV cache state. Stores the LLM context state (KV cache, n_past, etc.)
+// captured at the post-image-chunk boundary so subsequent queries with the
+// same image + system prompt + chat template skip both the vision encoder AND
+// the LLM image-prefill — TTFT drops from ~9s to a few hundred ms.
+static struct {
+    vlm_kv_cache_t * cache = nullptr;
+    std::mutex       mutex;
+} g_vkv;
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmKvCacheInit(
+        JNIEnv * env, jobject, jstring jdir, jlong budgetBytes) {
+    std::lock_guard<std::mutex> lock(g_vkv.mutex);
+    if (g_vkv.cache) {
+        vlm_kv_cache_free(g_vkv.cache);
+        g_vkv.cache = nullptr;
+    }
+    if (!jdir) return JNI_FALSE;
+    const char * dir = env->GetStringUTFChars(jdir, nullptr);
+    g_vkv.cache = vlm_kv_cache_create(dir, (int64_t)budgetBytes);
+    env->ReleaseStringUTFChars(jdir, dir);
+    return g_vkv.cache ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmKvCacheRelease(JNIEnv *, jobject) {
+    std::lock_guard<std::mutex> lock(g_vkv.mutex);
+    if (g_vkv.cache) {
+        vlm_kv_cache_free(g_vkv.cache);
+        g_vkv.cache = nullptr;
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmKvCacheClear(JNIEnv *, jobject) {
+    std::lock_guard<std::mutex> lock(g_vkv.mutex);
+    if (g_vkv.cache) vlm_kv_cache_clear(g_vkv.cache);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmKvCacheSetBudget(
+        JNIEnv *, jobject, jlong bytes) {
+    std::lock_guard<std::mutex> lock(g_vkv.mutex);
+    if (g_vkv.cache) vlm_kv_cache_set_budget(g_vkv.cache, (int64_t)bytes);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmKvCacheStatsJson(JNIEnv * env, jobject) {
+    std::lock_guard<std::mutex> lock(g_vkv.mutex);
+    json info;
+    if (!g_vkv.cache) {
+        info["initialized"] = false;
+        return env->NewStringUTF(info.dump().c_str());
+    }
+    info["initialized"]  = true;
+    info["total_bytes"]  = vlm_kv_cache_total_bytes(g_vkv.cache);
+    info["budget_bytes"] = vlm_kv_cache_get_budget(g_vkv.cache);
+    info["entry_count"]  = vlm_kv_cache_count(g_vkv.cache);
+    info["hits"]         = vlm_kv_cache_hits(g_vkv.cache);
+    info["misses"]       = vlm_kv_cache_misses(g_vkv.cache);
+    return env->NewStringUTF(info.dump().c_str());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmKvCacheListEntriesJson(JNIEnv * env, jobject) {
+    std::lock_guard<std::mutex> lock(g_vkv.mutex);
+    if (!g_vkv.cache) return env->NewStringUTF("[]");
+    int32_t count = 0;
+    auto * entries = vlm_kv_cache_list(g_vkv.cache, &count);
+    json arr = json::array();
+    for (int32_t i = 0; i < count; i++) {
+        char hex[VLM_KV_CACHE_HASH_BYTES * 2 + 1];
+        for (int j = 0; j < VLM_KV_CACHE_HASH_BYTES; j++) {
+            snprintf(hex + j*2, 3, "%02x", entries[i].hash[j]);
+        }
+        arr.push_back({
+            {"hash",           hex},
+            {"n_tokens",       entries[i].n_tokens},
+            {"size_bytes",     entries[i].size_bytes},
+            {"last_access_ms", entries[i].last_access_ms},
+        });
+    }
+    vlm_kv_cache_list_free(entries);
+    return env->NewStringUTF(arr.dump().c_str());
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmKvCacheRemove(
+        JNIEnv * env, jobject, jbyteArray jhash) {
+    std::lock_guard<std::mutex> lock(g_vkv.mutex);
+    if (!g_vkv.cache || !jhash) return JNI_FALSE;
+    if (env->GetArrayLength(jhash) != VLM_KV_CACHE_HASH_BYTES) return JNI_FALSE;
+    uint8_t hash[VLM_KV_CACHE_HASH_BYTES];
+    env->GetByteArrayRegion(jhash, 0, VLM_KV_CACHE_HASH_BYTES, (jbyte *)hash);
+    return vlm_kv_cache_remove(g_vkv.cache, hash) ? JNI_TRUE : JNI_FALSE;
+}
+
+// ── Backend diagnostics ─────────────────────────────────────────────────
+//
+// Lists every ggml backend that auto-registered at startup. Purely
+// informational — does NOT route ops to GPU. Per-op routing requires
+// upstream llama.cpp changes (ggml_backend_sched configured with the
+// right backend set, plus an op-routing callback) and is intentionally
+// not exposed here. See VLM.md "What's NOT shipping yet" for the
+// trade-off discussion.
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeListBackendsJson(JNIEnv * env, jobject) {
+    ensure_backend_init();
+
+    json regs   = json::array();
+    json devs   = json::array();
+
+    const size_t n_reg = ggml_backend_reg_count();
+    for (size_t i = 0; i < n_reg; i++) {
+        ggml_backend_reg_t r = ggml_backend_reg_get(i);
+        if (!r) continue;
+        const char * name = ggml_backend_reg_name(r);
+        regs.push_back({ {"name", name ? name : "?"} });
+    }
+
+    const size_t n_dev = ggml_backend_dev_count();
+    for (size_t i = 0; i < n_dev; i++) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (!d) continue;
+
+        ggml_backend_dev_props p{};
+        ggml_backend_dev_get_props(d, &p);
+
+        const char * type_str = "?";
+        switch (p.type) {
+            case GGML_BACKEND_DEVICE_TYPE_CPU:   type_str = "cpu";   break;
+            case GGML_BACKEND_DEVICE_TYPE_GPU:   type_str = "gpu";   break;
+            case GGML_BACKEND_DEVICE_TYPE_IGPU:  type_str = "igpu";  break;
+            case GGML_BACKEND_DEVICE_TYPE_ACCEL: type_str = "accel"; break;
+        }
+
+        devs.push_back({
+            {"name",         p.name        ? p.name        : "?"},
+            {"description",  p.description ? p.description : ""},
+            {"type",         type_str},
+            {"memory_free",  (uint64_t)p.memory_free},
+            {"memory_total", (uint64_t)p.memory_total},
+            {"async",        p.caps.async},
+            {"events",       p.caps.events},
+        });
+    }
+
+    json out;
+    out["backends"] = regs;
+    out["devices"]  = devs;
+    return env->NewStringUTF(out.dump().c_str());
+}
+
 // VLM (Vision Language Model) state. The mtmd projector context binds n_threads
 // at init time; if the caller switches thread mode after loading, the projector
 // keeps the old count. Reload via releaseVlmProjector() + loadVlmProjector() to
@@ -2637,6 +2832,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGenerateStream(
         jstring jmessagesJson,
         jobjectArray imageDataArray,
         jobjectArray vtKeysArray,    // optional byte[32][] parallel to images; null = no caching
+        jbyteArray   vlmKvKeyArray,  // optional byte[32] for VLM-KV cache; null = no caching
         jint maxTokens,
         jobject callback) {
 
@@ -2775,7 +2971,90 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGenerateStream(
     std::vector<float> cached_embd_buf;   // reused across image chunks on hit
 
     const size_t n_chunks_total = mtmd_input_chunks_size(chunks);
-    for (size_t ci = 0; ci < n_chunks_total && eval_result == 0; ci++) {
+
+    // ── VLM-KV cache integration ──────────────────────────────────────────
+    // The big TTFT win: cache the LLM context state *after* the last image
+    // chunk has been decoded. On a hit, restore that state and skip everything
+    // up through the last image — including the ~9s image-prefill llama_decode.
+    //
+    // Key derivation is the caller's job; we only require a 32-byte hash. The
+    // canonical key derivation is in GGMLEngine.computeVlmKvKey() and includes
+    // image bytes, projector path, image_max_tokens, system prompt, and chat
+    // template prefix.
+    uint8_t  vlm_kv_key[VLM_KV_CACHE_HASH_BYTES];
+    bool     have_vlm_kv_key = false;
+    if (vlmKvKeyArray && env->GetArrayLength(vlmKvKeyArray) == VLM_KV_CACHE_HASH_BYTES) {
+        env->GetByteArrayRegion(vlmKvKeyArray, 0, VLM_KV_CACHE_HASH_BYTES,
+                                (jbyte *)vlm_kv_key);
+        have_vlm_kv_key = true;
+    }
+
+    // Stable snapshot of the cache pointer for the duration of this call.
+    // Init/release on the host thread between calls is safe; mid-generation
+    // release is undefined (host responsibility).
+    vlm_kv_cache_t * vlm_kv = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_vkv.mutex);
+        vlm_kv = g_vkv.cache;
+    }
+
+    // Boundary index: first chunk *after* the last image chunk. If there are
+    // no image chunks, the cache is irrelevant and we leave this at 0.
+    int resume_chunk_idx = 0;
+    for (int i = (int)n_chunks_total - 1; i >= 0; i--) {
+        if (mtmd_input_chunk_get_type(mtmd_input_chunks_get(chunks, i))
+                != MTMD_INPUT_CHUNK_TYPE_TEXT) {
+            resume_chunk_idx = i + 1;
+            break;
+        }
+    }
+
+    bool    vlm_kv_restored = false;
+    int32_t vlm_kv_restored_tokens = 0;
+    if (have_vlm_kv_key && vlm_kv && resume_chunk_idx > 0) {
+        int32_t peek_n  = 0;
+        size_t  peek_sz = 0;
+        if (vlm_kv_cache_peek(vlm_kv, vlm_kv_key, &peek_n, &peek_sz) && peek_sz > 0) {
+            std::vector<uint8_t> blob(peek_sz);
+            size_t  got_sz = 0;
+            int32_t got_n  = 0;
+            if (vlm_kv_cache_lookup(vlm_kv, vlm_kv_key,
+                                    blob.data(), peek_sz, &got_sz, &got_n)) {
+                const size_t set_ret = llama_state_seq_set_data(
+                    g_state.ctx, blob.data(), got_sz, /*seq_id=*/0);
+                if (set_ret > 0) {
+                    new_n_past             = (llama_pos)got_n;
+                    vlm_kv_restored        = true;
+                    vlm_kv_restored_tokens = got_n;
+                    LOGI("VLM-KV cache HIT (restored %d tokens, %zu bytes) — "
+                         "skipping chunks [0, %d)",
+                         got_n, got_sz, resume_chunk_idx);
+                } else {
+                    LOGW("VLM-KV cache: state_set_data failed (geometry mismatch?), "
+                         "falling back to fresh decode");
+                }
+            }
+        }
+    }
+
+    if (g_onVlmKvCacheStatus && have_vlm_kv_key) {
+        env->CallVoidMethod(callback, g_onVlmKvCacheStatus,
+                            (jboolean)vlm_kv_restored, (jint)vlm_kv_restored_tokens);
+    }
+
+    // When restored, skip chunks [0, resume_chunk_idx) but still advance
+    // img_idx past any image chunks we skipped — vtKeysArray slots align
+    // by image-chunk index.
+    const size_t start_ci = vlm_kv_restored ? (size_t)resume_chunk_idx : 0;
+    if (vlm_kv_restored) {
+        for (size_t i = 0; i < (size_t)resume_chunk_idx; i++) {
+            const enum mtmd_input_chunk_type t = mtmd_input_chunk_get_type(
+                mtmd_input_chunks_get(chunks, i));
+            if (t != MTMD_INPUT_CHUNK_TYPE_TEXT) img_idx++;
+        }
+    }
+
+    for (size_t ci = start_ci; ci < n_chunks_total && eval_result == 0; ci++) {
         const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, ci);
         const bool is_last = (ci == n_chunks_total - 1);
         const enum mtmd_input_chunk_type ctype = mtmd_input_chunk_get_type(chunk);
@@ -2859,6 +3138,23 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGenerateStream(
         if (g_onProgress && n_chunks_total > 1) {
             float p = 0.1f + 0.4f * ((float)(ci + 1) / (float)n_chunks_total);
             env->CallVoidMethod(callback, g_onProgress, p);
+        }
+
+        // Boundary save: just decoded the last image chunk on a fresh path.
+        // Persist the LLM context state so the next call with the same key
+        // can skip everything up through here.
+        if (have_vlm_kv_key && !vlm_kv_restored && vlm_kv && eval_result == 0
+                && (int)ci + 1 == resume_chunk_idx) {
+            const size_t blob_size = llama_state_seq_get_size(g_state.ctx, /*seq_id=*/0);
+            if (blob_size > 0) {
+                std::vector<uint8_t> blob(blob_size);
+                const size_t written = llama_state_seq_get_data(
+                    g_state.ctx, blob.data(), blob_size, /*seq_id=*/0);
+                if (written > 0) {
+                    vlm_kv_cache_store(vlm_kv, vlm_kv_key,
+                                       blob.data(), written, (int32_t)new_n_past);
+                }
+            }
         }
     }
 

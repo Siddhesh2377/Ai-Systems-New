@@ -32,6 +32,7 @@ sealed interface VlmState {
         val imageTokens: Int? = null,
         val progress: Float? = null,
         val vtCacheHit: Boolean? = null,
+        val vlmKvCacheHit: Boolean? = null,
     ) : VlmState
 
     data class GenerationDone(
@@ -41,6 +42,7 @@ sealed interface VlmState {
         val vlmDecodeMs: Float?,
         val imageTokens: Int?,
         val vtCacheHit: Boolean?,
+        val vlmKvCacheHit: Boolean?,
     ) : VlmState
 
     data class Error(val message: String) : VlmState
