@@ -6,7 +6,6 @@ package com.dark.gguf_lib.models
  */
 sealed class GenerationEvent {
     data class Token(val text: String) : GenerationEvent()
-    data class ToolCall(val name: String, val argsJson: String) : GenerationEvent()
     data object Done : GenerationEvent()
     data class Error(val message: String) : GenerationEvent()
     data class Metrics(val metrics: DecodingMetrics) : GenerationEvent()
@@ -24,5 +23,15 @@ sealed class GenerationEvent {
         val vlmEncodeMs: Float,
         val vlmDecodeMs: Float,
         val imageTokens: Int
+    ) : GenerationEvent()
+
+    /**
+     * VT (vision token) cache result for a single image. Fired once per image
+     * when a cache key was supplied. On hit, the ~10s ViT pass is skipped.
+     */
+    data class VtCacheStatus(
+        val hit: Boolean,
+        val nTokens: Int,
+        val nEmbd: Int,
     ) : GenerationEvent()
 }

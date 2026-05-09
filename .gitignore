@@ -37,3 +37,4 @@ CMakeCache.txt
 .DS_Store
 Thumbs.db
 desktop.ini
+/gguf_lib/plans/

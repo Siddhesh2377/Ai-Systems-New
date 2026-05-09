@@ -15,7 +15,6 @@
 # JNI callback interfaces — native code resolves methods via env->GetMethodID.
 -keep interface com.dark.gguf_lib.models.StreamCallback { *; }
 -keep interface com.dark.gguf_lib.models.EmbeddingCallback { *; }
--keep interface com.dark.gguf_lib.models.AgentCallback { *; }
 
 # Constructed from JNI via env->NewObject.
 -keep class com.dark.gguf_lib.models.EmbeddingResult { *; }
@@ -29,8 +28,6 @@
 # Public SDK classes.
 -keep class com.dark.gguf_lib.GGMLEngine { public *; }
 -keep class com.dark.gguf_lib.GGMLEngine$* { public *; }
--keep class com.dark.gguf_lib.ToolManager { public *; }
--keep class com.dark.gguf_lib.CharacterEngine { public *; }
 -keep class com.dark.gguf_lib.EmbeddingEngine { public *; }
 -keep class com.dark.gguf_lib.RAGEngine { public *; }
 -keep class com.dark.gguf_lib.TextDigest { *; }
@@ -38,21 +35,11 @@
 
 # Enums — name()/ordinal() are used at runtime.
 -keep enum com.dark.gguf_lib.DeviceTier { *; }
--keep enum com.dark.gguf_lib.Mood { *; }
--keep enum com.dark.gguf_lib.toolcalling.GrammarMode { *; }
 -keep enum com.dark.gguf_lib.DocKind { *; }
 
 # Public data classes.
 -keep class com.dark.gguf_lib.LoadingParams { *; }
 -keep class com.dark.gguf_lib.GenerationResult { *; }
--keep class com.dark.gguf_lib.Personality { *; }
--keep class com.dark.gguf_lib.ControlVectorConfig { *; }
-
-# Tool calling API.
--keep class com.dark.gguf_lib.toolcalling.ToolCall { *; }
--keep class com.dark.gguf_lib.toolcalling.ToolCallingConfig { *; }
--keep class com.dark.gguf_lib.toolcalling.ToolDefinitionBuilder { public *; }
--keep class com.dark.gguf_lib.toolcalling.ToolDefinitionBuilder$* { public *; }
 
 # Suspend functions generate Continuation subclasses; preserve them.
 -keep class kotlin.coroutines.Continuation

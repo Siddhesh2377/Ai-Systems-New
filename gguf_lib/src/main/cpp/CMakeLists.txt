@@ -47,6 +47,18 @@ set(LLAMA_MULTIMODAL     ON  CACHE BOOL "" FORCE)
 set(GGML_CPU             ON  CACHE BOOL "" FORCE)
 set(GGML_LTO             ON  CACHE BOOL "" FORCE)
 
+# GPU backend — Vulkan only.
+# Headers and libvulkan.so are bundled in the NDK sysroot, so it builds
+# out of the box. Used selectively for VLM vision encode (mtmd's use_gpu
+# flag) — LLM decode stays on CPU because batch=1 loses on Adreno 810
+# (see DEVICE.md for the bench numbers).
+#
+# OpenCL is intentionally OFF: it needs a vendor OpenCL SDK that isn't
+# in the NDK. If you ever need OpenCL alongside, vendor in OpenCL-Headers
+# from Khronos and point `-DOpenCL_INCLUDE_DIR` + `-DOpenCL_LIBRARY` at
+# them, and re-enable here.
+set(GGML_VULKAN          ON  CACHE BOOL "" FORCE)
+
 if(ANDROID_ABI STREQUAL "arm64-v8a")
     # Baseline armv8-a — KleidiAI dispatches dotprod/i8mm/SVE per-device at runtime.
     # armv8.6-a as a global target caused SIGILL on Cortex-A76/A77 without i8mm.
@@ -114,9 +126,9 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
     gguf_lib.cpp
     error_tracker.cpp
     ${LLAMA_DIR}/engine/tn-log.cpp
-    ${LLAMA_DIR}/engine/tool-manager.cpp
     ${LLAMA_DIR}/engine/thread-engine.cpp
     ${LLAMA_DIR}/engine/rag-engine.cpp
+    ${LLAMA_DIR}/engine/vt_cache.cpp
     ${RAG_INGEST_SOURCES}
     ${TEXT_DIGEST_SOURCES}
     ${VLM_SOURCES})

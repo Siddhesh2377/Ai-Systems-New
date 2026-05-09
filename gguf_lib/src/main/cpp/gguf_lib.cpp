@@ -1,6 +1,6 @@
 // JNI bridge for com.dark.gguf_lib. Wraps llama.cpp + the tool-neuron engine
-// helpers (thread-engine, tool-manager, rag-engine, mtmd) and exposes a flat
-// C-callable surface to Kotlin via GGUFNativeLib.
+// helpers (thread-engine, rag-engine, mtmd) and exposes a flat C-callable
+// surface to Kotlin via GGUFNativeLib.
 
 #include <jni.h>
 #include <string>
@@ -23,9 +23,9 @@
 #include "sampling.h"
 #include "chat.h"
 
-#include "tool-manager.h"
 #include "thread-engine.h"
 #include "rag-engine.h"
+#include "vt_cache.h"
 #include "rag_ingest/rag_ingest.h"
 #include "text_digest/text_digest.h"
 #include "error_tracker.h"
@@ -74,13 +74,13 @@ static void ensure_backend_init() {
 // single IsSameObject check per generate call.
 static jclass    g_cb_class            = nullptr;
 static jmethodID g_onToken             = nullptr;
-static jmethodID g_onToolCall          = nullptr;
 static jmethodID g_onDone              = nullptr;
 static jmethodID g_onError             = nullptr;
 static jmethodID g_onMetrics           = nullptr;
 static jmethodID g_onProgress          = nullptr;
 static jmethodID g_onTokenBytes        = nullptr; // zero-copy byte[] fast path
 static jmethodID g_onVlmStageMetrics   = nullptr;
+static jmethodID g_onVlmCacheStatus    = nullptr; // VT cache hit/miss feedback
 
 static jclass    g_embed_cb_class   = nullptr;
 static jmethodID g_embed_onComplete = nullptr;
@@ -95,7 +95,6 @@ static bool ensure_callback_methods(JNIEnv * env, jobject callback) {
     if (g_cb_class) env->DeleteGlobalRef(g_cb_class);
     g_cb_class = (jclass)env->NewGlobalRef(cls);
     g_onToken    = env->GetMethodID(cls, "onToken",    "(Ljava/lang/String;)V");
-    g_onToolCall = env->GetMethodID(cls, "onToolCall", "(Ljava/lang/String;Ljava/lang/String;)V");
     g_onDone     = env->GetMethodID(cls, "onDone",     "()V");
     g_onError    = env->GetMethodID(cls, "onError",    "(Ljava/lang/String;)V");
     g_onMetrics  = env->GetMethodID(cls, "onMetrics",  "(FFFIIFFFF)V");
@@ -104,6 +103,8 @@ static bool ensure_callback_methods(JNIEnv * env, jobject callback) {
     g_onTokenBytes = env->GetMethodID(cls, "onTokenBytes", "([BI)V");
     if (env->ExceptionCheck()) env->ExceptionClear();
     g_onVlmStageMetrics = env->GetMethodID(cls, "onVlmStageMetrics", "(FFI)V");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    g_onVlmCacheStatus = env->GetMethodID(cls, "onVlmCacheStatus", "(ZII)V");
     if (env->ExceptionCheck()) env->ExceptionClear();
     env->DeleteLocalRef(cls);
     return g_onToken && g_onDone && g_onError;
@@ -136,13 +137,6 @@ static struct {
     std::string system_prompt;
     std::string chat_template_override;
 
-    // 0 = STRICT (force tool JSON), 1 = LAZY (model decides)
-    std::string tools_json;
-    int  grammar_mode  = 1;
-    bool typed_grammar = true;
-
-    tool_manager_t * tool_mgr = nullptr;
-
     // 0 = power_saving, 1 = balanced, 2 = performance — drives thread-engine
     int thread_mode = 1;
 
@@ -153,12 +147,6 @@ static struct {
     int                      n_past = 0;
     std::vector<llama_token> prev_prompt_tokens;
     int                      n_system_tokens = 0;
-
-    // persona_biases: set by nativeSetLogitBias, preserved across uncensored toggles.
-    // cached_refusal_ids: vocab-scanned once on first uncensored=true; reused thereafter.
-    std::vector<llama_logit_bias> persona_biases;
-    std::vector<int32_t>          cached_refusal_ids;
-    bool                          refusal_ids_scanned = false;
 
     std::string prompt_cache_dir;
     bool        thinking_enabled = true;
@@ -288,7 +276,7 @@ static std::vector<common_chat_msg> parse_messages_json(const std::string & mess
                 cm.role    = msg.value("role", "user");
                 cm.content = msg.value("content", "");
                 if (cm.role != "system" && cm.role != "user" &&
-                    cm.role != "assistant" && cm.role != "tool") {
+                    cm.role != "assistant") {
                     cm.role = "assistant";
                 }
                 msgs.push_back(cm);
@@ -317,13 +305,8 @@ static const std::vector<std::string> COMMON_STOP_STRINGS = {
 };
 
 struct chat_template_result {
-    std::string                          prompt;
-    std::vector<std::string>             stops;
-    common_chat_format                   format       = COMMON_CHAT_FORMAT_CONTENT_ONLY;
-    std::string                          grammar;
-    bool                                 grammar_lazy = false;
-    std::vector<common_grammar_trigger>  grammar_triggers;
-    std::vector<std::string>             preserved_tokens;
+    std::string              prompt;
+    std::vector<std::string> stops;
 };
 
 static chat_template_result apply_chat_template(const std::vector<common_chat_msg> & messages,
@@ -336,7 +319,6 @@ static chat_template_result apply_chat_template(const std::vector<common_chat_ms
             if (msg.role == "system")         prompt += msg.content + "\n";
             else if (msg.role == "user")      prompt += "User: " + msg.content + "\n";
             else if (msg.role == "assistant") prompt += "Assistant: " + msg.content + "\n";
-            else if (msg.role == "tool")      prompt += "Tool result: " + msg.content + "\n";
         }
         if (add_generation_prompt) prompt += "Assistant:";
         out.prompt = prompt;
@@ -351,56 +333,9 @@ static chat_template_result apply_chat_template(const std::vector<common_chat_ms
     inputs.use_jinja             = true;
     inputs.enable_thinking       = g_state.thinking_enabled;
 
-    if (!g_state.tools_json.empty()) {
-        try {
-            auto tools_j  = json::parse(g_state.tools_json);
-            inputs.tools  = common_chat_tools_parse_oaicompat(tools_j);
-            inputs.tool_choice = (g_state.grammar_mode == 0)
-                ? COMMON_CHAT_TOOL_CHOICE_REQUIRED
-                : COMMON_CHAT_TOOL_CHOICE_AUTO;
-        } catch (...) {
-            LOGW("Failed to parse tools JSON for template");
-        }
-    }
-
-    auto result          = common_chat_templates_apply(g_state.chat_templates.get(), inputs);
-    out.prompt           = result.prompt;
-    out.format           = result.format;
-    out.grammar          = result.grammar;
-    out.grammar_lazy     = result.grammar_lazy;
-    out.grammar_triggers = result.grammar_triggers;
-    out.preserved_tokens = result.preserved_tokens;
-
-    // If the template ignored the tools (CONTENT_ONLY) it means this model's
-    // template has no native tool-call grammar. Fall back to prompt-engineering
-    // by appending the ToolManager-generated description into the system msg.
-    if (out.format == COMMON_CHAT_FORMAT_CONTENT_ONLY &&
-        !g_state.tools_json.empty() && g_state.tool_mgr) {
-        char * tool_prompt = tool_manager_get_prompt(g_state.tool_mgr);
-        if (tool_prompt && tool_prompt[0]) {
-            std::vector<common_chat_msg> augmented = messages;
-            bool found_system = false;
-            for (auto & m : augmented) {
-                if (m.role == "system") {
-                    m.content += "\n\n" + std::string(tool_prompt);
-                    found_system = true;
-                    break;
-                }
-            }
-            if (!found_system) {
-                augmented.insert(augmented.begin(), {"system", std::string(tool_prompt)});
-            }
-            common_chat_templates_inputs aug_inputs;
-            aug_inputs.messages              = augmented;
-            aug_inputs.add_generation_prompt = add_generation_prompt;
-            aug_inputs.use_jinja             = true;
-            auto aug_result = common_chat_templates_apply(g_state.chat_templates.get(), aug_inputs);
-            out.prompt = aug_result.prompt;
-        }
-        tool_manager_free_string(tool_prompt);
-    }
-
-    out.stops = result.additional_stops;
+    auto result = common_chat_templates_apply(g_state.chat_templates.get(), inputs);
+    out.prompt = result.prompt;
+    out.stops  = result.additional_stops;
     out.stops.insert(out.stops.end(), COMMON_STOP_STRINGS.begin(), COMMON_STOP_STRINGS.end());
     return out;
 }
@@ -1143,28 +1078,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStream(
         n_common = 0;
     }
 
-    // Apply grammar constraints for tool calling if available
-    bool grammar_applied = false;
-    common_params_sampling saved_params;
-    if (!tmpl_result.grammar.empty() && !g_state.tools_json.empty()) {
-        saved_params = g_state.sampling_params; // save for restore after generation
-        g_state.sampling_params.grammar = tmpl_result.grammar;
-        g_state.sampling_params.grammar_lazy =
-            (g_state.grammar_mode == 0) ? tmpl_result.grammar_lazy : true;
-        g_state.sampling_params.grammar_triggers = tmpl_result.grammar_triggers;
-        // Resolve preserved_tokens strings to token IDs
-        for (auto & tok_str : tmpl_result.preserved_tokens) {
-            auto ids = tokenize_string(tok_str, false);
-            for (auto id : ids) {
-                g_state.sampling_params.preserved_tokens.insert(id);
-            }
-        }
-        grammar_applied = true;
-        LOGI("Grammar constraints applied for tool calling (lazy=%d, %zu triggers)",
-             g_state.sampling_params.grammar_lazy, tmpl_result.grammar_triggers.size());
-    }
-
-    // reset sampler (with or without grammar)
     rebuild_sampler();
 
     auto t_start = std::chrono::high_resolution_clock::now();
@@ -1177,10 +1090,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStream(
     jni_progress_ctx progress_ctx = { env, callback };
     if (!new_tokens.empty() && !eval_tokens(new_tokens, g_state.n_past,
                                              jni_eval_progress, &progress_ctx)) {
-        if (grammar_applied) {
-            g_state.sampling_params = saved_params;
-            rebuild_sampler();
-        }
         jstring jerr = env->NewStringUTF("Failed to evaluate prompt");
         env->CallVoidMethod(callback, g_onError, jerr);
         env->DeleteLocalRef(jerr);
@@ -1286,71 +1195,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStream(
     }
 
     auto t_end = std::chrono::high_resolution_clock::now();
-
-    // restore sampling params if grammar was applied
-    if (grammar_applied) {
-        g_state.sampling_params = saved_params;
-        rebuild_sampler();
-    }
-
-    // check for tool calls in output (two strategies: template parser + our ToolManager)
-    if (g_onToolCall && !g_state.tools_json.empty()) {
-        bool found_tool_call = false;
-
-        // Strategy 1: llama.cpp template-aware parser (works with models that follow their template)
-        if (g_state.chat_templates) {
-            try {
-                common_chat_parser_params parser_params;
-                parser_params.format = tmpl_result.format;
-
-                auto parsed = common_chat_parse(generated_text, false, parser_params);
-                for (auto & tc : parsed.tool_calls) {
-                    json wrapped;
-                    wrapped["name"] = tc.name;
-                    try {
-                        wrapped["arguments"] = json::parse(tc.arguments);
-                    } catch (...) {
-                        wrapped["arguments"] = tc.arguments;
-                    }
-                    std::string wrapped_str = wrapped.dump();
-
-                    jstring jname = safe_new_string_utf(env, tc.name.c_str());
-                    jstring jargs = safe_new_string_utf(env, wrapped_str.c_str());
-                    env->CallVoidMethod(callback, g_onToolCall, jname, jargs);
-                    env->DeleteLocalRef(jname);
-                    env->DeleteLocalRef(jargs);
-                    found_tool_call = true;
-                    LOGI("Template parsed tool call: %s args=%s", tc.name.c_str(), wrapped_str.c_str());
-                }
-            } catch (const std::exception & e) {
-                LOGW("Template tool call parsing failed: %s", e.what());
-            }
-        }
-
-        // strategy 2: our ToolManager fallback (JSON + XML + function-call)
-        if (!found_tool_call && g_state.tool_mgr) {
-            auto result = tool_manager_parse_output(g_state.tool_mgr, generated_text.c_str());
-            if (result.is_valid) {
-                json wrapped;
-                wrapped["name"] = result.tool_name;
-                try {
-                    wrapped["arguments"] = json::parse(result.arguments_json);
-                } catch (...) {
-                    wrapped["arguments"] = result.arguments_json;
-                }
-                std::string wrapped_str = wrapped.dump();
-
-                jstring jname = safe_new_string_utf(env, result.tool_name);
-                jstring jargs = safe_new_string_utf(env, wrapped_str.c_str());
-                env->CallVoidMethod(callback, g_onToolCall, jname, jargs);
-                env->DeleteLocalRef(jname);
-                env->DeleteLocalRef(jargs);
-                tool_manager_free_string((char *)result.tool_name);
-                tool_manager_free_string((char *)result.arguments_json);
-                LOGI("ToolManager fallback parsed tool call: %s", wrapped_str.c_str());
-            }
-        }
-    }
 
     // metrics
     float prompt_ms = std::chrono::duration<float, std::milli>(t_prompt_done - t_start).count();
@@ -1512,25 +1356,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStreamMultiTurn(
         }
     }
 
-    // apply grammar constraints for tool calling if available
-    bool grammar_applied = false;
-    common_params_sampling saved_params;
-    if (!tmpl_result.grammar.empty() && !g_state.tools_json.empty()) {
-        saved_params = g_state.sampling_params;
-        g_state.sampling_params.grammar = tmpl_result.grammar;
-        g_state.sampling_params.grammar_lazy =
-            (g_state.grammar_mode == 0) ? tmpl_result.grammar_lazy : true;
-        g_state.sampling_params.grammar_triggers = tmpl_result.grammar_triggers;
-        for (auto & tok_str : tmpl_result.preserved_tokens) {
-            auto ids = tokenize_string(tok_str, false);
-            for (auto id : ids) {
-                g_state.sampling_params.preserved_tokens.insert(id);
-            }
-        }
-        grammar_applied = true;
-        LOGI("Grammar constraints applied for tool calling (lazy=%d)", g_state.sampling_params.grammar_lazy);
-    }
-
     rebuild_sampler();
 
     auto t_start = std::chrono::high_resolution_clock::now();
@@ -1543,10 +1368,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStreamMultiTurn(
     jni_progress_ctx mt_progress = { env, callback };
     if (!new_tokens.empty() && !eval_tokens(new_tokens, g_state.n_past,
                                              jni_eval_progress, &mt_progress)) {
-        if (grammar_applied) {
-            g_state.sampling_params = saved_params;
-            rebuild_sampler();
-        }
         jstring jerr = env->NewStringUTF("Failed to evaluate prompt");
         env->CallVoidMethod(callback, g_onError, jerr);
         env->DeleteLocalRef(jerr);
@@ -1637,57 +1458,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStreamMultiTurn(
 
     auto t_end = std::chrono::high_resolution_clock::now();
 
-    if (grammar_applied) {
-        g_state.sampling_params = saved_params;
-        rebuild_sampler();
-    }
-
-    // check for tool calls (two strategies: template parser + our ToolManager)
-    if (g_onToolCall && !g_state.tools_json.empty()) {
-        bool found_tool_call = false;
-
-        if (g_state.chat_templates) {
-            try {
-                common_chat_parser_params parser_params;
-                parser_params.format = tmpl_result.format;
-                auto parsed = common_chat_parse(generated_text, false, parser_params);
-                for (auto & tc : parsed.tool_calls) {
-                    json wrapped;
-                    wrapped["name"] = tc.name;
-                    try { wrapped["arguments"] = json::parse(tc.arguments); }
-                    catch (...) { wrapped["arguments"] = tc.arguments; }
-                    std::string wrapped_str = wrapped.dump();
-                    jstring jname = safe_new_string_utf(env, tc.name.c_str());
-                    jstring jargs = safe_new_string_utf(env, wrapped_str.c_str());
-                    env->CallVoidMethod(callback, g_onToolCall, jname, jargs);
-                    env->DeleteLocalRef(jname);
-                    env->DeleteLocalRef(jargs);
-                    found_tool_call = true;
-                }
-            } catch (const std::exception & e) {
-                LOGW("Template tool call parsing failed: %s", e.what());
-            }
-        }
-
-        if (!found_tool_call && g_state.tool_mgr) {
-            auto result = tool_manager_parse_output(g_state.tool_mgr, generated_text.c_str());
-            if (result.is_valid) {
-                json wrapped;
-                wrapped["name"] = result.tool_name;
-                try { wrapped["arguments"] = json::parse(result.arguments_json); }
-                catch (...) { wrapped["arguments"] = result.arguments_json; }
-                std::string wrapped_str = wrapped.dump();
-                jstring jname = safe_new_string_utf(env, result.tool_name);
-                jstring jargs = safe_new_string_utf(env, wrapped_str.c_str());
-                env->CallVoidMethod(callback, g_onToolCall, jname, jargs);
-                env->DeleteLocalRef(jname);
-                env->DeleteLocalRef(jargs);
-                tool_manager_free_string((char *)result.tool_name);
-                tool_manager_free_string((char *)result.arguments_json);
-            }
-        }
-    }
-
     float prompt_ms = std::chrono::duration<float, std::milli>(t_prompt_done - t_start).count();
     float gen_ms = std::chrono::duration<float, std::milli>(t_end - t_prompt_done).count();
     float total_ms = std::chrono::duration<float, std::milli>(t_end - t_start).count();
@@ -1739,10 +1509,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRelease(JNIEnv *, jobject) {
     g_state.n_system_tokens = 0;
     g_state.system_prompt.clear();
     g_state.chat_template_override.clear();
-    g_state.tools_json.clear();
-    g_state.persona_biases.clear();
-    g_state.cached_refusal_ids.clear();
-    g_state.refusal_ids_scanned = false;
 
     if (g_prompt_batch_cap > 0) {
         llama_batch_free(g_prompt_batch);
@@ -1753,11 +1519,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRelease(JNIEnv *, jobject) {
         llama_batch_free(g_single_batch);
         g_single_batch = {};
         g_single_batch_init = false;
-    }
-
-    if (g_state.tool_mgr) {
-        tool_manager_free(g_state.tool_mgr);
-        g_state.tool_mgr = nullptr;
     }
     LOGI("Model released");
 }
@@ -1807,126 +1568,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGetModelInfo(JNIEnv * env, jobject) 
         LOGE("Failed to get model info: %s", e.what());
         return nullptr;
     }
-}
-
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_dark_gguf_1lib_GGUFNativeLib_nativeIsToolCallingSupported(JNIEnv *, jobject) {
-    if (!g_state.model) return JNI_FALSE;
-
-    // Check if model has a chat template (indicates tool calling support)
-    if (g_state.chat_templates) {
-        return JNI_TRUE;
-    }
-    return JNI_FALSE;
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetToolsJson(
-        JNIEnv * env, jobject, jstring jtoolsJson) {
-    const char * json_cstr = env->GetStringUTFChars(jtoolsJson, nullptr);
-    g_state.tools_json = json_cstr;
-    env->ReleaseStringUTFChars(jtoolsJson, json_cstr);
-
-    // Also register tools with our ToolManager for fallback multi-format parsing
-    if (g_state.tools_json.empty()) {
-        LOGI("Tools JSON set (empty)");
-        return;
-    }
-
-    if (!g_state.tool_mgr) {
-        g_state.tool_mgr = tool_manager_create();
-    }
-    tool_manager_clear(g_state.tool_mgr);
-
-    try {
-        auto tools_j = json::parse(g_state.tools_json);
-        if (tools_j.is_array()) {
-            for (auto & t : tools_j) {
-                std::string name = t.value("name", "");
-                std::string desc;
-
-                // Handle OpenAI-style {"type":"function","function":{...}} format
-                if (t.contains("function") && t["function"].is_object()) {
-                    auto & func = t["function"];
-                    name = func.value("name", name);
-                    desc = func.value("description", "");
-                } else {
-                    desc = t.value("description", "");
-                }
-
-                if (name.empty()) continue;
-
-                // Build param defs from JSON schema
-                std::vector<tool_param_def> params;
-                std::vector<std::string> param_names; // keep strings alive
-                std::vector<std::string> param_descs;
-
-                json props;
-                std::vector<std::string> required_params;
-
-                if (t.contains("function") && t["function"].contains("parameters")) {
-                    auto & schema = t["function"]["parameters"];
-                    if (schema.contains("properties")) props = schema["properties"];
-                    if (schema.contains("required") && schema["required"].is_array()) {
-                        for (auto & r : schema["required"]) required_params.push_back(r.get<std::string>());
-                    }
-                } else if (t.contains("parameters")) {
-                    auto & schema = t["parameters"];
-                    if (schema.contains("properties")) props = schema["properties"];
-                    if (schema.contains("required") && schema["required"].is_array()) {
-                        for (auto & r : schema["required"]) required_params.push_back(r.get<std::string>());
-                    }
-                }
-
-                for (auto & [pname, pval] : props.items()) {
-                    param_names.push_back(pname);
-                    param_descs.push_back(pval.value("description", ""));
-
-                    tool_param_type ptype = TOOL_PARAM_STRING;
-                    std::string type_str = pval.value("type", "string");
-                    if (type_str == "number" || type_str == "integer") ptype = TOOL_PARAM_NUMBER;
-                    else if (type_str == "boolean") ptype = TOOL_PARAM_BOOLEAN;
-                    else if (type_str == "array") ptype = TOOL_PARAM_ARRAY;
-                    else if (type_str == "object") ptype = TOOL_PARAM_OBJECT;
-
-                    bool is_required = false;
-                    for (auto & r : required_params) {
-                        if (r == pname) { is_required = true; break; }
-                    }
-
-                    params.push_back({
-                        param_names.back().c_str(),
-                        param_descs.back().c_str(),
-                        ptype,
-                        is_required
-                    });
-                }
-
-                tool_def td;
-                td.name = name.c_str();
-                td.description = desc.c_str();
-                td.params = params.empty() ? nullptr : params.data();
-                td.n_params = (int32_t)params.size();
-                tool_manager_register(g_state.tool_mgr, &td);
-            }
-        }
-    } catch (const std::exception & e) {
-        LOGW("Failed to register tools with ToolManager: %s", e.what());
-    }
-
-    LOGI("Tools JSON set (%zu chars), ToolManager registered", g_state.tools_json.size());
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetGrammarMode(JNIEnv *, jobject, jint mode) {
-    g_state.grammar_mode = mode;
-    LOGI("Grammar mode set to %d", mode);
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetTypedGrammar(JNIEnv *, jobject, jboolean enabled) {
-    g_state.typed_grammar = enabled;
-    LOGI("Typed grammar %s", enabled ? "enabled" : "disabled");
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -2045,96 +1686,12 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetLogitBias(
             }
         }
 
-        // Save a copy as persona biases so setUncensored can merge without losing them
-        g_state.persona_biases = g_state.sampling_params.logit_bias;
-
-        // Refusal biases are tracked in cached_refusal_ids and re-applied by nativeSetUncensored
-
         rebuild_sampler();
-        LOGI("Logit bias set: %zu persona + merged", g_state.persona_biases.size());
+        LOGI("Logit bias set: %zu entries", g_state.sampling_params.logit_bias.size());
 
     } catch (const std::exception & e) {
         LOGE("Failed to parse logit bias JSON: %s", e.what());
     }
-}
-
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadControlVectors(
-        JNIEnv * env, jobject, jstring jvectorsJson) {
-    if (!g_state.model || !g_state.ctx) return JNI_FALSE;
-
-    const char * json_cstr = env->GetStringUTFChars(jvectorsJson, nullptr);
-    std::string json_str(json_cstr);
-    env->ReleaseStringUTFChars(jvectorsJson, json_cstr);
-
-    try {
-        auto j = json::parse(json_str);
-
-        // Parse control vector paths and scales
-        std::vector<common_control_vector_load_info> cvs;
-        if (j.is_array()) {
-            for (auto & item : j) {
-                common_control_vector_load_info cv;
-                cv.fname = item.value("path", "");
-                cv.strength = item.value("scale", 1.0f);
-                if (!cv.fname.empty()) {
-                    cvs.push_back(cv);
-                }
-            }
-        } else if (j.is_object()) {
-            common_control_vector_load_info cv;
-            cv.fname = j.value("path", "");
-            cv.strength = j.value("scale", 1.0f);
-            if (!cv.fname.empty()) {
-                cvs.push_back(cv);
-            }
-        }
-
-        if (cvs.empty()) {
-            LOGW("No valid control vectors found in JSON");
-            return JNI_FALSE;
-        }
-
-        // Load control vectors
-        auto cvec = common_control_vector_load(cvs);
-        if (cvec.n_embd == -1) {
-            LOGE("Failed to load control vectors");
-            return JNI_FALSE;
-        }
-
-        int n_embd = llama_model_n_embd(g_state.model);
-        if (cvec.n_embd != n_embd) {
-            LOGE("Control vector dimension mismatch: %d vs %d", cvec.n_embd, n_embd);
-            return JNI_FALSE;
-        }
-
-        int err = llama_set_adapter_cvec(g_state.ctx,
-                                          cvec.data.data(),
-                                          cvec.data.size(),
-                                          cvec.n_embd,
-                                          -1, -1);
-        if (err) {
-            LOGE("Failed to apply control vector");
-            return JNI_FALSE;
-        }
-
-        LOGI("Control vectors loaded and applied");
-        return JNI_TRUE;
-
-    } catch (const std::exception & e) {
-        LOGE("Failed to load control vectors: %s", e.what());
-        return JNI_FALSE;
-    }
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_com_dark_gguf_1lib_GGUFNativeLib_nativeClearControlVector(JNIEnv *, jobject) {
-    if (!g_state.ctx) return;
-
-    // Pass nullptr to clear the control vector
-    llama_set_adapter_cvec(g_state.ctx, nullptr, 0, 0, -1, -1);
-
-    LOGI("Control vector cleared");
 }
 
 extern "C" JNIEXPORT jlong JNICALL
@@ -2355,120 +1912,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeReleaseEmbeddingModel(JNIEnv *, jobj
     if (g_embed.model) { llama_model_free(g_embed.model); g_embed.model = nullptr; }
 
     LOGI("Embedding model released");
-}
-
-// Personality / mood: implemented purely as sampler-param presets — no
-// separate model, no extra memory.
-extern "C" JNIEXPORT void JNICALL
-Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetPersonality(
-        JNIEnv * env, jobject, jstring jparamsJson) {
-    std::lock_guard<std::mutex> lock(g_state.gen_mutex);
-    const char * json_cstr = env->GetStringUTFChars(jparamsJson, nullptr);
-    std::string json_str(json_cstr);
-    env->ReleaseStringUTFChars(jparamsJson, json_cstr);
-
-    try {
-        auto j = json::parse(json_str);
-        g_state.sampling_params.temp           = j.value("temperature", 0.7f);
-        g_state.sampling_params.top_p          = j.value("topP", j.value("top_p", 0.9f));
-        g_state.sampling_params.penalty_repeat = j.value("repetitionPenalty", j.value("repetition_penalty", 1.1f));
-        // creativity ∈ [0,1] → min_p ∈ [0.10, 0.02]. Higher creativity = looser filter.
-        float creativity = j.value("creativity", 0.5f);
-        g_state.sampling_params.min_p = 0.1f - creativity * 0.08f;
-        rebuild_sampler();
-    } catch (const std::exception & e) {
-        LOGE("Failed to set personality: %s", e.what());
-    }
-}
-
-// mood index: 0=NEUTRAL 1=HAPPY 2=SAD 3=EXCITED 4=CALM 5=ANGRY 6=CURIOUS
-//             7=CREATIVE 8=FOCUSED 9=CUSTOM
-extern "C" JNIEXPORT void JNICALL
-Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetMood(JNIEnv *, jobject, jint mood) {
-    std::lock_guard<std::mutex> lock(g_state.gen_mutex);
-    static const float mood_temp[]    = { 0.7f, 0.8f, 0.6f, 0.9f, 0.5f, 0.85f, 0.75f, 0.9f, 0.6f, 0.7f };
-    static const float mood_penalty[] = { 1.1f, 1.05f,1.15f,1.0f, 1.2f, 1.0f,  1.1f,  1.0f, 1.15f,1.1f };
-    int m = (int)mood;
-    if (m < 0 || m > 9) m = 0;
-    g_state.sampling_params.temp           = mood_temp[m];
-    g_state.sampling_params.penalty_repeat = mood_penalty[m];
-    rebuild_sampler();
-}
-
-extern "C" JNIEXPORT jstring JNICALL
-Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGetCharacterContext(JNIEnv * env, jobject) {
-    char buf[256];
-    snprintf(buf, sizeof(buf),
-             "{\"temperature\":%.2f,\"top_p\":%.2f,\"penalty\":%.2f}",
-             g_state.sampling_params.temp,
-             g_state.sampling_params.top_p,
-             g_state.sampling_params.penalty_repeat);
-    return safe_new_string_utf(env, buf);
-}
-
-static bool g_uncensored = false;
-
-extern "C" JNIEXPORT void JNICALL
-Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetUncensored(JNIEnv *, jobject, jboolean enabled) {
-    std::lock_guard<std::mutex> lock(g_state.gen_mutex);
-    g_uncensored = (bool)enabled;
-
-    if (enabled && g_state.model) {
-        if (!g_state.refusal_ids_scanned) {
-            const llama_vocab * vocab = llama_model_get_vocab(g_state.model);
-            g_state.cached_refusal_ids.clear();
-
-            static const char * refusal_patterns[] = {
-                "cannot", "can't", "refus", "unable", "won't",
-                "Sorry", "sorry", "apologize", "instead",
-                "suggest", "recommend", "encourage",
-                "clarify", "elaborate", "rephrase",
-                "inappropriate", "unethical", "illegal",
-                "dangerous", "harmful", "unsafe", "immoral",
-                "guidelines", "disclaimer", "advisable",
-                "irresponsible", "unacceptable", "condemn",
-                "consequences", "authorities",
-                "wellbeing", "well-being", "welfare",
-                "concerned", "distress",
-                nullptr
-            };
-
-            int32_t n_vocab = llama_vocab_n_tokens(vocab);
-            for (int32_t id = 0; id < n_vocab; id++) {
-                char buf[256] = {};
-                int len = llama_token_to_piece(vocab, id, buf, sizeof(buf) - 1, 0, true);
-                if (len <= 0) continue;
-                buf[len] = '\0';
-                for (int pi = 0; refusal_patterns[pi]; pi++) {
-                    if (strstr(buf, refusal_patterns[pi])) {
-                        g_state.cached_refusal_ids.push_back(id);
-                        break;
-                    }
-                }
-            }
-            g_state.refusal_ids_scanned = true;
-            LOGI("Refusal scan: %zu tokens cached", g_state.cached_refusal_ids.size());
-        }
-
-        g_state.sampling_params.logit_bias = g_state.persona_biases;
-        for (int32_t id : g_state.cached_refusal_ids) {
-            llama_logit_bias lb;
-            lb.token = id;
-            lb.bias = -100.0f;
-            g_state.sampling_params.logit_bias.push_back(lb);
-        }
-        rebuild_sampler();
-        LOGI("Uncensored ON: suppressing %zu refusal tokens", g_state.cached_refusal_ids.size());
-    } else if (!enabled) {
-        g_state.sampling_params.logit_bias = g_state.persona_biases;
-        rebuild_sampler();
-        LOGI("Uncensored OFF");
-    }
-}
-
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGetUncensored(JNIEnv *, jobject) {
-    return g_uncensored ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -2962,499 +2405,101 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRagImportIndex(
     return rc;
 }
 
-// Agent engine: plan → execute (tool calls) → summarize, on top of g_state.
-// Cached AgentCallback method IDs.
-static jclass    g_agent_cb_class       = nullptr;
-static jmethodID g_agent_onPlan         = nullptr;
-static jmethodID g_agent_onToolCall     = nullptr;
-static jmethodID g_agent_onToolResult   = nullptr;
-static jmethodID g_agent_onToken        = nullptr;
-static jmethodID g_agent_onSummary      = nullptr;
-static jmethodID g_agent_onComplete     = nullptr;
-static jmethodID g_agent_onError        = nullptr;
-static jmethodID g_agent_executeTool    = nullptr; // synchronous Kotlin upcall
 
-static bool ensure_agent_callback_methods(JNIEnv * env, jobject callback) {
-    jclass cls = env->GetObjectClass(callback);
-    if (g_agent_cb_class && env->IsSameObject(cls, g_agent_cb_class)) {
-        env->DeleteLocalRef(cls);
-        return true;
-    }
-    if (g_agent_cb_class) env->DeleteGlobalRef(g_agent_cb_class);
-    g_agent_cb_class = (jclass)env->NewGlobalRef(cls);
-
-    g_agent_onPlan       = env->GetMethodID(cls, "onPlan",       "(Ljava/lang/String;)V");
-    g_agent_onToolCall   = env->GetMethodID(cls, "onToolCall",   "(ILjava/lang/String;Ljava/lang/String;)V");
-    g_agent_onToolResult = env->GetMethodID(cls, "onToolResult", "(ILjava/lang/String;Ljava/lang/String;ZJ)V");
-    g_agent_onToken      = env->GetMethodID(cls, "onToken",      "(Ljava/lang/String;Z)V");
-    g_agent_onSummary    = env->GetMethodID(cls, "onSummary",    "(Ljava/lang/String;)V");
-    g_agent_onComplete   = env->GetMethodID(cls, "onComplete",   "()V");
-    g_agent_onError      = env->GetMethodID(cls, "onError",      "(Ljava/lang/String;)V");
-    g_agent_executeTool  = env->GetMethodID(cls, "executeToolFromNative",
-                                            "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
-
-    env->DeleteLocalRef(cls);
-    return g_agent_onPlan && g_agent_onToolCall && g_agent_onToolResult &&
-           g_agent_onToken && g_agent_onSummary && g_agent_onComplete &&
-           g_agent_onError && g_agent_executeTool;
-}
-
+// VT (Vision Token) cache state. Lazily initialised on first
+// nativeVtCacheInit() call. Owned by Kotlin's GGMLEngine lifecycle.
 static struct {
-    jobject           callback_ref = nullptr;
-    std::string       tool_schemas_json;
-    std::atomic<bool> cancel_flag{false};
-    std::mutex        mutex;
-    bool              initialized = false;
-} g_agent;
+    vt_cache_t * cache = nullptr;
+    std::mutex   mutex;
+} g_vt;
 
-// Caller must hold g_state.gen_mutex. Reads/writes g_state's KV cache directly,
-// so callers must not interleave a chat generation while this runs.
-static std::string agent_generate_text(
-        JNIEnv * env,
-        const std::vector<common_chat_msg> & messages,
-        int max_tokens,
-        bool use_grammar,
-        bool stream_to_callback,
-        bool is_summary) {
-
-    if (!g_state.model || !g_state.ctx) return "";
-
-    // Per-phase tools/grammar swap. The plan/summarize phases pass
-    // use_grammar=false and want free-form text — so we drop tools_json from
-    // the template inputs for those phases. The execute phase forces STRICT
-    // grammar mode so the model produces a valid tool-call JSON.
-    chat_template_result tmpl_result;
-    int  saved_grammar_mode = g_state.grammar_mode;
-    bool tools_swapped      = false;
-    std::string saved_tools;
-    try {
-        if (use_grammar && !g_state.tools_json.empty()) {
-            g_state.grammar_mode = 0;
-        } else {
-            saved_tools = g_state.tools_json;
-            g_state.tools_json.clear();
-            tools_swapped = true;
-        }
-        tmpl_result = apply_chat_template(messages, true);
-    } catch (const std::exception & e) {
-        if (tools_swapped) g_state.tools_json = saved_tools;
-        g_state.grammar_mode = saved_grammar_mode;
-        LOGE("Agent template error: %s", e.what());
-        return "";
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVtCacheInit(
+        JNIEnv * env, jobject, jstring jdir, jlong budgetBytes) {
+    std::lock_guard<std::mutex> lock(g_vt.mutex);
+    if (g_vt.cache) {
+        vt_cache_free(g_vt.cache);
+        g_vt.cache = nullptr;
     }
-    if (tools_swapped) g_state.tools_json = saved_tools;
-    g_state.grammar_mode = saved_grammar_mode;
-
-    auto tokens = tokenize_string(tmpl_result.prompt, true);
-    if (tokens.empty()) return "";
-
-    if (check_prompt_fits((int)tokens.size(), max_tokens) == -1) {
-        LOGW("Agent prompt exceeds context window");
-        return "";
-    }
-
-    bool                   grammar_applied = false;
-    common_params_sampling saved_params;
-    if (use_grammar && !tmpl_result.grammar.empty() && !g_state.tools_json.empty()) {
-        saved_params                              = g_state.sampling_params;
-        g_state.sampling_params.grammar           = tmpl_result.grammar;
-        g_state.sampling_params.grammar_lazy      =
-            (g_state.grammar_mode == 0) ? tmpl_result.grammar_lazy : true;
-        g_state.sampling_params.grammar_triggers  = tmpl_result.grammar_triggers;
-        for (auto & tok_str : tmpl_result.preserved_tokens) {
-            auto ids = tokenize_string(tok_str, false);
-            for (auto id : ids) g_state.sampling_params.preserved_tokens.insert(id);
-        }
-        grammar_applied = true;
-    }
-
-    // Each agent phase is its own prompt — start with a clean KV cache.
-    llama_memory_t mem = llama_get_memory(g_state.ctx);
-    llama_memory_clear(mem, true);
-    g_state.n_past = 0;
-    rebuild_sampler();
-
-    if (!eval_tokens(tokens, g_state.n_past, nullptr, nullptr)) {
-        if (grammar_applied) {
-            g_state.sampling_params = saved_params;
-            rebuild_sampler();
-        }
-        return "";
-    }
-
-    antiprompt_state antiprompt;
-    antiprompt.set_stops(tmpl_result.stops);
-
-    const llama_vocab * vocab = llama_model_get_vocab(g_state.model);
-    std::string         generated;
-    generated.reserve(max_tokens * 4);
-    int n_generated = 0;
-
-    while (n_generated < max_tokens && !g_agent.cancel_flag.load() && !g_state.cancel_flag.load()) {
-        if (!g_state.sampler) break;
-
-        llama_token id = common_sampler_sample(g_state.sampler, g_state.ctx, -1);
-        common_sampler_accept(g_state.sampler, id, true);
-
-        if (llama_vocab_is_eog(vocab, id)) break;
-
-        char buf[256];
-        int n = llama_token_to_piece(vocab, id, buf, sizeof(buf) - 1, 0, true);
-        if (n > 0) {
-            buf[n] = '\0';
-            generated.append(buf, n);
-
-            // Check antiprompt
-            std::string tail(generated.end() - std::min((size_t)64, generated.size()), generated.end());
-            size_t stop_pos = antiprompt.find_stop(tail, (size_t)n, STOP_FULL);
-            if (stop_pos != std::string::npos) {
-                // Trim at stop
-                size_t actual_stop = generated.size() - tail.size() + stop_pos;
-                generated.resize(actual_stop);
-                break;
-            }
-
-            // Stream tokens to callback if requested
-            if (stream_to_callback && g_agent.callback_ref) {
-                jstring jtoken = safe_new_string_utf(env, buf);
-                env->CallVoidMethod(g_agent.callback_ref, g_agent_onToken,
-                                    jtoken, (jboolean)is_summary);
-                env->DeleteLocalRef(jtoken);
-            }
-        }
-
-        // Context shift if needed
-        if (g_state.n_past >= (int)llama_n_ctx(g_state.ctx) - 1) {
-            if (!try_context_shift()) break;
-        }
-
-        llama_batch & sb = get_single_batch();
-        common_batch_clear(sb);
-        common_batch_add(sb, id, g_state.n_past, {0}, true);
-        if (llama_decode(g_state.ctx, sb) != 0) break;
-        g_state.n_past++;
-        n_generated++;
-    }
-
-    // Restore grammar params
-    if (grammar_applied) {
-        g_state.sampling_params = saved_params;
-        rebuild_sampler();
-    }
-
-    LOGI("Agent generated %d tokens (grammar=%d, summary=%d)", n_generated, use_grammar, is_summary);
-    return generated;
+    if (!jdir) return JNI_FALSE;
+    const char * dir = env->GetStringUTFChars(jdir, nullptr);
+    g_vt.cache = vt_cache_create(dir, (int64_t)budgetBytes);
+    env->ReleaseStringUTFChars(jdir, dir);
+    return g_vt.cache ? JNI_TRUE : JNI_FALSE;
 }
 
-struct agent_tool_call {
-    std::string name;
-    std::string args_json;
-    bool        valid = false;
-};
-
-// Tries four strategies in order: chat-template parser, ToolManager
-// fallback, whole-text JSON, embedded JSON object scan.
-static agent_tool_call agent_parse_tool_call(const std::string & text) {
-    agent_tool_call result;
-
-    if (g_state.chat_templates) {
-        try {
-            common_chat_parser_params params;
-            auto parsed = common_chat_parse(text, false, params);
-            if (!parsed.tool_calls.empty()) {
-                auto & tc = parsed.tool_calls[0];
-                result.name      = tc.name;
-                result.args_json = tc.arguments;
-                result.valid     = true;
-                return result;
-            }
-        } catch (...) {}
+extern "C" JNIEXPORT void JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVtCacheRelease(JNIEnv *, jobject) {
+    std::lock_guard<std::mutex> lock(g_vt.mutex);
+    if (g_vt.cache) {
+        vt_cache_free(g_vt.cache);
+        g_vt.cache = nullptr;
     }
+}
 
-    if (g_state.tool_mgr) {
-        auto tm_result = tool_manager_parse_output(g_state.tool_mgr, text.c_str());
-        if (tm_result.is_valid) {
-            result.name      = tm_result.tool_name;
-            result.args_json = tm_result.arguments_json;
-            result.valid     = true;
-            tool_manager_free_string((char *)tm_result.tool_name);
-            tool_manager_free_string((char *)tm_result.arguments_json);
-            return result;
-        }
+extern "C" JNIEXPORT void JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVtCacheClear(JNIEnv *, jobject) {
+    std::lock_guard<std::mutex> lock(g_vt.mutex);
+    if (g_vt.cache) vt_cache_clear(g_vt.cache);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVtCacheSetBudget(
+        JNIEnv *, jobject, jlong bytes) {
+    std::lock_guard<std::mutex> lock(g_vt.mutex);
+    if (g_vt.cache) vt_cache_set_budget(g_vt.cache, (int64_t)bytes);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVtCacheStatsJson(JNIEnv * env, jobject) {
+    std::lock_guard<std::mutex> lock(g_vt.mutex);
+    json info;
+    if (!g_vt.cache) {
+        info["initialized"] = false;
+        return env->NewStringUTF(info.dump().c_str());
     }
+    info["initialized"]  = true;
+    info["total_bytes"]  = vt_cache_total_bytes(g_vt.cache);
+    info["budget_bytes"] = vt_cache_get_budget(g_vt.cache);
+    info["entry_count"]  = vt_cache_count(g_vt.cache);
+    info["hits"]         = vt_cache_hits(g_vt.cache);
+    info["misses"]       = vt_cache_misses(g_vt.cache);
+    return env->NewStringUTF(info.dump().c_str());
+}
 
-    try {
-        auto j = json::parse(text);
-        if (j.contains("name") && j.contains("arguments")) {
-            result.name      = j["name"].get<std::string>();
-            result.args_json = j["arguments"].dump();
-            result.valid     = true;
-            return result;
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVtCacheListEntriesJson(JNIEnv * env, jobject) {
+    std::lock_guard<std::mutex> lock(g_vt.mutex);
+    if (!g_vt.cache) return env->NewStringUTF("[]");
+    int32_t count = 0;
+    auto * entries = vt_cache_list(g_vt.cache, &count);
+    json arr = json::array();
+    for (int32_t i = 0; i < count; i++) {
+        char hex[VT_CACHE_HASH_BYTES * 2 + 1];
+        for (int j = 0; j < VT_CACHE_HASH_BYTES; j++) {
+            snprintf(hex + j*2, 3, "%02x", entries[i].hash[j]);
         }
-    } catch (...) {}
-
-    auto pos = text.find("{\"name\"");
-    if (pos == std::string::npos) pos = text.find("{\"tool_call");
-    if (pos != std::string::npos) {
-        int    depth = 0;
-        size_t end   = pos;
-        for (size_t i = pos; i < text.size(); i++) {
-            if (text[i] == '{') depth++;
-            else if (text[i] == '}') { depth--; if (depth == 0) { end = i + 1; break; } }
-        }
-        if (end > pos) {
-            try {
-                auto j = json::parse(text.substr(pos, end - pos));
-                if (j.contains("name")) {
-                    result.name = j["name"].get<std::string>();
-                    if (j.contains("arguments")) result.args_json = j["arguments"].dump();
-                    result.valid = true;
-                    return result;
-                }
-            } catch (...) {}
-        }
+        arr.push_back({
+            {"hash",           hex},
+            {"n_tokens",       entries[i].n_tokens},
+            {"n_embd",         entries[i].n_embd},
+            {"size_bytes",     entries[i].size_bytes},
+            {"last_access_ms", entries[i].last_access_ms},
+        });
     }
-
-    return result;
+    vt_cache_list_free(entries);
+    return env->NewStringUTF(arr.dump().c_str());
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_dark_gguf_1lib_GGUFNativeLib_nativeInitAgentSystem(
-        JNIEnv * env, jobject, jobject callback, jstring jtoolSchemasJson) {
-
-    std::lock_guard<std::mutex> lock(g_agent.mutex);
-
-    if (!g_state.model || !g_state.ctx) {
-        LOGE("Cannot init agent: no model loaded");
-        return JNI_FALSE;
-    }
-
-    if (!ensure_agent_callback_methods(env, callback)) {
-        LOGE("Failed to resolve agent callback methods");
-        return JNI_FALSE;
-    }
-
-    // Store global ref to callback
-    if (g_agent.callback_ref) env->DeleteGlobalRef(g_agent.callback_ref);
-    g_agent.callback_ref = env->NewGlobalRef(callback);
-
-    // Store tool schemas
-    if (jtoolSchemasJson) {
-        const char * schemas = env->GetStringUTFChars(jtoolSchemasJson, nullptr);
-        g_agent.tool_schemas_json = schemas;
-        env->ReleaseStringUTFChars(jtoolSchemasJson, schemas);
-    }
-
-    g_agent.cancel_flag = false;
-    g_agent.initialized = true;
-
-    LOGI("Agent system initialized with %zu bytes of tool schemas",
-         g_agent.tool_schemas_json.size());
-    return JNI_TRUE;
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRunAgentStep(
-        JNIEnv * env, jobject,
-        jstring juserMessage, jstring jsystemPrompt, jint maxRounds) {
-
-    // Lock both agent and generation mutexes (agent owns generation during its step)
-    std::lock_guard<std::mutex> agent_lock(g_agent.mutex);
-    std::lock_guard<std::mutex> gen_lock(g_state.gen_mutex);
-
-    if (!g_agent.initialized || !g_agent.callback_ref) {
-        LOGE("Agent not initialized");
-        return;
-    }
-    if (!g_state.model || !g_state.ctx) {
-        jstring jerr = safe_new_string_utf(env, "No model loaded");
-        env->CallVoidMethod(g_agent.callback_ref, g_agent_onError, jerr);
-        env->DeleteLocalRef(jerr);
-        return;
-    }
-
-    g_agent.cancel_flag = false;
-
-    const char * user_cstr = env->GetStringUTFChars(juserMessage, nullptr);
-    std::string user_message(user_cstr);
-    env->ReleaseStringUTFChars(juserMessage, user_cstr);
-
-    const char * sys_cstr = env->GetStringUTFChars(jsystemPrompt, nullptr);
-    std::string system_prompt(sys_cstr);
-    env->ReleaseStringUTFChars(jsystemPrompt, sys_cstr);
-
-    // Inject the agent's tool schemas into g_state so apply_chat_template()
-    // sees them during the execute phase. Restored before we return.
-    std::string saved_tools = g_state.tools_json;
-    if (!g_agent.tool_schemas_json.empty()) {
-        g_state.tools_json = g_agent.tool_schemas_json;
-    }
-
-    LOGI("Agent: PLAN phase");
-    {
-        std::vector<common_chat_msg> plan_msgs;
-        plan_msgs.push_back({"system", system_prompt + "\n\nCreate a brief 1-2 sentence plan for this request. Do NOT call any tools yet."});
-        plan_msgs.push_back({"user", user_message});
-
-        std::string plan = agent_generate_text(env, plan_msgs, 256, false, true, false);
-
-        if (g_agent.cancel_flag.load()) {
-            g_state.tools_json = saved_tools;
-            return;
-        }
-
-        if (!plan.empty()) {
-            jstring jplan = safe_new_string_utf(env, plan.c_str());
-            env->CallVoidMethod(g_agent.callback_ref, g_agent_onPlan, jplan);
-            env->DeleteLocalRef(jplan);
-        }
-    }
-
-    // Execute phase: up to maxRounds tool-call iterations.
-    LOGI("Agent phase: EXECUTE (max %d rounds)", maxRounds);
-    struct tool_step {
-        int round;
-        std::string tool_name;
-        std::string args_json;
-        std::string result_json;
-        bool success;
-        long time_ms;
-    };
-    std::vector<tool_step> steps;
-
-    for (int round = 0; round < maxRounds && !g_agent.cancel_flag.load(); round++) {
-        // Build multi-turn context with previous tool call results
-        std::vector<common_chat_msg> exec_msgs;
-        exec_msgs.push_back({"system", system_prompt + "\n\nCall the next tool needed to accomplish the user's request. If no more tools are needed, respond with a plain text summary."});
-        exec_msgs.push_back({"user", user_message});
-
-        // Inject previous tool call / result pairs as alternating assistant/tool messages
-        for (auto & s : steps) {
-            json tc_json;
-            tc_json["name"] = s.tool_name;
-            try { tc_json["arguments"] = json::parse(s.args_json); }
-            catch (...) { tc_json["arguments"] = s.args_json; }
-            exec_msgs.push_back({"assistant", tc_json.dump()});
-            exec_msgs.push_back({"tool", s.result_json});
-        }
-
-        std::string output = agent_generate_text(env, exec_msgs, 300, true, false, false);
-
-        if (g_agent.cancel_flag.load()) break;
-        if (output.empty()) break;
-
-        auto parsed = agent_parse_tool_call(output);
-        if (!parsed.valid) {
-            LOGI("Agent round %d: no tool call, ending execute phase", round);
-            break;
-        }
-
-        jstring jname = safe_new_string_utf(env, parsed.name.c_str());
-        jstring jargs = safe_new_string_utf(env, parsed.args_json.c_str());
-        env->CallVoidMethod(g_agent.callback_ref, g_agent_onToolCall,
-                            (jint)round, jname, jargs);
-        env->DeleteLocalRef(jname);
-        env->DeleteLocalRef(jargs);
-
-        auto t_start = std::chrono::steady_clock::now();
-
-        jstring jexec_name = safe_new_string_utf(env, parsed.name.c_str());
-        jstring jexec_args = safe_new_string_utf(env, parsed.args_json.c_str());
-        jstring jresult = (jstring)env->CallObjectMethod(
-            g_agent.callback_ref, g_agent_executeTool, jexec_name, jexec_args);
-        env->DeleteLocalRef(jexec_name);
-        env->DeleteLocalRef(jexec_args);
-
-        // Pending exceptions from the synchronous upcall MUST be cleared before
-        // any other JNI call — otherwise we hit undefined behaviour.
-        std::string result_str;
-        if (env->ExceptionCheck()) {
-            env->ExceptionDescribe();
-            env->ExceptionClear();
-            if (jresult) env->DeleteLocalRef(jresult);
-            result_str = "{\"error\":\"tool executor threw\"}";
-        } else if (jresult) {
-            const char * res_cstr = env->GetStringUTFChars(jresult, nullptr);
-            result_str = res_cstr ? res_cstr : "";
-            if (res_cstr) env->ReleaseStringUTFChars(jresult, res_cstr);
-            env->DeleteLocalRef(jresult);
-        } else {
-            result_str = "{\"error\":\"null result\"}";
-        }
-
-        auto t_end   = std::chrono::steady_clock::now();
-        long elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
-
-        bool success = result_str.find("\"error\"") == std::string::npos;
-        steps.push_back({round, parsed.name, parsed.args_json, result_str, success, elapsed});
-
-        jstring jresult_str  = safe_new_string_utf(env, result_str.c_str());
-        jstring jresult_name = safe_new_string_utf(env, parsed.name.c_str());
-        env->CallVoidMethod(g_agent.callback_ref, g_agent_onToolResult,
-                            (jint)round, jresult_name, jresult_str,
-                            (jboolean)success, (jlong)elapsed);
-        env->DeleteLocalRef(jresult_str);
-        env->DeleteLocalRef(jresult_name);
-
-        LOGI("Agent round %d: %s → %s (%ld ms)",
-             round, parsed.name.c_str(), success ? "success" : "error", elapsed);
-    }
-
-    if (g_agent.cancel_flag.load()) {
-        g_state.tools_json = saved_tools;
-        return;
-    }
-
-    // Summarize phase.
-    {
-        std::vector<common_chat_msg> sum_msgs;
-        std::string steps_text;
-        for (auto & s : steps) {
-            steps_text += "- " + s.tool_name + "(" + s.args_json + ") → " +
-                          s.result_json.substr(0, 500) + "\n";
-        }
-        sum_msgs.push_back({"system", "Summarize what was accomplished. Be concise and helpful."});
-        sum_msgs.push_back({"user", user_message});
-        sum_msgs.push_back({"assistant", "I executed the following steps:\n" + steps_text});
-        sum_msgs.push_back({"user", "Please provide a clear, concise summary of what you did and the results."});
-
-        std::string summary = agent_generate_text(env, sum_msgs, 512, false, true, true);
-
-        if (!summary.empty() && !g_agent.cancel_flag.load()) {
-            jstring jsummary = safe_new_string_utf(env, summary.c_str());
-            env->CallVoidMethod(g_agent.callback_ref, g_agent_onSummary, jsummary);
-            env->DeleteLocalRef(jsummary);
-        }
-    }
-
-    g_state.tools_json = saved_tools;
-
-    if (!g_agent.cancel_flag.load()) {
-        env->CallVoidMethod(g_agent.callback_ref, g_agent_onComplete);
-    }
-    LOGI("Agent step complete: %zu tool calls", steps.size());
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_com_dark_gguf_1lib_GGUFNativeLib_nativeStopAgent(JNIEnv *, jobject) {
-    g_agent.cancel_flag = true;
-    g_state.cancel_flag = true; // also stop any in-progress generation
-    LOGI("Agent stop requested");
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_com_dark_gguf_1lib_GGUFNativeLib_nativeReleaseAgentSystem(JNIEnv * env, jobject) {
-    std::lock_guard<std::mutex> lock(g_agent.mutex);
-
-    g_agent.cancel_flag = true;
-    if (g_agent.callback_ref) {
-        env->DeleteGlobalRef(g_agent.callback_ref);
-        g_agent.callback_ref = nullptr;
-    }
-    g_agent.tool_schemas_json.clear();
-    g_agent.initialized = false;
-
-    LOGI("Agent system released");
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVtCacheRemove(
+        JNIEnv * env, jobject, jbyteArray jhash) {
+    std::lock_guard<std::mutex> lock(g_vt.mutex);
+    if (!g_vt.cache || !jhash) return JNI_FALSE;
+    if (env->GetArrayLength(jhash) != VT_CACHE_HASH_BYTES) return JNI_FALSE;
+    uint8_t hash[VT_CACHE_HASH_BYTES];
+    env->GetByteArrayRegion(jhash, 0, VT_CACHE_HASH_BYTES, (jbyte *)hash);
+    return vt_cache_remove(g_vt.cache, hash) ? JNI_TRUE : JNI_FALSE;
 }
 
 // VLM (Vision Language Model) state. The mtmd projector context binds n_threads
@@ -3489,6 +2534,10 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmLoadProjector(
     const char * path = env->GetStringUTFChars(jpath, nullptr);
 
     auto params = mtmd_context_params_default();
+    // GPU dispatch is NOT controlled by this flag — it's a coarse hammer that
+    // affects more than just the vision encoder. Real heterogeneous routing
+    // (per-op CPU/GPU placement based on M) is wired through a custom
+    // ggml_backend_sched in the load path. Leave this off.
     params.use_gpu       = false;
     params.n_threads     = nThreads > 0
         ? nThreads
@@ -3587,6 +2636,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGenerateStream(
         JNIEnv * env, jobject,
         jstring jmessagesJson,
         jobjectArray imageDataArray,
+        jobjectArray vtKeysArray,    // optional byte[32][] parallel to images; null = no caching
         jint maxTokens,
         jobject callback) {
 
@@ -3714,6 +2764,16 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGenerateStream(
     llama_pos new_n_past = 0;
     int32_t eval_result = 0;
 
+    // VT cache integration. Each non-text chunk corresponds (by position) to
+    // the next entry in imageDataArray / vtKeysArray. We hash-key per image,
+    // not per chunk, because a single image always produces a single chunk
+    // through mtmd_tokenize. Multi-image prompts get one cache slot each.
+    const int32_t n_embd_inp = llama_model_n_embd_inp(g_state.model);
+    int img_idx = 0;
+    int32_t n_cache_hits = 0;
+    int32_t n_cache_misses = 0;
+    std::vector<float> cached_embd_buf;   // reused across image chunks on hit
+
     const size_t n_chunks_total = mtmd_input_chunks_size(chunks);
     for (size_t ci = 0; ci < n_chunks_total && eval_result == 0; ci++) {
         const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, ci);
@@ -3727,21 +2787,73 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGenerateStream(
                 new_n_past, 0, vlm_n_batch, is_last, &new_n_past);
             t_decode_us += llama_time_us() - t0;
         } else {
-            // Vision / audio encoder forward
-            const int64_t t_enc0 = llama_time_us();
-            eval_result = mtmd_encode_chunk(g_vlm.ctx, chunk);
-            t_encode_us += llama_time_us() - t_enc0;
-            if (eval_result != 0) break;
-
-            float * embd = mtmd_get_output_embd(g_vlm.ctx);
             const int32_t n_tok = (int32_t)mtmd_input_chunk_get_n_tokens(chunk);
             n_image_tokens += n_tok;
+            const size_t n_floats = (size_t)n_tok * (size_t)n_embd_inp;
+
+            // Pull this image's cache key (if any) before the slow path
+            uint8_t  vt_key[VT_CACHE_HASH_BYTES];
+            bool     have_key = false;
+            if (vtKeysArray && img_idx < env->GetArrayLength(vtKeysArray)) {
+                jbyteArray jkey = (jbyteArray)env->GetObjectArrayElement(vtKeysArray, img_idx);
+                if (jkey && env->GetArrayLength(jkey) == VT_CACHE_HASH_BYTES) {
+                    env->GetByteArrayRegion(jkey, 0, VT_CACHE_HASH_BYTES, (jbyte *)vt_key);
+                    have_key = true;
+                }
+                if (jkey) env->DeleteLocalRef(jkey);
+            }
+
+            float * embd = nullptr;
+            bool    cache_hit = false;
+
+            if (have_key && g_vt.cache) {
+                cached_embd_buf.assign(n_floats, 0.0f);
+                int32_t hit_nt = 0, hit_ne = 0;
+                if (vt_cache_lookup(g_vt.cache, vt_key,
+                                    cached_embd_buf.data(), n_floats,
+                                    &hit_nt, &hit_ne)) {
+                    if (hit_nt == n_tok && hit_ne == n_embd_inp) {
+                        embd = cached_embd_buf.data();
+                        cache_hit = true;
+                        n_cache_hits++;
+                        LOGI("VT cache HIT for image %d (%d tokens × %d embd)",
+                             img_idx, hit_nt, hit_ne);
+                    } else {
+                        // Geometry mismatch (different image_max_tokens, etc.).
+                        // Fall through to encode path; treat as miss.
+                        LOGW("VT cache geometry mismatch: cached %dx%d vs expected %dx%d",
+                             hit_nt, hit_ne, n_tok, n_embd_inp);
+                    }
+                }
+            }
+
+            if (g_onVlmCacheStatus && have_key) {
+                env->CallVoidMethod(callback, g_onVlmCacheStatus,
+                                    (jboolean)cache_hit, (jint)n_tok, (jint)n_embd_inp);
+            }
+
+            if (!cache_hit) {
+                // Vision / audio encoder forward
+                const int64_t t_enc0 = llama_time_us();
+                eval_result = mtmd_encode_chunk(g_vlm.ctx, chunk);
+                t_encode_us += llama_time_us() - t_enc0;
+                if (eval_result != 0) break;
+
+                embd = mtmd_get_output_embd(g_vlm.ctx);
+                n_cache_misses++;
+
+                if (have_key && g_vt.cache && embd) {
+                    vt_cache_store(g_vt.cache, vt_key, embd, n_tok, n_embd_inp);
+                }
+            }
 
             const int64_t t_dec0 = llama_time_us();
             eval_result = mtmd_helper_decode_image_chunk(
                 g_vlm.ctx, g_state.ctx, chunk, embd,
                 new_n_past, 0, vlm_n_batch, &new_n_past);
             t_decode_us += llama_time_us() - t_dec0;
+
+            img_idx++;
         }
 
         if (g_onProgress && n_chunks_total > 1) {
@@ -3749,6 +2861,9 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGenerateStream(
             env->CallVoidMethod(callback, g_onProgress, p);
         }
     }
+
+    LOGI("VLM chunks: %d image chunks (%d cache hit, %d miss)",
+         img_idx, n_cache_hits, n_cache_misses);
 
     mtmd_input_chunks_free(chunks);
 

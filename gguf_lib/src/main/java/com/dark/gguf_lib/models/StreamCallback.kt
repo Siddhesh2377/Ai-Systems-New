@@ -6,7 +6,6 @@ package com.dark.gguf_lib.models
  */
 interface StreamCallback {
     fun onToken(token: String)
-    fun onToolCall(name: String, argsJson: String)
     fun onDone()
     fun onError(message: String)
     fun onMetrics(
@@ -39,4 +38,16 @@ interface StreamCallback {
      * Default no-op for backwards compatibility.
      */
     fun onVlmStageMetrics(vlmEncodeMs: Float, vlmDecodeMs: Float, imageTokens: Int) {}
+
+    /**
+     * VT cache hit/miss for a single image chunk. Fired once per image when
+     * a cache key was provided to [nativeVlmGenerateStream]. On hit, the ViT
+     * forward pass is skipped — vlmEncodeMs in the subsequent
+     * [onVlmStageMetrics] event will be ~0.
+     *
+     * @param hit     true → cached embeddings reused; false → encoder ran fresh
+     * @param nTokens Number of image embedding tokens
+     * @param nEmbd   Per-token embedding dimension (`llama_model_n_embd_inp`)
+     */
+    fun onVlmCacheStatus(hit: Boolean, nTokens: Int, nEmbd: Int) {}
 }

@@ -41,6 +41,7 @@ android {
 
 dependencies {
     implementation(project(":ai_sd"))
+    implementation(project(":gguf_lib"))
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.compose.material3)

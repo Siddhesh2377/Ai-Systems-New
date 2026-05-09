@@ -1,6 +1,5 @@
 package com.dark.gguf_lib
 
-import com.dark.gguf_lib.models.AgentCallback
 import com.dark.gguf_lib.models.EmbeddingCallback
 import com.dark.gguf_lib.models.StreamCallback
 
@@ -8,10 +7,10 @@ import com.dark.gguf_lib.models.StreamCallback
  * Low-level JNI bridge to llama.cpp + tool-neuron engine helpers.
  *
  * Consumers should not call this directly — use the higher-level wrappers
- * ([GGMLEngine], [ToolManager], [CharacterEngine], [EmbeddingEngine],
- * [RAGEngine]) instead. Names and signatures here are load-bearing —
- * `consumer-rules.pro` keeps every native method by name, and the C++ side
- * looks them up via JNI auto-discovery (no `RegisterNatives`).
+ * ([GGMLEngine], [EmbeddingEngine], [RAGEngine]) instead. Names and
+ * signatures here are load-bearing — `consumer-rules.pro` keeps every
+ * native method by name, and the C++ side looks them up via JNI
+ * auto-discovery (no `RegisterNatives`).
  */
 internal object GGUFNativeLib {
 
@@ -67,14 +66,6 @@ internal object GGUFNativeLib {
 
     external fun nativeStopGeneration()
 
-    external fun nativeIsToolCallingSupported(): Boolean
-    external fun nativeSetToolsJson(toolsJson: String)
-    external fun nativeSetGrammarMode(mode: Int)
-    external fun nativeSetTypedGrammar(enabled: Boolean)
-
-    external fun nativeLoadControlVectors(vectorsJson: String): Boolean
-    external fun nativeClearControlVector()
-
     external fun nativeGetStateSize(): Long
     external fun nativeGetContextUsage(): Float
     external fun nativeStateSaveToFile(path: String): Boolean
@@ -86,11 +77,6 @@ internal object GGUFNativeLib {
     /** Apply eviction immediately — useful after a long prefill. */
     external fun nativeEvictToBudget()
 
-    external fun nativeSetPersonality(paramsJson: String)
-    external fun nativeSetMood(mood: Int)
-    external fun nativeGetCharacterContext(): String
-    external fun nativeSetUncensored(enabled: Boolean)
-    external fun nativeGetUncensored(): Boolean
     external fun nativeSupportsThinking(): Boolean
     external fun nativeSetThinkingEnabled(enabled: Boolean)
 
@@ -186,11 +172,6 @@ internal object GGUFNativeLib {
 
     external fun nativeReleaseRagEngine()
 
-    external fun nativeInitAgentSystem(callback: AgentCallback, toolSchemasJson: String): Boolean
-    external fun nativeRunAgentStep(userMessage: String, systemPrompt: String, maxRounds: Int)
-    external fun nativeStopAgent()
-    external fun nativeReleaseAgentSystem()
-
     /**
      * Load a vision/audio projector (mmproj GGUF) onto the currently loaded text model.
      *
@@ -218,11 +199,42 @@ internal object GGUFNativeLib {
     /**
      * Generate from text + images. messagesJson must contain image markers
      * (from [nativeVlmGetDefaultMarker]) where each image should appear.
+     *
+     * @param vtKeys Optional 32-byte SHA256 keys, parallel to [imageData].
+     *   Pass null (or null entries) to skip the VT cache for that image.
+     *   When the cache is initialised and a key is provided, native first
+     *   tries [vt_cache_lookup]; on hit it skips the ~10s ViT pass entirely.
      */
     external fun nativeVlmGenerateStream(
         messagesJson: String,
         imageData: Array<ByteArray>,
+        vtKeys: Array<ByteArray>?,
         maxTokens: Int,
         callback: StreamCallback,
     ): Boolean
+
+    // ── VT (Vision Token) cache ─────────────────────────────────────────────
+    //
+    // Content-addressed store for ViT-encoded image embeddings. Survives
+    // process restarts. LRU-evicted when total bytes exceeds the budget.
+
+    /** Open the cache at [dir] with [budgetBytes] (0 = default 200 MB). */
+    external fun nativeVtCacheInit(dir: String, budgetBytes: Long): Boolean
+
+    /** Close the cache. Files on disk persist; only the in-memory index is freed. */
+    external fun nativeVtCacheRelease()
+
+    /** Drop every entry from disk and reset stats. */
+    external fun nativeVtCacheClear()
+
+    external fun nativeVtCacheSetBudget(bytes: Long)
+
+    /** Returns JSON: `{initialized, total_bytes, budget_bytes, entry_count, hits, misses}`. */
+    external fun nativeVtCacheStatsJson(): String
+
+    /** Returns JSON array of `{hash, n_tokens, n_embd, size_bytes, last_access_ms}`. */
+    external fun nativeVtCacheListEntriesJson(): String
+
+    /** Drop a single entry by 32-byte hash. Returns true if it was present. */
+    external fun nativeVtCacheRemove(hash: ByteArray): Boolean
 }

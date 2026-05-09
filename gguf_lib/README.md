@@ -9,15 +9,13 @@ ARM-optimized).
 ```
 Kotlin SDK
   GGMLEngine          model load/unload, generation, KV cache, thread mode, VLM
-  CharacterEngine     personality, mood, uncensored mode (sampler-level)
-  ToolManager         tool registration, grammar mode, multi-format parsing
   RAGEngine           late-chunking retrieval, binary quantization index
   EmbeddingEngine     standalone text embedding
   TextDigest          extractive summarization (CPU-only, no model)
     |                 (GGUFNativeLib — internal JNI bridge)
 gguf_lib.so           JNI + engine sources compiled into a single .so
     |
-llama.cpp engine/     thread-engine, tool-manager, rag-engine, mtmd (VLM)
+llama.cpp engine/     thread-engine, rag-engine, mtmd (VLM)
 llama.cpp src/        model loading, tokenization, inference, sampling
 ggml/                 CPU backend — NEON, i8mm, dotprod, KleidiAI ARM kernels
 ```
@@ -80,7 +78,6 @@ engine.generateFlow("Hello!", maxTokens = 512).collect { event ->
         is GenerationEvent.Token    -> print(event.text)
         is GenerationEvent.Done     -> {}
         is GenerationEvent.Metrics  -> log(event.metrics.tokensPerSecond)
-        is GenerationEvent.ToolCall -> handleTool(event.name, event.argsJson)
         is GenerationEvent.Error    -> log(event.message)
         is GenerationEvent.Progress -> updateProgress(event.progress)
         else -> {}
@@ -131,21 +128,6 @@ engine.stateLoadFromFile("$filesDir/session.bin")
 engine.setPromptCacheDir(context.cacheDir.absolutePath)
 ```
 
-## Tool calling
-
-```kotlin
-val weather = ToolDefinitionBuilder("get_weather", "Get current weather")
-    .stringParam("location", "City name", required = true)
-    .build()
-
-val toolManager = ToolManager(engine)
-toolManager.registerTools(listOf(weather), ToolCallingConfig(grammarMode = GrammarMode.LAZY))
-
-// Tool calls arrive via GenerationEvent.ToolCall during generate flows.
-```
-
-Grammar modes: `STRICT` forces tool-call output; `LAZY` lets the model choose.
-
 ## Vision (VLM)
 
 ```kotlin
@@ -187,24 +169,6 @@ rag.importIndex(blob!!)
 
 rag.close()
 ```
-
-## Character / personality
-
-```kotlin
-val character = CharacterEngine(engine)
-
-character.setPersonality(Personality(
-    name        = "Luna",
-    persona     = "A warm, empathetic assistant",
-    temperature = 0.8f,
-    creativity  = 0.7f,
-))
-character.setMood(Mood.HAPPY)
-character.setUncensored(true)  // vocab-scan + logit bias on first call, cached
-```
-
-All personality/mood/uncensored state lives purely in sampler params — no
-extra model, no extra memory.
 
 ## Embedding (standalone)
 

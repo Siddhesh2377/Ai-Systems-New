@@ -5,22 +5,19 @@ import android.net.Uri
 import com.dark.gguf_lib.models.DecodingMetrics
 import com.dark.gguf_lib.models.GenerationEvent
 import com.dark.gguf_lib.models.StreamCallback
-import com.dark.gguf_lib.toolcalling.ToolCallingConfig
-import com.dark.gguf_lib.toolcalling.ToolDefinitionBuilder
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import org.json.JSONArray
 
 /**
  * On-device GGUF inference engine — primary entry point of the SDK.
  *
- * Wraps llama.cpp via JNI with Flow-based streaming generation, tool calling,
- * a sampler-level personality engine, embeddings, RAG, VLM (vision), and KV
- * cache state persistence. One model is loaded at a time, app-wide.
+ * Wraps llama.cpp via JNI with Flow-based streaming generation, embeddings,
+ * RAG, VLM (vision), and KV cache state persistence. One model is loaded
+ * at a time, app-wide.
  *
  * Threading
  * ---------
@@ -267,10 +264,9 @@ class GGMLEngine {
      * Single-turn streaming generation as a [Flow] of [GenerationEvent].
      *
      * The flow emits [GenerationEvent.Token] chunks during decode, optionally
-     * [GenerationEvent.ToolCall] / [GenerationEvent.Progress] /
-     * [GenerationEvent.Metrics] / [GenerationEvent.Error], and terminates with
-     * [GenerationEvent.Done]. Cancelling the collector calls [stopGeneration]
-     * on the native side.
+     * [GenerationEvent.Progress] / [GenerationEvent.Metrics] /
+     * [GenerationEvent.Error], and terminates with [GenerationEvent.Done].
+     * Cancelling the collector calls [stopGeneration] on the native side.
      */
     fun generateFlow(prompt: String, maxTokens: Int = 4096): Flow<GenerationEvent> = callbackFlow {
         val cb = streamCallback(::trySend, ::close)
@@ -287,7 +283,7 @@ class GGMLEngine {
      * Multi-turn streaming generation. Same event model as [generateFlow].
      *
      * @param messagesJson JSON array of `{role, content}` objects. Roles:
-     *                     `system`, `user`, `assistant`, `tool`. Anything else
+     *                     `system`, `user`, `assistant`. Anything else
      *                     is remapped to `assistant` on the native side.
      */
     fun generateMultiTurnFlow(messagesJson: String, maxTokens: Int = 4096): Flow<GenerationEvent> = callbackFlow {
@@ -309,7 +305,6 @@ class GGMLEngine {
 
         val cb = object : StreamCallback {
             override fun onToken(token: String) { text.append(token) }
-            override fun onToolCall(name: String, argsJson: String) {}
             override fun onDone() {}
             override fun onError(message: String) { error = message }
             override fun onMetrics(
@@ -331,43 +326,6 @@ class GGMLEngine {
 
     /** Request the current generation to stop. Idempotent; cheap. */
     fun stopGeneration() = GGUFNativeLib.nativeStopGeneration()
-
-    /**
-     * Enable tool calling with a list of tool definitions.
-     *
-     * @param config Grammar mode + typed grammar toggle. STRICT forces a tool
-     *               call; LAZY lets the model choose between text and tools.
-     */
-    fun enableToolCalling(
-        tools: List<ToolDefinitionBuilder.ToolDefinition>,
-        config: ToolCallingConfig = ToolCallingConfig(),
-    ) {
-        val arr = JSONArray()
-        tools.forEach { arr.put(it.toOpenAIFormat()) }
-        GGUFNativeLib.nativeSetToolsJson(arr.toString())
-        GGUFNativeLib.nativeSetGrammarMode(config.grammarMode.value)
-        GGUFNativeLib.nativeSetTypedGrammar(config.useTypedGrammar)
-    }
-
-    /** Set tools from a raw OpenAI-format JSON string. Pass `""` to disable. */
-    fun setToolsJson(toolsJson: String) = GGUFNativeLib.nativeSetToolsJson(toolsJson)
-
-    /** Disable tool calling. */
-    fun clearTools() = GGUFNativeLib.nativeSetToolsJson("")
-
-    /** Whether the loaded model's chat template supports tool calling. */
-    fun isToolCallingSupported(): Boolean = loaded && GGUFNativeLib.nativeIsToolCallingSupported()
-
-    /**
-     * Load control vectors for personality / emotional tuning.
-     *
-     * @param vectorsJson JSON array `[{"path":"/path/to/vec.gguf","scale":1.0}, ...]`.
-     */
-    fun loadControlVectors(vectorsJson: String): Boolean =
-        GGUFNativeLib.nativeLoadControlVectors(vectorsJson)
-
-    /** Clear any active control vectors. */
-    fun clearControlVector() = GGUFNativeLib.nativeClearControlVector()
 
     /** Bytes needed to serialize the current KV cache state. */
     fun getStateSize(): Long = if (loaded) GGUFNativeLib.nativeGetStateSize() else 0
@@ -464,16 +422,25 @@ class GGMLEngine {
      * contain the marker from [getVlmDefaultMarker] at each image's position.
      *
      * @param imageData Raw file bytes (JPEG/PNG) for each image.
+     * @param vtKeys Optional 32-byte SHA256 keys, parallel to [imageData]. When
+     *   non-null and the VT cache is initialised, cached embeddings short-circuit
+     *   the vision encoder. Use [computeVtKey] to derive a canonical key.
      */
     fun generateVlmFlow(
         messagesJson: String,
         imageData: List<ByteArray>,
         maxTokens: Int = 4096,
+        vtKeys: List<ByteArray?>? = null,
     ): Flow<GenerationEvent> = callbackFlow {
         val cb = streamCallback(::trySend, ::close)
+        val keysArray: Array<ByteArray>? = vtKeys?.let { keys ->
+            // Replace null entries with zero-length arrays so JNI sees a stable
+            // jobjectArray; native side checks length == 32 before using a slot.
+            Array(keys.size) { i -> keys[i] ?: ByteArray(0) }
+        }
         val job = launch(Dispatchers.IO) {
             GGUFNativeLib.nativeVlmGenerateStream(
-                messagesJson, imageData.toTypedArray(), maxTokens, cb,
+                messagesJson, imageData.toTypedArray(), keysArray, maxTokens, cb,
             )
         }
         awaitClose {
@@ -481,6 +448,45 @@ class GGMLEngine {
             GGUFNativeLib.nativeStopGeneration()
         }
     }
+
+    /**
+     * Canonical VT-cache key for an image.
+     *
+     * SHA256 of: image bytes ∥ projector identity ∥ image_max_tokens.
+     * Two different JPEG/PNG encodings of the same picture intentionally hit
+     * different cache slots — caching is byte-content-addressed for simplicity.
+     * If you want pixel-content addressing, decode + re-encode at a canonical
+     * resolution before calling this.
+     */
+    fun computeVtKey(
+        imageBytes: ByteArray,
+        projectorPath: String,
+        imageMaxTokens: Int,
+    ): ByteArray {
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+        md.update(imageBytes)
+        md.update(projectorPath.toByteArray(Charsets.UTF_8))
+        md.update(byteArrayOf(
+            (imageMaxTokens shr 24).toByte(),
+            (imageMaxTokens shr 16).toByte(),
+            (imageMaxTokens shr 8).toByte(),
+            imageMaxTokens.toByte(),
+        ))
+        return md.digest()
+    }
+
+    // ── VT cache management ──────────────────────────────────────────────
+
+    /** Initialise the VT cache. Call once after [load] (or any time before generate). */
+    fun vtCacheInit(dir: String, budgetBytes: Long = 200L * 1024L * 1024L): Boolean =
+        GGUFNativeLib.nativeVtCacheInit(dir, budgetBytes)
+
+    fun vtCacheRelease()                  = GGUFNativeLib.nativeVtCacheRelease()
+    fun vtCacheClear()                    = GGUFNativeLib.nativeVtCacheClear()
+    fun vtCacheSetBudget(bytes: Long)     = GGUFNativeLib.nativeVtCacheSetBudget(bytes)
+    fun vtCacheStatsJson(): String        = GGUFNativeLib.nativeVtCacheStatsJson()
+    fun vtCacheListEntriesJson(): String  = GGUFNativeLib.nativeVtCacheListEntriesJson()
+    fun vtCacheRemove(hash: ByteArray): Boolean = GGUFNativeLib.nativeVtCacheRemove(hash)
 
     companion object {
         /** Categorize the host device by total RAM. */
@@ -505,14 +511,11 @@ class GGMLEngine {
     }
 }
 
-// Builds a StreamCallback that forwards every native event onto the supplied
-// channel-send + close lambdas. Used by all three generate Flows.
 private inline fun streamCallback(
     crossinline send: (GenerationEvent) -> Unit,
     crossinline close: () -> Unit,
 ): StreamCallback = object : StreamCallback {
     override fun onToken(token: String) { send(GenerationEvent.Token(token)) }
-    override fun onToolCall(name: String, argsJson: String) { send(GenerationEvent.ToolCall(name, argsJson)) }
     override fun onDone() { send(GenerationEvent.Done); close() }
     override fun onError(message: String) { send(GenerationEvent.Error(message)); close() }
     override fun onProgress(progress: Float) { send(GenerationEvent.Progress(progress)) }
@@ -528,6 +531,9 @@ private inline fun streamCallback(
     }
     override fun onVlmStageMetrics(vlmEncodeMs: Float, vlmDecodeMs: Float, imageTokens: Int) {
         send(GenerationEvent.VlmStageMetrics(vlmEncodeMs, vlmDecodeMs, imageTokens))
+    }
+    override fun onVlmCacheStatus(hit: Boolean, nTokens: Int, nEmbd: Int) {
+        send(GenerationEvent.VtCacheStatus(hit, nTokens, nEmbd))
     }
 }
 
