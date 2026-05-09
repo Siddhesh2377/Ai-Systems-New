@@ -26,7 +26,7 @@ import org.json.JSONObject
  */
 class VlmViewModel(app: Application) : AndroidViewModel(app) {
 
-    val spec: VlmModelSpec = VlmModelSpec.QWEN3_VL_2B
+    val spec: VlmModelSpec = VlmModelSpec.LFM2_VL_450M
     private val downloader = VlmModelDownloader(app)
     private val engine = GGMLEngine()
 
@@ -48,10 +48,19 @@ class VlmViewModel(app: Application) : AndroidViewModel(app) {
      */
     private val chatTemplatePrefix: String = "<__image__>\n"
 
+    /** UI-controllable image quality. Affects ViT compute, prefill batch size, and cache entry size. */
+    private val _imageQuality = MutableStateFlow(com.dark.gguf_lib.ImageQuality.MEDIUM)
+    val imageQuality: StateFlow<com.dark.gguf_lib.ImageQuality> = _imageQuality.asStateFlow()
+    fun setImageQuality(q: com.dark.gguf_lib.ImageQuality) { _imageQuality.value = q }
+
     private val _state = MutableStateFlow<VlmState>(VlmState.Idle)
     val state: StateFlow<VlmState> = _state.asStateFlow()
 
+    private val _prewarmState = MutableStateFlow<PrewarmState>(PrewarmState.Idle)
+    val prewarmState: StateFlow<PrewarmState> = _prewarmState.asStateFlow()
+
     private var generationJob: Job? = null
+    private var prewarmJob: Job? = null
 
     val modelDownloaded: Boolean get() = downloader.isFullyDownloaded(spec)
     val isLoaded: Boolean get() = engine.isLoaded
@@ -200,6 +209,7 @@ class VlmViewModel(app: Application) : AndroidViewModel(app) {
                     maxTokens = 512,
                     vtKeys = vtKey?.let { listOf(it) },
                     vlmKvKey = vlmKvKey,
+                    imageQuality = _imageQuality.value,
                 ).collect { event ->
                     when (event) {
                         is GenerationEvent.Token -> {
@@ -286,24 +296,130 @@ class VlmViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * Fire-and-forget background ViT pre-encode for [imageBytes]. Stores into
-     * the VT cache so the first generate() against this image skips the
-     * vision encoder (~9s saved on 7s Gen 3). No-op if the engine isn't
-     * loaded or the cache isn't initialised.
+     * Fire-and-forget background pre-warm for [imageBytes]. Runs BOTH the
+     * vision encoder AND the LLM image-prefill, populating both caches so
+     * the first generate() against this image gets sub-second TTFT (no ViT,
+     * no image-prefill — only the user-question text decode).
+     *
+     * The pre-warm uses a canonical message that matches the structure
+     * generate() builds (`<__image__>\n`), so the cache key derivation
+     * lines up. No-op if the engine isn't loaded or the caches aren't
+     * initialised.
      */
     fun precomputeVisionFor(imageBytes: ByteArray) {
-        if (!engine.isLoaded || !engine.isVlmLoaded || !vtCacheReady) return
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching {
-                val ok = engine.precomputeVisionEmbeddings(
-                    imageBytes     = imageBytes,
-                    projectorPath  = projectorPath,
-                    imageMaxTokens = imageMaxTokens,
+        if (!engine.isLoaded || !engine.isVlmLoaded) {
+            _prewarmState.value = PrewarmState.Idle
+            return
+        }
+        // Cancel any in-flight pre-warm — newer image takes precedence.
+        prewarmJob?.cancel()
+        prewarmJob = viewModelScope.launch(Dispatchers.IO) {
+            val t0 = System.currentTimeMillis()
+            _prewarmState.value = PrewarmState.InProgress(startedAt = t0)
+            try {
+                val marker = engine.getVlmDefaultMarker()
+                val pre = JSONArray().apply {
+                    put(JSONObject().apply {
+                        put("role", "user")
+                        put("content", "$marker\n")
+                    })
+                }.toString()
+
+                val vtKey = if (vtCacheReady) {
+                    engine.computeVtKey(imageBytes, projectorPath, imageMaxTokens)
+                } else null
+
+                if (!vlmKvCacheReady) {
+                    // Fallback: ViT-only pre-warm if VLM-KV cache isn't open.
+                    val ok = vtKey?.let {
+                        engine.precomputeVisionEmbeddings(imageBytes, it, _imageQuality.value)
+                    } ?: false
+                    val dt = System.currentTimeMillis() - t0
+                    _prewarmState.value = PrewarmState.Done(durationMs = dt, cached = ok)
+                    return@launch
+                }
+
+                val vlmKvKey = engine.computeVlmKvKey(
+                    imageBytes         = imageBytes,
+                    projectorPath      = projectorPath,
+                    imageMaxTokens     = imageMaxTokens,
+                    modelFingerprint   = modelFingerprint,
+                    systemPrompt       = "",
+                    chatTemplatePrefix = chatTemplatePrefix,
                 )
-                android.util.Log.i("VlmViewModel", "ViT precompute done (cached=$ok)")
+
+                var totalChunks = 0
+                var blobBytes   = 0L
+                var nTokens     = 0
+
+                engine.precomputeVlmKvStateFlow(
+                    messagesJson = pre,
+                    imageBytes   = imageBytes,
+                    vlmKvKey     = vlmKvKey,
+                    vtKey        = vtKey,
+                    imageQuality = _imageQuality.value,
+                ).collect { ev ->
+                    when (ev) {
+                        is com.dark.gguf_lib.VlmPrewarmEvent.Started -> {
+                            totalChunks = ev.totalChunks
+                            _prewarmState.value = PrewarmState.InProgress(
+                                startedAt   = t0,
+                                stage       = "Starting (${ev.totalChunks} chunks)…",
+                                totalChunks = ev.totalChunks,
+                            )
+                        }
+                        is com.dark.gguf_lib.VlmPrewarmEvent.ChunkStart -> {
+                            val verb = if (ev.isImage) "Encoding image" else "Decoding text"
+                            _prewarmState.value = PrewarmState.InProgress(
+                                startedAt    = t0,
+                                stage        = "$verb chunk ${ev.index + 1}/${ev.total}…",
+                                chunkIndex   = ev.index,
+                                totalChunks  = ev.total,
+                            )
+                        }
+                        is com.dark.gguf_lib.VlmPrewarmEvent.ChunkDone -> {
+                            // Bump the index to "completed" so the bar advances.
+                            _prewarmState.value = PrewarmState.InProgress(
+                                startedAt    = t0,
+                                stage        = "Decoding into LLM (chunk ${ev.index + 1}/${ev.total})…",
+                                chunkIndex   = ev.index + 1,
+                                totalChunks  = ev.total,
+                                lastEncodeMs = ev.encodeMs.takeIf { it > 0f },
+                                lastDecodeMs = ev.decodeMs.takeIf { it > 0f },
+                            )
+                        }
+                        is com.dark.gguf_lib.VlmPrewarmEvent.StateStored -> {
+                            blobBytes = ev.blobBytes
+                            nTokens   = ev.nTokens
+                            _prewarmState.value = PrewarmState.InProgress(
+                                startedAt   = t0,
+                                stage       = "Saving KV state (${ev.blobBytes / 1024} KB)…",
+                                chunkIndex  = totalChunks,
+                                totalChunks = totalChunks,
+                            )
+                        }
+                        is com.dark.gguf_lib.VlmPrewarmEvent.Done -> {
+                            _prewarmState.value = PrewarmState.Done(
+                                durationMs  = ev.totalMs,
+                                cached      = ev.cached,
+                                totalChunks = totalChunks,
+                                blobBytes   = blobBytes,
+                                nTokens     = nTokens,
+                            )
+                        }
+                        is com.dark.gguf_lib.VlmPrewarmEvent.Error -> {
+                            _prewarmState.value = PrewarmState.Failed(ev.message)
+                        }
+                    }
+                }
+            } catch (t: Throwable) {
+                _prewarmState.value = PrewarmState.Failed(t.message ?: t::class.java.simpleName)
             }
         }
     }
+
+    /** Reset prewarm state — call from the UI when a fresh image is being picked. */
+    fun resetPrewarm() { _prewarmState.value = PrewarmState.Idle }
 
     /** Drop every cached VT entry from disk. */
     fun clearVtCache() {

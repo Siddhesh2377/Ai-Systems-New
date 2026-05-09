@@ -89,6 +89,103 @@ static void ensure_backend_init() {
     });
 }
 
+// ── Image quality presets ───────────────────────────────────────────────
+//
+// Maps the 3-level Kotlin enum to a max-side-px target. The native side
+// downsamples the decoded bitmap to this max dimension (preserving aspect
+// ratio) before handing it to mtmd. The projector then does its own internal
+// resize to the model's preferred input size — feeding it a smaller bitmap
+// just means less work in the projector + smaller token counts.
+//
+// LOW    — heavy downscale, lowest fidelity, fastest encode
+// MEDIUM — sane mobile default, matches LFM2-VL's native ~512² regime
+// HIGH   — passthrough; no resize
+constexpr int IMG_Q_LOW    = 0;
+constexpr int IMG_Q_MEDIUM = 1;
+constexpr int IMG_Q_HIGH   = 2;
+
+static int max_side_for_quality(int q) {
+    switch (q) {
+        case IMG_Q_LOW:    return 384;
+        case IMG_Q_MEDIUM: return 768;
+        case IMG_Q_HIGH:   return 0;        // 0 = no cap
+        default:           return 768;       // unknown → MEDIUM
+    }
+}
+
+// Plain bilinear downsample of a packed RGB image. Assumes 3 channels per
+// pixel, src layout = row-major. Writes into caller-provided dst buffer of
+// size dw*dh*3. Upscaling is allowed but uncommon — this is meant for
+// downscale-before-encode.
+static void resize_rgb_bilinear(const unsigned char * src, int sw, int sh,
+                                unsigned char * dst, int dw, int dh) {
+    if (dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0) return;
+    const float fx = (float)sw / (float)dw;
+    const float fy = (float)sh / (float)dh;
+    for (int y = 0; y < dh; y++) {
+        const float sy_f = (y + 0.5f) * fy - 0.5f;
+        int sy0 = (int)std::floor(sy_f);
+        int sy1 = sy0 + 1;
+        const float wy1 = sy_f - sy0;
+        const float wy0 = 1.0f - wy1;
+        if (sy0 < 0) sy0 = 0;
+        if (sy1 >= sh) sy1 = sh - 1;
+
+        for (int x = 0; x < dw; x++) {
+            const float sx_f = (x + 0.5f) * fx - 0.5f;
+            int sx0 = (int)std::floor(sx_f);
+            int sx1 = sx0 + 1;
+            const float wx1 = sx_f - sx0;
+            const float wx0 = 1.0f - wx1;
+            if (sx0 < 0) sx0 = 0;
+            if (sx1 >= sw) sx1 = sw - 1;
+
+            const unsigned char * p00 = src + (sy0 * sw + sx0) * 3;
+            const unsigned char * p01 = src + (sy0 * sw + sx1) * 3;
+            const unsigned char * p10 = src + (sy1 * sw + sx0) * 3;
+            const unsigned char * p11 = src + (sy1 * sw + sx1) * 3;
+            unsigned char *       dp  = dst + (y   * dw + x  ) * 3;
+
+            for (int c = 0; c < 3; c++) {
+                const float v = wy0 * (wx0 * p00[c] + wx1 * p01[c])
+                              + wy1 * (wx0 * p10[c] + wx1 * p11[c]);
+                dp[c] = (unsigned char)(v + 0.5f);
+            }
+        }
+    }
+}
+
+// If the bitmap's longer side exceeds the quality preset's cap, replace it
+// with a downsampled bitmap (caller-owned). Returns the bitmap to use — the
+// original if no resize was needed (and not freed), or a freshly allocated
+// one with the original freed.
+static mtmd_bitmap * apply_image_quality(mtmd_bitmap * src, int quality) {
+    if (!src) return nullptr;
+    const int max_side = max_side_for_quality(quality);
+    if (max_side <= 0) return src;            // HIGH = passthrough
+
+    const uint32_t nx = mtmd_bitmap_get_nx(src);
+    const uint32_t ny = mtmd_bitmap_get_ny(src);
+    const uint32_t longer = std::max(nx, ny);
+    if (longer <= (uint32_t)max_side) return src;
+
+    const float scale = (float)max_side / (float)longer;
+    const int new_nx = std::max(1, (int)std::round(nx * scale));
+    const int new_ny = std::max(1, (int)std::round(ny * scale));
+
+    std::vector<unsigned char> dst((size_t)new_nx * new_ny * 3);
+    resize_rgb_bilinear(mtmd_bitmap_get_data(src), (int)nx, (int)ny,
+                        dst.data(), new_nx, new_ny);
+
+    mtmd_bitmap * resized = mtmd_bitmap_init((uint32_t)new_nx, (uint32_t)new_ny, dst.data());
+    if (!resized) return src;                 // alloc failure — keep original
+
+    LOGI("apply_image_quality: q=%d resized %ux%u → %dx%d",
+         quality, nx, ny, new_nx, new_ny);
+    mtmd_bitmap_free(src);
+    return resized;
+}
+
 // Cached StreamCallback method IDs. JNI GetObjectClass + GetMethodID are
 // re-done only when a different callback class shows up; the hot path is a
 // single IsSameObject check per generate call.
@@ -106,6 +203,36 @@ static jmethodID g_onVlmKvCacheStatus  = nullptr; // VLM-KV cache hit/miss feedb
 static jclass    g_embed_cb_class   = nullptr;
 static jmethodID g_embed_onComplete = nullptr;
 static jmethodID g_embed_onError    = nullptr;
+
+// VlmPrewarmCallback — separate cache because the class is distinct from
+// StreamCallback and lookups happen on a different (background) call site.
+static jclass    g_pw_cb_class      = nullptr;
+static jmethodID g_pw_onStarted     = nullptr;
+static jmethodID g_pw_onChunkStart  = nullptr;
+static jmethodID g_pw_onChunkDone   = nullptr;
+static jmethodID g_pw_onStateStored = nullptr;
+static jmethodID g_pw_onDone        = nullptr;
+static jmethodID g_pw_onError       = nullptr;
+
+static bool ensure_prewarm_callback_methods(JNIEnv * env, jobject callback) {
+    if (!callback) return false;
+    jclass cls = env->GetObjectClass(callback);
+    if (g_pw_cb_class && env->IsSameObject(cls, g_pw_cb_class)) {
+        env->DeleteLocalRef(cls);
+        return true;
+    }
+    if (g_pw_cb_class) env->DeleteGlobalRef(g_pw_cb_class);
+    g_pw_cb_class      = (jclass)env->NewGlobalRef(cls);
+    g_pw_onStarted     = env->GetMethodID(cls, "onStarted",     "(I)V");
+    g_pw_onChunkStart  = env->GetMethodID(cls, "onChunkStart",  "(IIZ)V");
+    g_pw_onChunkDone   = env->GetMethodID(cls, "onChunkDone",   "(IIFF)V");
+    g_pw_onStateStored = env->GetMethodID(cls, "onStateStored", "(JI)V");
+    g_pw_onDone        = env->GetMethodID(cls, "onDone",        "(JZ)V");
+    g_pw_onError       = env->GetMethodID(cls, "onError",       "(Ljava/lang/String;)V");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    env->DeleteLocalRef(cls);
+    return g_pw_onStarted && g_pw_onDone;
+}
 
 static bool ensure_callback_methods(JNIEnv * env, jobject callback) {
     jclass cls = env->GetObjectClass(callback);
@@ -2834,7 +2961,8 @@ extern "C" JNIEXPORT jboolean JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmPrecomputeVisionEmbeddings(
         JNIEnv * env, jobject,
         jbyteArray jImageData,
-        jbyteArray jVtKey) {
+        jbyteArray jVtKey,
+        jint imageQuality) {
 
     std::lock_guard<std::mutex> lock(g_state.gen_mutex);
 
@@ -2869,6 +2997,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmPrecomputeVisionEmbeddings(
         LOGE("VlmPrecompute: failed to decode image");
         return JNI_FALSE;
     }
+    bmp = apply_image_quality(bmp, (int)imageQuality);
 
     // Use the bare image marker so mtmd_tokenize emits exactly one image
     // chunk (plus possibly an empty text chunk). No chat template, no system
@@ -2925,6 +3054,275 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmPrecomputeVisionEmbeddings(
     return stored ? JNI_TRUE : JNI_FALSE;
 }
 
+// Pre-warm the VLM-KV cache. Runs the vision encoder AND the LLM
+// image-prefill, captures the LLM context state at the post-image-chunk
+// boundary, and stores it under [vlmKvKey]. The first user query that
+// matches the same key (system prompt + chat template prefix + image)
+// hits this entry, restores the state via llama_state_seq_set_data, and
+// jumps straight to decoding the user's question — TTFT drops from
+// ~the cold time to ~hundreds of ms even on the *first* prompt.
+//
+// messagesJson should describe the canonical pre-warm prompt — the
+// system + user-prefix-up-to-image-marker the host plans to use later.
+// Anything emitted *after* the last image chunk is decoded but its KV is
+// included in the saved blob, so callers should keep that suffix
+// minimal/empty (e.g. "<__image__>\n").
+//
+// Updates BOTH the VT cache (ViT embeddings) and the VLM-KV cache when
+// their respective keys are non-null. Pass null to skip a particular
+// cache.
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmPrecomputeKvState(
+        JNIEnv * env, jobject,
+        jstring   jmessagesJson,
+        jbyteArray jImageData,
+        jbyteArray jVtKey,           // optional, may be null
+        jbyteArray jVlmKvKey,        // required
+        jint       imageQuality,     // 0=LOW, 1=MEDIUM, 2=HIGH
+        jobject   jCallback) {       // optional VlmPrewarmCallback, may be null
+
+    std::lock_guard<std::mutex> lock(g_state.gen_mutex);
+
+    const auto t_start_total = std::chrono::high_resolution_clock::now();
+    auto fire_error = [&](const char * msg) {
+        if (jCallback && g_pw_onError) {
+            jstring jmsg = env->NewStringUTF(msg);
+            env->CallVoidMethod(jCallback, g_pw_onError, jmsg);
+            env->DeleteLocalRef(jmsg);
+        }
+    };
+
+    if (jCallback && !ensure_prewarm_callback_methods(env, jCallback)) {
+        LOGW("VlmPrecomputeKv: callback class missing required methods, ignoring");
+        jCallback = nullptr;
+    }
+
+    if (!g_state.model || !g_state.ctx) {
+        LOGE("VlmPrecomputeKv: text model not loaded");
+        fire_error("text model not loaded");
+        return JNI_FALSE;
+    }
+    if (!g_vlm.ctx) {
+        LOGE("VlmPrecomputeKv: projector not loaded");
+        fire_error("projector not loaded");
+        return JNI_FALSE;
+    }
+    if (!jVlmKvKey || env->GetArrayLength(jVlmKvKey) != VLM_KV_CACHE_HASH_BYTES) {
+        LOGE("VlmPrecomputeKv: vlmKvKey must be %d bytes", VLM_KV_CACHE_HASH_BYTES);
+        fire_error("vlmKvKey must be 32 bytes");
+        return JNI_FALSE;
+    }
+
+    vlm_kv_cache_t * vlm_kv = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_vkv.mutex);
+        vlm_kv = g_vkv.cache;
+    }
+    if (!vlm_kv) {
+        LOGE("VlmPrecomputeKv: VLM-KV cache not initialised");
+        return JNI_FALSE;
+    }
+
+    uint8_t vlm_kv_key[VLM_KV_CACHE_HASH_BYTES];
+    env->GetByteArrayRegion(jVlmKvKey, 0, VLM_KV_CACHE_HASH_BYTES, (jbyte *)vlm_kv_key);
+
+    uint8_t vt_key[VT_CACHE_HASH_BYTES];
+    bool    have_vt_key = false;
+    if (jVtKey && env->GetArrayLength(jVtKey) == VT_CACHE_HASH_BYTES) {
+        env->GetByteArrayRegion(jVtKey, 0, VT_CACHE_HASH_BYTES, (jbyte *)vt_key);
+        have_vt_key = true;
+    }
+
+    // Apply chat template — same path nativeVlmGenerateStream uses, so the
+    // chunks emitted by mtmd_tokenize match exactly when the host later
+    // queries with the same template + system + pre-image text.
+    const char * msgs_cstr = env->GetStringUTFChars(jmessagesJson, nullptr);
+    std::string messages_json(msgs_cstr);
+    env->ReleaseStringUTFChars(jmessagesJson, msgs_cstr);
+
+    auto messages = parse_messages_json(messages_json);
+    if (!g_state.system_prompt.empty()) {
+        if (messages.empty() || messages[0].role != "system") {
+            messages.insert(messages.begin(), {"system", g_state.system_prompt});
+        }
+    }
+
+    chat_template_result tmpl_result;
+    try {
+        tmpl_result = apply_chat_template(messages, true);
+    } catch (const std::exception & e) {
+        LOGE("VlmPrecomputeKv: chat template error: %s", e.what());
+        return JNI_FALSE;
+    }
+
+    // Decode image bytes into an mtmd_bitmap.
+    const int img_len = env->GetArrayLength(jImageData);
+    std::vector<unsigned char> img_buf((size_t)img_len);
+    env->GetByteArrayRegion(jImageData, 0, img_len, (jbyte *)img_buf.data());
+
+    mtmd_bitmap * bmp = mtmd_helper_bitmap_init_from_buf(
+        g_vlm.ctx, img_buf.data(), img_buf.size());
+    if (!bmp) {
+        LOGE("VlmPrecomputeKv: failed to decode image");
+        fire_error("failed to decode image");
+        return JNI_FALSE;
+    }
+    bmp = apply_image_quality(bmp, (int)imageQuality);
+
+    mtmd_input_chunks * chunks = mtmd_input_chunks_init();
+    mtmd_input_text input_text;
+    input_text.text          = tmpl_result.prompt.c_str();
+    input_text.add_special   = true;
+    input_text.parse_special = true;
+
+    const mtmd_bitmap * bitmap_ptrs[1] = { bmp };
+    int32_t tok_result = mtmd_tokenize(g_vlm.ctx, chunks, &input_text, bitmap_ptrs, 1);
+    mtmd_bitmap_free(bmp);
+
+    if (tok_result != 0) {
+        mtmd_input_chunks_free(chunks);
+        LOGE("VlmPrecomputeKv: tokenization failed (%d)", tok_result);
+        return JNI_FALSE;
+    }
+
+    // Boundary: first chunk *after* the last image chunk. We decode chunks
+    // [0, resume_chunk_idx) and save state. Anything after that boundary is
+    // not relevant — those are the user's variable post-image text tokens
+    // which the actual generate() call will decode fresh.
+    const size_t n_chunks_total = mtmd_input_chunks_size(chunks);
+    int resume_chunk_idx = 0;
+    for (int i = (int)n_chunks_total - 1; i >= 0; i--) {
+        if (mtmd_input_chunk_get_type(mtmd_input_chunks_get(chunks, i))
+                != MTMD_INPUT_CHUNK_TYPE_TEXT) {
+            resume_chunk_idx = i + 1;
+            break;
+        }
+    }
+    if (resume_chunk_idx == 0) {
+        mtmd_input_chunks_free(chunks);
+        LOGE("VlmPrecomputeKv: no image chunks in tokenized input");
+        fire_error("no image chunks in tokenized input");
+        return JNI_FALSE;
+    }
+
+    if (jCallback && g_pw_onStarted) {
+        env->CallVoidMethod(jCallback, g_pw_onStarted, (jint)resume_chunk_idx);
+    }
+
+    // Reset KV cache before pre-warm so the captured state is clean.
+    llama_memory_t mem = llama_get_memory(g_state.ctx);
+    if (mem) llama_memory_clear(mem, true);
+    g_state.n_past = 0;
+    g_state.prev_prompt_tokens.clear();
+
+    const int32_t vlm_n_batch  = 512;
+    const int32_t n_embd_inp   = llama_model_n_embd_inp(g_state.model);
+    llama_pos     new_n_past   = 0;
+    int64_t       t_encode_us  = 0;
+    int64_t       t_decode_us  = 0;
+    int32_t       eval_result  = 0;
+
+    auto t_start = std::chrono::high_resolution_clock::now();
+
+    for (int ci = 0; ci < resume_chunk_idx && eval_result == 0; ci++) {
+        const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, (size_t)ci);
+        const enum mtmd_input_chunk_type ctype = mtmd_input_chunk_get_type(chunk);
+        const bool is_image = (ctype != MTMD_INPUT_CHUNK_TYPE_TEXT);
+        const bool is_last  = (ci + 1 == resume_chunk_idx);
+
+        if (jCallback && g_pw_onChunkStart) {
+            env->CallVoidMethod(jCallback, g_pw_onChunkStart,
+                                (jint)ci, (jint)resume_chunk_idx, (jboolean)is_image);
+        }
+
+        int64_t this_enc_us = 0;
+        int64_t this_dec_us = 0;
+
+        if (!is_image) {
+            const int64_t t0 = llama_time_us();
+            eval_result = mtmd_helper_eval_chunk_single(
+                g_vlm.ctx, g_state.ctx, chunk,
+                new_n_past, 0, vlm_n_batch, is_last, &new_n_past);
+            this_dec_us = llama_time_us() - t0;
+            t_decode_us += this_dec_us;
+        } else {
+            const int32_t n_tok = (int32_t)mtmd_input_chunk_get_n_tokens(chunk);
+
+            const int64_t t_enc0 = llama_time_us();
+            eval_result = mtmd_encode_chunk(g_vlm.ctx, chunk);
+            this_enc_us = llama_time_us() - t_enc0;
+            t_encode_us += this_enc_us;
+            if (eval_result != 0) break;
+
+            float * embd = mtmd_get_output_embd(g_vlm.ctx);
+            if (have_vt_key && g_vt.cache && embd) {
+                vt_cache_store(g_vt.cache, vt_key, embd, n_tok, n_embd_inp);
+            }
+
+            const int64_t t_dec0 = llama_time_us();
+            eval_result = mtmd_helper_decode_image_chunk(
+                g_vlm.ctx, g_state.ctx, chunk, embd,
+                new_n_past, 0, vlm_n_batch, &new_n_past);
+            this_dec_us = llama_time_us() - t_dec0;
+            t_decode_us += this_dec_us;
+        }
+
+        if (jCallback && g_pw_onChunkDone) {
+            env->CallVoidMethod(jCallback, g_pw_onChunkDone,
+                                (jint)ci, (jint)resume_chunk_idx,
+                                (jfloat)(this_enc_us / 1000.0f),
+                                (jfloat)(this_dec_us / 1000.0f));
+        }
+    }
+
+    if (eval_result != 0) {
+        mtmd_input_chunks_free(chunks);
+        char msg[64];
+        snprintf(msg, sizeof(msg), "chunk eval failed (%d)", (int)eval_result);
+        LOGE("VlmPrecomputeKv: %s", msg);
+        fire_error(msg);
+        return JNI_FALSE;
+    }
+
+    // Capture the post-image state.
+    const size_t blob_size = llama_state_seq_get_size(g_state.ctx, /*seq_id=*/0);
+    bool stored = false;
+    if (blob_size > 0) {
+        std::vector<uint8_t> blob(blob_size);
+        const size_t written = llama_state_seq_get_data(
+            g_state.ctx, blob.data(), blob_size, /*seq_id=*/0);
+        if (written > 0) {
+            stored = vlm_kv_cache_store(vlm_kv, vlm_kv_key,
+                                        blob.data(), written, (int32_t)new_n_past);
+            if (jCallback && g_pw_onStateStored) {
+                env->CallVoidMethod(jCallback, g_pw_onStateStored,
+                                    (jlong)written, (jint)new_n_past);
+            }
+        }
+    }
+
+    mtmd_input_chunks_free(chunks);
+
+    auto t_end = std::chrono::high_resolution_clock::now();
+    const float total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        t_end - t_start).count();
+    const auto total_wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        t_end - t_start_total).count();
+
+    LOGI("VlmPrecomputeKv: encoded + decoded %d chunks in %.0fms "
+         "(enc=%.0fms, dec=%.0fms, n_past=%d, blob=%zu B, stored=%d)",
+         resume_chunk_idx, total_ms,
+         t_encode_us / 1000.0f, t_decode_us / 1000.0f,
+         (int)new_n_past, blob_size, (int)stored);
+
+    if (jCallback && g_pw_onDone) {
+        env->CallVoidMethod(jCallback, g_pw_onDone,
+                            (jlong)total_wall_ms, (jboolean)stored);
+    }
+
+    return stored ? JNI_TRUE : JNI_FALSE;
+}
+
 // Generates a response from text + images. messagesJson must include the
 // default media marker where images appear; raw image bytes (JPEG/PNG) are
 // passed in imageDataArray. The KV cache is cleared at the start — VLM does
@@ -2936,6 +3334,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGenerateStream(
         jobjectArray imageDataArray,
         jobjectArray vtKeysArray,    // optional byte[32][] parallel to images; null = no caching
         jbyteArray   vlmKvKeyArray,  // optional byte[32] for VLM-KV cache; null = no caching
+        jint imageQuality,           // 0=LOW, 1=MEDIUM, 2=HIGH (passthrough)
         jint maxTokens,
         jobject callback) {
 
@@ -3005,6 +3404,10 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGenerateStream(
             g_vlm.ctx, image_bufs[i].data.data(), image_bufs[i].data.size());
         if (!bmp) {
             LOGE("VLM: failed to decode image %d", i);
+            for (auto * b : bitmaps) mtmd_bitmap_free(b);
+        }
+        if (bmp) bmp = apply_image_quality(bmp, (int)imageQuality);
+        if (!bmp) {
             for (auto * b : bitmaps) mtmd_bitmap_free(b);
             jstring jerr = env->NewStringUTF("Failed to decode image");
             env->CallVoidMethod(callback, g_onError, jerr);

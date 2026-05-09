@@ -47,3 +47,38 @@ sealed interface VlmState {
 
     data class Error(val message: String) : VlmState
 }
+
+/**
+ * Independent state for the background pre-warm pass that fires when a new
+ * image is picked. Lives on its own flow so it can overlay any [VlmState]
+ * (Ready, Generating, GenerationDone, …) without disturbing the main UI
+ * lifecycle.
+ */
+sealed interface PrewarmState {
+    data object Idle : PrewarmState
+
+    /**
+     * Pre-warm in flight. [stage] is the human-readable current operation
+     * (e.g. "Encoding tile 3/5"); [chunkIndex]/[totalChunks] drive a determinate
+     * progress bar.
+     */
+    data class InProgress(
+        val startedAt: Long,
+        val stage: String = "Tokenizing…",
+        val chunkIndex: Int = 0,
+        val totalChunks: Int = 0,
+        val lastEncodeMs: Float? = null,
+        val lastDecodeMs: Float? = null,
+    ) : PrewarmState
+
+    /** Pre-warm completed in [durationMs] ms; [cached] = true if VLM-KV stored. */
+    data class Done(
+        val durationMs: Long,
+        val cached: Boolean,
+        val totalChunks: Int = 0,
+        val blobBytes: Long = 0,
+        val nTokens: Int = 0,
+    ) : PrewarmState
+
+    data class Failed(val message: String) : PrewarmState
+}

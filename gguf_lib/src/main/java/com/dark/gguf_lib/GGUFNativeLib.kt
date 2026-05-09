@@ -2,6 +2,7 @@ package com.dark.gguf_lib
 
 import com.dark.gguf_lib.models.EmbeddingCallback
 import com.dark.gguf_lib.models.StreamCallback
+import com.dark.gguf_lib.models.VlmPrewarmCallback
 
 /**
  * Low-level JNI bridge to llama.cpp + tool-neuron engine helpers.
@@ -211,6 +212,34 @@ internal object GGUFNativeLib {
     external fun nativeVlmPrecomputeVisionEmbeddings(
         imageData: ByteArray,
         vtKey: ByteArray,
+        imageQuality: Int,            // 0=LOW, 1=MEDIUM, 2=HIGH
+    ): Boolean
+
+    /**
+     * Pre-warm the VLM-KV cache: encode the image AND run the LLM
+     * image-prefill, then capture the post-image LLM state under [vlmKvKey].
+     * The next [nativeVlmGenerateStream] call with the same key restores
+     * the state and skips both the ViT pass AND the ~9s LLM image-prefill,
+     * so even the *very first* user prompt against this image gets
+     * sub-second TTFT.
+     *
+     * [messagesJson] should be the canonical pre-warm prompt — the
+     * system + user-prefix-up-to-image-marker the host plans to use later.
+     * The cache key must match what the host passes at generate time
+     * (use [GGMLEngine.computeVlmKvKey] for both).
+     *
+     * Pass [vtKey] (32 bytes) to also populate the VT cache as a
+     * side-effect; pass null to skip the VT-side write.
+     *
+     * Requires: text model loaded, projector loaded, VLM-KV cache initialised.
+     */
+    external fun nativeVlmPrecomputeKvState(
+        messagesJson: String,
+        imageData: ByteArray,
+        vtKey: ByteArray?,
+        vlmKvKey: ByteArray,
+        imageQuality: Int,            // 0=LOW, 1=MEDIUM, 2=HIGH
+        callback: VlmPrewarmCallback?,
     ): Boolean
 
     /**
@@ -233,6 +262,7 @@ internal object GGUFNativeLib {
         imageData: Array<ByteArray>,
         vtKeys: Array<ByteArray>?,
         vlmKvKey: ByteArray?,
+        imageQuality: Int,            // 0=LOW, 1=MEDIUM, 2=HIGH (passthrough)
         maxTokens: Int,
         callback: StreamCallback,
     ): Boolean

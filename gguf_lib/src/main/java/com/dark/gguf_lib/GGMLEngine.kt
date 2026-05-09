@@ -445,17 +445,100 @@ class GGMLEngine {
         imageBytes: ByteArray,
         projectorPath: String,
         imageMaxTokens: Int,
+        imageQuality: ImageQuality = ImageQuality.MEDIUM,
     ): Boolean = withContext(Dispatchers.IO) {
         val key = computeVtKey(imageBytes, projectorPath, imageMaxTokens)
-        GGUFNativeLib.nativeVlmPrecomputeVisionEmbeddings(imageBytes, key)
+        GGUFNativeLib.nativeVlmPrecomputeVisionEmbeddings(imageBytes, key, imageQuality.nativeValue)
     }
 
     /** Lower-level overload — caller supplies an already-derived 32-byte VT key. */
     suspend fun precomputeVisionEmbeddings(
         imageBytes: ByteArray,
         vtKey: ByteArray,
+        imageQuality: ImageQuality = ImageQuality.MEDIUM,
     ): Boolean = withContext(Dispatchers.IO) {
-        GGUFNativeLib.nativeVlmPrecomputeVisionEmbeddings(imageBytes, vtKey)
+        GGUFNativeLib.nativeVlmPrecomputeVisionEmbeddings(imageBytes, vtKey, imageQuality.nativeValue)
+    }
+
+    /**
+     * Pre-warm the VLM-KV cache: encode the image AND run the LLM
+     * image-prefill in the background, capture the post-image LLM state.
+     * The next [generateVlmFlow] call with the same [vlmKvKey] hits the
+     * cache and skips BOTH the ViT pass AND the image-prefill — the
+     * literal first user prompt against this image gets sub-second TTFT.
+     *
+     * [messagesJson] is the canonical pre-warm message list; typically
+     * `[{"role":"user","content":"<__image__>\n"}]`. Anything *after* the
+     * image marker is decoded but its KV is captured in the saved blob,
+     * so keep the suffix minimal.
+     *
+     * Pass [vtKey] (e.g. from [computeVtKey]) to populate the VT cache
+     * as a side-effect; pass null to skip the VT-side write.
+     *
+     * Suspends on [Dispatchers.IO]. The LLM image-prefill is the slow
+     * part (~5-10 s on Snapdragon 7s Gen 3 for Qwen3-VL-2B; ~1-2 s for
+     * LFM2-VL-450M). Fire-and-forget right after the host knows which
+     * image and which system prompt + chat template will be used —
+     * usually as soon as the image lands.
+     */
+    suspend fun precomputeVlmKvState(
+        messagesJson: String,
+        imageBytes: ByteArray,
+        vlmKvKey: ByteArray,
+        vtKey: ByteArray? = null,
+        imageQuality: ImageQuality = ImageQuality.MEDIUM,
+    ): Boolean = withContext(Dispatchers.IO) {
+        GGUFNativeLib.nativeVlmPrecomputeKvState(
+            messagesJson, imageBytes, vtKey, vlmKvKey,
+            imageQuality.nativeValue, /* callback = */ null,
+        )
+    }
+
+    /**
+     * Streaming variant of [precomputeVlmKvState] that emits per-stage events
+     * (one per image/text chunk) so the host UI can show "Encoding tile 3/5",
+     * "Decoding tile 3/5 (3.2 s)", etc. Same caching contract as the suspend
+     * version — only the callback surface differs.
+     */
+    fun precomputeVlmKvStateFlow(
+        messagesJson: String,
+        imageBytes: ByteArray,
+        vlmKvKey: ByteArray,
+        vtKey: ByteArray? = null,
+        imageQuality: ImageQuality = ImageQuality.MEDIUM,
+    ): Flow<VlmPrewarmEvent> = callbackFlow {
+        val cb = object : com.dark.gguf_lib.models.VlmPrewarmCallback {
+            override fun onStarted(totalChunks: Int) {
+                trySend(VlmPrewarmEvent.Started(totalChunks))
+            }
+            override fun onChunkStart(index: Int, total: Int, isImage: Boolean) {
+                trySend(VlmPrewarmEvent.ChunkStart(index, total, isImage))
+            }
+            override fun onChunkDone(index: Int, total: Int, encodeMs: Float, decodeMs: Float) {
+                trySend(VlmPrewarmEvent.ChunkDone(index, total, encodeMs, decodeMs))
+            }
+            override fun onStateStored(blobBytes: Long, nTokens: Int) {
+                trySend(VlmPrewarmEvent.StateStored(blobBytes, nTokens))
+            }
+            override fun onDone(totalMs: Long, cached: Boolean) {
+                trySend(VlmPrewarmEvent.Done(totalMs, cached))
+                close()
+            }
+            override fun onError(message: String) {
+                trySend(VlmPrewarmEvent.Error(message))
+                close()
+            }
+        }
+        val job = launch(Dispatchers.IO) {
+            GGUFNativeLib.nativeVlmPrecomputeKvState(
+                messagesJson, imageBytes, vtKey, vlmKvKey,
+                imageQuality.nativeValue, cb,
+            )
+            // If the native side returned without firing onDone (shouldn't
+            // happen on success, but defensive), close the flow anyway.
+            close()
+        }
+        awaitClose { job.cancel() }
     }
 
     /**
@@ -478,6 +561,7 @@ class GGMLEngine {
         maxTokens: Int = 4096,
         vtKeys: List<ByteArray?>? = null,
         vlmKvKey: ByteArray? = null,
+        imageQuality: ImageQuality = ImageQuality.MEDIUM,
     ): Flow<GenerationEvent> = callbackFlow {
         val cb = streamCallback(::trySend, ::close)
         val keysArray: Array<ByteArray>? = vtKeys?.let { keys ->
@@ -487,7 +571,8 @@ class GGMLEngine {
         }
         val job = launch(Dispatchers.IO) {
             GGUFNativeLib.nativeVlmGenerateStream(
-                messagesJson, imageData.toTypedArray(), keysArray, vlmKvKey, maxTokens, cb,
+                messagesJson, imageData.toTypedArray(), keysArray, vlmKvKey,
+                imageQuality.nativeValue, maxTokens, cb,
             )
         }
         awaitClose {

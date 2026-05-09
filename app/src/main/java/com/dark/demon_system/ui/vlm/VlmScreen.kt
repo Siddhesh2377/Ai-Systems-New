@@ -122,8 +122,10 @@ fun VlmScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             ModelStatusCard(state = state, vm = vm)
+            val prewarm by vm.prewarmState.collectAsState()
             ImagePickerCard(
                 bitmap = imageBitmap,
+                prewarm = prewarm,
                 onPick = {
                     pickImage.launch(
                         PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
@@ -132,7 +134,16 @@ fun VlmScreen(
                 onClear = {
                     imageBytes = null
                     imageBitmap = null
+                    vm.resetPrewarm()
                 },
+            )
+
+            val quality by vm.imageQuality.collectAsState()
+            ImageQualityPicker(
+                selected = quality,
+                enabled = prewarm !is PrewarmState.InProgress &&
+                          state !is VlmState.Generating,
+                onSelected = { vm.setImageQuality(it) },
             )
 
             OutlinedTextField(
@@ -260,6 +271,7 @@ private fun RowSpinner(text: String) {
 @Composable
 private fun ImagePickerCard(
     bitmap: android.graphics.Bitmap?,
+    prewarm: PrewarmState,
     onPick: () -> Unit,
     onClear: () -> Unit,
 ) {
@@ -274,19 +286,78 @@ private fun ImagePickerCard(
             Spacer(Modifier.height(6.dp))
 
             if (bitmap != null) {
-                Image(
-                    bitmap = bitmap.asImageBitmap(),
-                    contentDescription = null,
-                    contentScale = ContentScale.Fit,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .aspectRatio(bitmap.width.toFloat() / bitmap.height.toFloat())
-                        .clip(RoundedCornerShape(8.dp)),
-                )
+                Box {
+                    Image(
+                        bitmap = bitmap.asImageBitmap(),
+                        contentDescription = null,
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .aspectRatio(bitmap.width.toFloat() / bitmap.height.toFloat())
+                            .clip(RoundedCornerShape(8.dp)),
+                    )
+                    if (prewarm is PrewarmState.InProgress) {
+                        val pct = if (prewarm.totalChunks > 0)
+                            prewarm.chunkIndex.toFloat() / prewarm.totalChunks
+                        else null
+
+                        Box(
+                            modifier = Modifier
+                                .matchParentSize()
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.6f)),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                modifier = Modifier.padding(16.dp),
+                            ) {
+                                if (pct != null) {
+                                    CircularProgressIndicator(
+                                        progress = { pct },
+                                        color = MaterialTheme.colorScheme.inverseOnSurface,
+                                        strokeWidth = 3.dp,
+                                    )
+                                } else {
+                                    CircularProgressIndicator(
+                                        color = MaterialTheme.colorScheme.inverseOnSurface,
+                                        strokeWidth = 3.dp,
+                                    )
+                                }
+                                Spacer(Modifier.height(10.dp))
+                                Text(
+                                    prewarm.stage,
+                                    color = MaterialTheme.colorScheme.inverseOnSurface,
+                                    style = MaterialTheme.typography.labelMedium,
+                                )
+                                if (prewarm.lastEncodeMs != null || prewarm.lastDecodeMs != null) {
+                                    Spacer(Modifier.height(4.dp))
+                                    val parts = buildList {
+                                        prewarm.lastEncodeMs?.let { add("enc %.0f ms".format(it)) }
+                                        prewarm.lastDecodeMs?.let { add("dec %.0f ms".format(it)) }
+                                    }
+                                    Text(
+                                        parts.joinToString("  •  "),
+                                        color = MaterialTheme.colorScheme.inverseOnSurface,
+                                        style = MaterialTheme.typography.bodySmall,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                PrewarmStatusLine(prewarm)
                 Spacer(Modifier.height(8.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(onClick = onPick) { Text("Replace") }
-                    OutlinedButton(onClick = onClear) { Text("Clear") }
+                    OutlinedButton(
+                        onClick = onPick,
+                        enabled = prewarm !is PrewarmState.InProgress,
+                    ) { Text("Replace") }
+                    OutlinedButton(
+                        onClick = onClear,
+                        enabled = prewarm !is PrewarmState.InProgress,
+                    ) { Text("Clear") }
                 }
             } else {
                 Box(
@@ -300,6 +371,30 @@ private fun ImagePickerCard(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun PrewarmStatusLine(state: PrewarmState) {
+    when (state) {
+        PrewarmState.Idle -> {} // nothing
+        is PrewarmState.InProgress -> Text(
+            "${state.stage}  ·  first prompt will be fast",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        is PrewarmState.Done -> Text(
+            if (state.cached) "⚡ Pre-warmed in ${state.durationMs} ms · ${state.totalChunks} chunks · ${state.nTokens} tok · ${state.blobBytes / 1024} KB cached"
+            else              "Pre-warm finished in ${state.durationMs} ms — cache write skipped",
+            style = MaterialTheme.typography.bodySmall,
+            color = if (state.cached) MaterialTheme.colorScheme.primary
+                    else              MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        is PrewarmState.Failed -> Text(
+            "Pre-warm failed: ${state.message}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.error,
+        )
     }
 }
 
@@ -436,4 +531,58 @@ private fun Long.humanBytes(): String {
     if (mb < 1024) return "%.1f MB".format(mb)
     val gb = mb / 1024.0
     return "%.2f GB".format(gb)
+}
+
+@Composable
+private fun ImageQualityPicker(
+    selected: com.dark.gguf_lib.ImageQuality,
+    enabled: Boolean,
+    onSelected: (com.dark.gguf_lib.ImageQuality) -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Text(
+            "Image quality",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(4.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            com.dark.gguf_lib.ImageQuality.entries.forEach { q ->
+                val isSelected = q == selected
+                val container =
+                    if (isSelected) MaterialTheme.colorScheme.primary
+                    else            MaterialTheme.colorScheme.surface
+                val content =
+                    if (isSelected) MaterialTheme.colorScheme.onPrimary
+                    else            MaterialTheme.colorScheme.onSurface
+                Button(
+                    onClick = { onSelected(q) },
+                    enabled = enabled,
+                    modifier = Modifier.weight(1f),
+                    colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                        containerColor = container,
+                        contentColor = content,
+                    ),
+                ) {
+                    Text(
+                        when (q) {
+                            com.dark.gguf_lib.ImageQuality.LOW    -> "LOW (384)"
+                            com.dark.gguf_lib.ImageQuality.MEDIUM -> "MEDIUM (768)"
+                            com.dark.gguf_lib.ImageQuality.HIGH   -> "HIGH (full)"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+            }
+        }
+        Spacer(Modifier.height(2.dp))
+        Text(
+            "Lower = faster encode + smaller cache; less detail in model perception. Changing invalidates cached entries.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
 }
