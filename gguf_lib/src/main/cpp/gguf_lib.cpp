@@ -2822,6 +2822,109 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGetDefaultMarker(JNIEnv * env, jo
     return env->NewStringUTF(mtmd_default_marker());
 }
 
+// Run ONLY the vision encoder for an image and store the embeddings in the
+// VT cache. Skips the LLM context entirely — no llama_decode, no token
+// generation. Use to pre-warm the VT cache so the first user query against a
+// known image hits the cache and skips the ~9s ViT pass.
+//
+// vtKey must be 32 bytes (typically the same SHA256 the host would later pass
+// to nativeVlmGenerateStream). Returns true on successful encode + cache
+// store.
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmPrecomputeVisionEmbeddings(
+        JNIEnv * env, jobject,
+        jbyteArray jImageData,
+        jbyteArray jVtKey) {
+
+    std::lock_guard<std::mutex> lock(g_state.gen_mutex);
+
+    if (!g_state.model || !g_state.ctx) {
+        LOGE("VlmPrecompute: text model not loaded (need n_embd_inp)");
+        return JNI_FALSE;
+    }
+    if (!g_vlm.ctx) {
+        LOGE("VlmPrecompute: projector not loaded");
+        return JNI_FALSE;
+    }
+    if (!g_vt.cache) {
+        LOGE("VlmPrecompute: VT cache not initialised");
+        return JNI_FALSE;
+    }
+    if (!jImageData || !jVtKey) return JNI_FALSE;
+    if (env->GetArrayLength(jVtKey) != VT_CACHE_HASH_BYTES) {
+        LOGE("VlmPrecompute: vtKey must be %d bytes", VT_CACHE_HASH_BYTES);
+        return JNI_FALSE;
+    }
+
+    uint8_t vt_key[VT_CACHE_HASH_BYTES];
+    env->GetByteArrayRegion(jVtKey, 0, VT_CACHE_HASH_BYTES, (jbyte *)vt_key);
+
+    const int img_len = env->GetArrayLength(jImageData);
+    std::vector<unsigned char> img_buf((size_t)img_len);
+    env->GetByteArrayRegion(jImageData, 0, img_len, (jbyte *)img_buf.data());
+
+    mtmd_bitmap * bmp = mtmd_helper_bitmap_init_from_buf(
+        g_vlm.ctx, img_buf.data(), img_buf.size());
+    if (!bmp) {
+        LOGE("VlmPrecompute: failed to decode image");
+        return JNI_FALSE;
+    }
+
+    // Use the bare image marker so mtmd_tokenize emits exactly one image
+    // chunk (plus possibly an empty text chunk). No chat template, no system
+    // prompt — this is purely a vision-encoder warm-up and the cache key is
+    // the host's responsibility to keep consistent with later generation.
+    mtmd_input_chunks * chunks = mtmd_input_chunks_init();
+    mtmd_input_text input_text;
+    input_text.text          = mtmd_default_marker();
+    input_text.add_special   = false;
+    input_text.parse_special = true;
+
+    const mtmd_bitmap * bitmap_ptrs[1] = { bmp };
+    int32_t tok_result = mtmd_tokenize(g_vlm.ctx, chunks, &input_text, bitmap_ptrs, 1);
+    mtmd_bitmap_free(bmp);
+
+    if (tok_result != 0) {
+        mtmd_input_chunks_free(chunks);
+        LOGE("VlmPrecompute: tokenization failed (%d)", tok_result);
+        return JNI_FALSE;
+    }
+
+    const int32_t n_embd_inp = llama_model_n_embd_inp(g_state.model);
+    bool stored = false;
+
+    const size_t n_chunks_total = mtmd_input_chunks_size(chunks);
+    for (size_t ci = 0; ci < n_chunks_total; ci++) {
+        const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, ci);
+        if (mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_TEXT) continue;
+
+        const int32_t n_tok = (int32_t)mtmd_input_chunk_get_n_tokens(chunk);
+
+        const int64_t t0 = llama_time_us();
+        int32_t enc_ret = mtmd_encode_chunk(g_vlm.ctx, chunk);
+        const int64_t enc_ms = (llama_time_us() - t0) / 1000;
+
+        if (enc_ret != 0) {
+            LOGE("VlmPrecompute: encode_chunk failed (%d)", enc_ret);
+            break;
+        }
+
+        float * embd = mtmd_get_output_embd(g_vlm.ctx);
+        if (!embd) {
+            LOGE("VlmPrecompute: get_output_embd returned null");
+            break;
+        }
+
+        stored = vt_cache_store(g_vt.cache, vt_key, embd, n_tok, n_embd_inp);
+        LOGI("VlmPrecompute: encoded + cached %d tokens × %d embd in %lldms (stored=%d)",
+             n_tok, n_embd_inp, (long long)enc_ms, (int)stored);
+        break;  // first image chunk is the whole image; no need to scan further
+    }
+
+    mtmd_input_chunks_free(chunks);
+    return stored ? JNI_TRUE : JNI_FALSE;
+}
+
 // Generates a response from text + images. messagesJson must include the
 // default media marker where images appear; raw image bytes (JPEG/PNG) are
 // passed in imageDataArray. The KV cache is cleared at the start — VLM does

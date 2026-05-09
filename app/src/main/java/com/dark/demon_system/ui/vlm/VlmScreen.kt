@@ -81,6 +81,10 @@ fun VlmScreen(
                     if (bytes != null) {
                         imageBytes = bytes
                         imageBitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                        // Pre-warm the ViT cache in the background so the first
+                        // generate() call against this image hits VT cache and
+                        // skips the ~9s vision encoder pass. Fire-and-forget.
+                        vm.precomputeVisionFor(bytes)
                     }
                 }
             }

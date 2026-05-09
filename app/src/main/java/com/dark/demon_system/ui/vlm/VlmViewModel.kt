@@ -107,11 +107,13 @@ class VlmViewModel(app: Application) : AndroidViewModel(app) {
                     useMlock = false,
                     cacheTypeK = "q8_0",
                     cacheTypeV = "q8_0",
-                    // Per-op routing: large ops (image-prefill batch ~234) go
-                    // to GPU/Vulkan, single-token decode stays on CPU. Cuts
-                    // cold cached-VT TTFT from ~9s to ~5s without harming
-                    // decode tok/s. Falls back to CPU-only if no GPU device.
-                    opOffload = true,
+                    // opOffload=true gives per-op CPU/GPU routing (large ops
+                    // → Vulkan, decode → CPU) but currently triggers
+                    // vk::DeviceLostError on Adreno 810's driver during the
+                    // 234-token image-prefill compute graph (kernel TDR).
+                    // Disabled until we add per-device gating or chunk the
+                    // image-prefill into smaller Vulkan dispatches.
+                    opOffload = false,
                 )
                 if (!ok) {
                     _state.value = VlmState.Error("Failed to load text model")
@@ -281,6 +283,26 @@ class VlmViewModel(app: Application) : AndroidViewModel(app) {
     fun stopGeneration() {
         engine.stopGeneration()
         generationJob?.cancel()
+    }
+
+    /**
+     * Fire-and-forget background ViT pre-encode for [imageBytes]. Stores into
+     * the VT cache so the first generate() against this image skips the
+     * vision encoder (~9s saved on 7s Gen 3). No-op if the engine isn't
+     * loaded or the cache isn't initialised.
+     */
+    fun precomputeVisionFor(imageBytes: ByteArray) {
+        if (!engine.isLoaded || !engine.isVlmLoaded || !vtCacheReady) return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                val ok = engine.precomputeVisionEmbeddings(
+                    imageBytes     = imageBytes,
+                    projectorPath  = projectorPath,
+                    imageMaxTokens = imageMaxTokens,
+                )
+                android.util.Log.i("VlmViewModel", "ViT precompute done (cached=$ok)")
+            }
+        }
     }
 
     /** Drop every cached VT entry from disk. */

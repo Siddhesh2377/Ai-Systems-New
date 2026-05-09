@@ -431,7 +431,51 @@ The two caches compose: VLM-KV is checked first, falls through to VT,
 falls through to fresh encode + decode. Misses are free (just write on
 the way out).
 
-### Per-op CPU/GPU routing — `opOffload` (shipping)
+### Pre-warming the VT cache (`precomputeVisionEmbeddings`)
+
+Run only the vision encoder for an image and store the embeddings in the
+VT cache, without touching the LLM. The next `generateVlmFlow` call with
+the same image hits the cache and skips the ~9s ViT pass — even on the
+"first" user query, because you've already done the encode in the
+background.
+
+```kotlin
+// Fire as soon as the user picks/imports an image
+viewModelScope.launch {
+    engine.precomputeVisionEmbeddings(
+        imageBytes     = bytes,
+        projectorPath  = projectorGgufPath,
+        imageMaxTokens = 256,
+    )
+    // Or, if you've already derived a key:
+    // engine.precomputeVisionEmbeddings(bytes, vtKey)
+}
+```
+
+The `app/.../VlmScreen.kt` image-picker callback shows the canonical
+fire-and-forget pattern. With pre-warm + VLM-KV cache stacked, the
+"first" user query feels under a second:
+
+| Scenario | TTFT |
+|---|---:|
+| Cold (no pre-warm, no caches) | ~18.7 s |
+| Pre-warmed VT only (first prompt on a known image) | ~9.0 s |
+| Both caches warm (any subsequent prompt on same image) | ~hundreds of ms |
+
+The host pays the ViT cost once per image, in the background,
+out-of-band from any user interaction.
+
+### Per-op CPU/GPU routing — `opOffload` (shipped, opt-in)
+
+> ⚠️ **Adreno 810 caveat**: opOffload=true currently triggers
+> `vk::DeviceLostError` on Adreno 810's Vulkan driver during the
+> 234-token image-prefill compute graph (kernel TDR). The mechanism
+> works correctly (verified via `graph splits = 368 (with bs=512), 1
+> (with bs=1)`); the failure is a driver-level GPU watchdog. Until
+> we add per-device gating or split the image-prefill into smaller
+> Vulkan dispatches, **leave opOffload=false on Adreno 810**. On
+> hardware with a stable Vulkan driver (most desktop GPUs) it
+> delivers the speedup described below.
 
 Pass `opOffload = true` to `engine.load(...)` to enable per-op routing.
 What this does:
@@ -566,6 +610,8 @@ nativeVlmGetInfo()                                                     : String?
 nativeVlmGetDefaultMarker()                                            : String
 
 nativeVlmGenerateStream(messagesJson, imageData[], vtKeys[]?, vlmKvKey?, maxTokens, callback) : Boolean
+
+nativeVlmPrecomputeVisionEmbeddings(imageData, vtKey[32]) : Boolean
 
 nativeVtCacheInit(dir, budgetBytes)        : Boolean
 nativeVtCacheRelease()

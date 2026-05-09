@@ -428,6 +428,37 @@ class GGMLEngine {
     fun getVlmDefaultMarker(): String = GGUFNativeLib.nativeVlmGetDefaultMarker()
 
     /**
+     * Run only the vision encoder for [imageBytes] and store the resulting
+     * embeddings in the VT cache under a key derived the same way
+     * [computeVtKey] does. No LLM context is touched.
+     *
+     * Use this to pre-warm the VT cache in the background — e.g. as soon as
+     * the user picks/imports an image, kick this off so the first actual
+     * query against the image hits the cache and skips the ~9s ViT pass on
+     * Snapdragon 7s Gen 3.
+     *
+     * Suspends on [Dispatchers.IO]; returns true on successful encode + store.
+     * Requires: [load] succeeded, [loadVlmProjector] succeeded, [vtCacheInit]
+     * succeeded.
+     */
+    suspend fun precomputeVisionEmbeddings(
+        imageBytes: ByteArray,
+        projectorPath: String,
+        imageMaxTokens: Int,
+    ): Boolean = withContext(Dispatchers.IO) {
+        val key = computeVtKey(imageBytes, projectorPath, imageMaxTokens)
+        GGUFNativeLib.nativeVlmPrecomputeVisionEmbeddings(imageBytes, key)
+    }
+
+    /** Lower-level overload — caller supplies an already-derived 32-byte VT key. */
+    suspend fun precomputeVisionEmbeddings(
+        imageBytes: ByteArray,
+        vtKey: ByteArray,
+    ): Boolean = withContext(Dispatchers.IO) {
+        GGUFNativeLib.nativeVlmPrecomputeVisionEmbeddings(imageBytes, vtKey)
+    }
+
+    /**
      * Stream generation with text + images. The user message content should
      * contain the marker from [getVlmDefaultMarker] at each image's position.
      *

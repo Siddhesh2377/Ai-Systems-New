@@ -199,6 +199,21 @@ internal object GGUFNativeLib {
     external fun nativeVlmGetDefaultMarker(): String
 
     /**
+     * Run only the vision encoder for [imageData] and store the resulting
+     * embeddings in the VT cache under [vtKey] (32 bytes). No LLM context is
+     * touched — purely a ViT warm-up. Subsequent
+     * [nativeVlmGenerateStream] calls with the same [vtKey] hit the cache and
+     * skip the ~9s ViT pass.
+     *
+     * Requires: text model loaded, projector loaded, VT cache initialised.
+     * Returns true on successful encode + store.
+     */
+    external fun nativeVlmPrecomputeVisionEmbeddings(
+        imageData: ByteArray,
+        vtKey: ByteArray,
+    ): Boolean
+
+    /**
      * Generate from text + images. messagesJson must contain image markers
      * (from [nativeVlmGetDefaultMarker]) where each image should appear.
      *
