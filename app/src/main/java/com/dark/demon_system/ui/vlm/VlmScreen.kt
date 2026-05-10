@@ -122,6 +122,15 @@ fun VlmScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             ModelStatusCard(state = state, vm = vm)
+
+            val routing by vm.routing.collectAsState()
+            Text(
+                routing,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontFamily = FontFamily.Monospace,
+                modifier = Modifier.fillMaxWidth(),
+            )
             val prewarm by vm.prewarmState.collectAsState()
             ImagePickerCard(
                 bitmap = imageBitmap,

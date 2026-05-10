@@ -2856,10 +2856,21 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmLoadProjector(
     const char * path = env->GetStringUTFChars(jpath, nullptr);
 
     auto params = mtmd_context_params_default();
-    // GPU dispatch is NOT controlled by this flag — it's a coarse hammer that
-    // affects more than just the vision encoder. Real heterogeneous routing
-    // (per-op CPU/GPU placement based on M) is wired through a custom
-    // ggml_backend_sched in the load path. Leave this off.
+    // use_gpu is wired through clip.cpp (registers Vulkan + allocates
+    // weights on GPU buft so ggml_backend_sched produces 1 split, not
+    // 202). Architecturally correct AND verified on-device:
+    //   "alloc_compute_meta: graph splits = 1, nodes = 406"
+    //
+    // BUT: Adreno 810's Vulkan driver still TDRs (vk::DeviceLostError
+    // after ~6 seconds of sustained compute) even with the clean
+    // single-split graph. This is a kernel-level GPU watchdog issue, not
+    // something we can engineer around from userspace.
+    //
+    // Default to false here so the SDK is stable on the device family
+    // where this matters most. Hosts running on Mali / desktop GPUs /
+    // Adreno 6xx-7xx can flip to true via an SDK API once we expose one.
+    // The clip.cpp infrastructure stays in place — when a clean Vulkan
+    // path becomes possible, only this flag changes.
     params.use_gpu       = false;
     params.n_threads     = nThreads > 0
         ? nThreads

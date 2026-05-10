@@ -36,6 +36,11 @@ class VlmViewModel(app: Application) : AndroidViewModel(app) {
     private var vtCacheReady: Boolean = false
     private var vlmKvCacheReady: Boolean = false
     private var modelFingerprint: String = ""
+    private var encoder: com.dark.gguf_lib.VlmEncoder? = null
+
+    /** Human-readable routing decision for the on-screen debug strip. */
+    private val _routing = MutableStateFlow("Encoder: not initialised")
+    val routing: StateFlow<String> = _routing.asStateFlow()
 
     /**
      * The chat-template prefix that sits between the system prompt and the
@@ -153,6 +158,16 @@ class VlmViewModel(app: Application) : AndroidViewModel(app) {
                     getApplication<Application>().filesDir, "vlm_kv_cache",
                 ).absolutePath
                 vlmKvCacheReady = engine.vlmKvCacheInit(kvCacheDir, 300L * 1024L * 1024L)
+
+                // Construct the encoder scheduler now that everything's loaded.
+                encoder = com.dark.gguf_lib.VlmEncoder(
+                    engine             = engine,
+                    projectorPath      = projectorPath,
+                    modelFingerprint   = modelFingerprint,
+                    systemPrompt       = "",
+                    chatTemplatePrefix = chatTemplatePrefix,
+                    imageMaxTokens     = imageMaxTokens,
+                ).also { _routing.value = it.describeRouting() }
 
                 _state.value = VlmState.Ready
             } catch (t: Throwable) {
@@ -307,60 +322,23 @@ class VlmViewModel(app: Application) : AndroidViewModel(app) {
      * initialised.
      */
     fun precomputeVisionFor(imageBytes: ByteArray) {
-        if (!engine.isLoaded || !engine.isVlmLoaded) {
+        val enc = encoder
+        if (enc == null || !engine.isLoaded || !engine.isVlmLoaded) {
             _prewarmState.value = PrewarmState.Idle
             return
         }
-        // Cancel any in-flight pre-warm — newer image takes precedence.
         prewarmJob?.cancel()
         prewarmJob = viewModelScope.launch(Dispatchers.IO) {
             val t0 = System.currentTimeMillis()
             _prewarmState.value = PrewarmState.InProgress(startedAt = t0)
+            var totalChunks = 0
+            var blobBytes   = 0L
+            var nTokens     = 0
             try {
-                val marker = engine.getVlmDefaultMarker()
-                val pre = JSONArray().apply {
-                    put(JSONObject().apply {
-                        put("role", "user")
-                        put("content", "$marker\n")
-                    })
-                }.toString()
-
-                val vtKey = if (vtCacheReady) {
-                    engine.computeVtKey(imageBytes, projectorPath, imageMaxTokens)
-                } else null
-
-                if (!vlmKvCacheReady) {
-                    // Fallback: ViT-only pre-warm if VLM-KV cache isn't open.
-                    val ok = vtKey?.let {
-                        engine.precomputeVisionEmbeddings(imageBytes, it, _imageQuality.value)
-                    } ?: false
-                    val dt = System.currentTimeMillis() - t0
-                    _prewarmState.value = PrewarmState.Done(durationMs = dt, cached = ok)
-                    return@launch
-                }
-
-                val vlmKvKey = engine.computeVlmKvKey(
-                    imageBytes         = imageBytes,
-                    projectorPath      = projectorPath,
-                    imageMaxTokens     = imageMaxTokens,
-                    modelFingerprint   = modelFingerprint,
-                    systemPrompt       = "",
-                    chatTemplatePrefix = chatTemplatePrefix,
-                )
-
-                var totalChunks = 0
-                var blobBytes   = 0L
-                var nTokens     = 0
-
-                engine.precomputeVlmKvStateFlow(
-                    messagesJson = pre,
-                    imageBytes   = imageBytes,
-                    vlmKvKey     = vlmKvKey,
-                    vtKey        = vtKey,
-                    imageQuality = _imageQuality.value,
-                ).collect { ev ->
+                enc.submit(imageBytes, _imageQuality.value).collect { ev ->
                     when (ev) {
-                        is com.dark.gguf_lib.VlmPrewarmEvent.Started -> {
+                        is com.dark.gguf_lib.VlmEncodeEvent.Queued -> { /* no-op */ }
+                        is com.dark.gguf_lib.VlmEncodeEvent.Started -> {
                             totalChunks = ev.totalChunks
                             _prewarmState.value = PrewarmState.InProgress(
                                 startedAt   = t0,
@@ -368,27 +346,26 @@ class VlmViewModel(app: Application) : AndroidViewModel(app) {
                                 totalChunks = ev.totalChunks,
                             )
                         }
-                        is com.dark.gguf_lib.VlmPrewarmEvent.ChunkStart -> {
+                        is com.dark.gguf_lib.VlmEncodeEvent.Stage -> {
                             val verb = if (ev.isImage) "Encoding image" else "Decoding text"
                             _prewarmState.value = PrewarmState.InProgress(
-                                startedAt    = t0,
-                                stage        = "$verb chunk ${ev.index + 1}/${ev.total}…",
-                                chunkIndex   = ev.index,
-                                totalChunks  = ev.total,
+                                startedAt   = t0,
+                                stage       = "$verb chunk ${ev.index + 1}/${ev.total}…",
+                                chunkIndex  = ev.index,
+                                totalChunks = ev.total,
                             )
                         }
-                        is com.dark.gguf_lib.VlmPrewarmEvent.ChunkDone -> {
-                            // Bump the index to "completed" so the bar advances.
+                        is com.dark.gguf_lib.VlmEncodeEvent.ChunkDone -> {
                             _prewarmState.value = PrewarmState.InProgress(
                                 startedAt    = t0,
-                                stage        = "Decoding into LLM (chunk ${ev.index + 1}/${ev.total})…",
+                                stage        = "Decoded chunk ${ev.index + 1}/${ev.total}",
                                 chunkIndex   = ev.index + 1,
                                 totalChunks  = ev.total,
                                 lastEncodeMs = ev.encodeMs.takeIf { it > 0f },
                                 lastDecodeMs = ev.decodeMs.takeIf { it > 0f },
                             )
                         }
-                        is com.dark.gguf_lib.VlmPrewarmEvent.StateStored -> {
+                        is com.dark.gguf_lib.VlmEncodeEvent.StateStored -> {
                             blobBytes = ev.blobBytes
                             nTokens   = ev.nTokens
                             _prewarmState.value = PrewarmState.InProgress(
@@ -398,7 +375,7 @@ class VlmViewModel(app: Application) : AndroidViewModel(app) {
                                 totalChunks = totalChunks,
                             )
                         }
-                        is com.dark.gguf_lib.VlmPrewarmEvent.Done -> {
+                        is com.dark.gguf_lib.VlmEncodeEvent.Done -> {
                             _prewarmState.value = PrewarmState.Done(
                                 durationMs  = ev.totalMs,
                                 cached      = ev.cached,
@@ -407,7 +384,7 @@ class VlmViewModel(app: Application) : AndroidViewModel(app) {
                                 nTokens     = nTokens,
                             )
                         }
-                        is com.dark.gguf_lib.VlmPrewarmEvent.Error -> {
+                        is com.dark.gguf_lib.VlmEncodeEvent.Error -> {
                             _prewarmState.value = PrewarmState.Failed(ev.message)
                         }
                     }
