@@ -10,6 +10,7 @@
 
 #include "model_loader.h"
 #include "../pipeline/pipeline_globals.h"
+#include "../core/edit_cache.h"
 #include "../state/diffusion_state.h"
 #include "../utils/sd_logger.h"
 #include "../utils/config.h"
@@ -615,6 +616,9 @@ void cleanup() {
     // Drop CLIP embedding cache so a new model never sees stale embeddings
     // from a different tokenizer / dimension.
     clear_clip_cache();
+    // Drop the DiffEdit last-gen cache. Latents + embeds are model-specific
+    // (different tokenizer + UNet weights → meaningless across loads).
+    invalidate_edit_cache();
 
     if (clipSession && clipInterpreter) {
         clipInterpreter->releaseSession(clipSession);

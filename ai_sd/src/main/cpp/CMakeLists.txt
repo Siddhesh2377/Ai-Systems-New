@@ -196,6 +196,7 @@ set(AI_SD_SOURCES
 
     # Core inference pipeline (ported from xororz, refactored Phase 1.10)
     src/core/pipeline_orchestrator.cpp
+    src/core/edit_cache.cpp
 
     # Phase 5 feature modules
     src/segmentation/segmenter.cpp

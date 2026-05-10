@@ -10,6 +10,7 @@
 
 #include "../pipeline/diffusion_pipeline.h"
 #include "pipeline_context.h"
+#include "edit_cache.h"
 #include "../utils/sd_logger.h"
 
 #include <chrono>
@@ -980,6 +981,34 @@ GenerationResult generateImage(
     log_tensor_stats("latents_pre_vae_scale", latents.data(),
                      static_cast<int>(latents.size()));
 #endif
+
+    // Cache the final clean latent + the cond/uncond CLIP embeddings for
+    // the DiffEdit text-driven edit feature. Captured BEFORE the
+    // 1/0.18215 VAE-scale rescale because that's the form the edit path's
+    // re-noise step expects (matches scheduler.add_noise contract).
+    {
+        auto& cache = sd_pipeline::edit_cache();
+        std::lock_guard<std::mutex> _(sd_pipeline::edit_cache_mutex());
+        cache.latent.assign(latents.begin(), latents.end());
+        cache.text_embedding = text_embedding_float;
+        cache.sample_w = sample_width;
+        cache.sample_h = sample_height;
+        cache.output_w = output_width;
+        cache.output_h = output_height;
+        cache.text_embedding_size = text_embedding_size;
+        cache.scheduler_type = scheduler_type;
+        cache.cfg = cfg;
+        cache.steps = steps;
+        cache.seed = seed;
+        cache.original_prompt = prompt;
+        cache.original_negative_prompt = negative_prompt;
+        cache.valid = true;
+        SD_LOG_INFO("[EDIT] Cached final latent (%zu floats) + embeds (%zu floats) "
+                    "for %dx%d @ %s/%d steps",
+                    cache.latent.size(), cache.text_embedding.size(),
+                    cache.output_w, cache.output_h,
+                    cache.scheduler_type.c_str(), cache.steps);
+    }
 
     latents = xt::eval((1.0 / 0.18215) * latents);
 
