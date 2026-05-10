@@ -1033,6 +1033,39 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeReleaseStyleTransfer(
     SD_LOG_INFO("[STYLE] Released");
 }
 
+// Returns a flat int[] of supported (w, h) pairs the loaded UNet binary
+// can run at. Filesystem-only — no model load required, no QNN init.
+// Caller passes the model directory and the base resolution baked into
+// the .bin (xororz/Mr-J-369 packs put this in the dir name, e.g.
+// `output_512` → 512×512). Used by the consuming app to populate the
+// resolution selector, which is the cleanest fix for the silent
+// noise-on-1024² problem we hit when the patch file is missing.
+JNIEXPORT jintArray JNICALL
+Java_com_dark_ai_1sd_SDNativeLib_nativeGetSupportedResolutions(
+        JNIEnv* env, jobject /* thiz */,
+        jstring modelDir, jint baseWidth, jint baseHeight) {
+    std::string dir = jstring_to_string(env, modelDir);
+    auto resolutions = sd_pipeline::get_supported_resolutions(
+        dir, static_cast<int>(baseWidth), static_cast<int>(baseHeight));
+
+    jsize n = static_cast<jsize>(resolutions.size() * 2);
+    jintArray result = env->NewIntArray(n);
+    if (!result) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return nullptr;
+    }
+    if (n == 0) return result;
+
+    std::vector<jint> flat;
+    flat.reserve(static_cast<size_t>(n));
+    for (const auto& r : resolutions) {
+        flat.push_back(r.width);
+        flat.push_back(r.height);
+    }
+    env->SetIntArrayRegion(result, 0, n, flat.data());
+    return result;
+}
+
 } // extern "C"
 
 // Defined here so the unique_ptr<T> globals' full types are in scope for

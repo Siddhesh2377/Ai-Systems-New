@@ -10,6 +10,7 @@
 
 #include <string>
 #include <memory>
+#include <vector>
 
 // Forward declarations
 struct SDModelConfig;
@@ -41,5 +42,24 @@ bool loadStandaloneQnnUpscaler(const std::string& modelPath);
 
 /// Release the standalone upscaler if loaded.
 void releaseStandaloneQnnUpscaler();
+
+/// (width, height) pair returned by get_supported_resolutions.
+struct Resolution {
+    int width;
+    int height;
+};
+
+/// Scan `modelDir` for `.patch` files and combine with the base
+/// resolution to enumerate every (width, height) the loaded UNet binary
+/// can run at. Patch files follow xororz / Mr-J-369 naming:
+///   `<N>.patch`         — square resolution N×N
+///   `<W>x<H>.patch`     — rectangular WxH
+/// `baseW`/`baseH` are always included (whatever the unet.bin was
+/// compiled for, typically 512×512 for SD-1.5 `min` variants). Result
+/// is sorted by total pixel count ascending and de-duplicated.
+/// Independent of model load state — pure filesystem scan, safe to call
+/// before `initialize_models`.
+std::vector<Resolution> get_supported_resolutions(const std::string& modelDir,
+                                                   int baseW, int baseH);
 
 }  // namespace sd_pipeline

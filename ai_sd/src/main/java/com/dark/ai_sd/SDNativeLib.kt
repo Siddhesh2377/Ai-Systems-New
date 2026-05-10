@@ -170,6 +170,24 @@ class SDNativeLib {
      */
     external fun nativeGetSocInfo(): String
 
+    /**
+     * Enumerate every (width, height) the model in [modelDir] can run at.
+     * Scans the directory for `.patch` files (`<N>.patch` for square or
+     * `<W>x<H>.patch` for rectangular) and combines with [baseWidth] x
+     * [baseHeight] (the resolution baked into the UNet `.bin` — usually
+     * 512×512 for SD-1.5 `min` variants, often visible in the parent dir
+     * name like `output_512`).
+     *
+     * @return flat int array `[w0, h0, w1, h1, ...]` sorted by total
+     *         pixel count ascending. Empty if [modelDir] doesn't exist
+     *         and [baseWidth]/[baseHeight] are non-positive.
+     */
+    external fun nativeGetSupportedResolutions(
+        modelDir: String,
+        baseWidth: Int,
+        baseHeight: Int
+    ): IntArray
+
     // ── Segmenter (Phase 5.3 — MobileSAM) ──
 
     external fun nativeLoadSegmenter(encoderPath: String, decoderPath: String, useOpenCL: Boolean): Boolean

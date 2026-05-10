@@ -469,6 +469,38 @@ class DiffusionManager(private val context: Context) {
      */
     fun getSocInfo(): String = nativeLib.nativeGetSocInfo()
 
+    /**
+     * List every (width, height) the model in [modelDir] supports. The
+     * UNet binary's baked resolution ([baseWidth] x [baseHeight], usually
+     * 512x512 for SD-1.5 `min` variants) is always included; additional
+     * resolutions come from `.patch` files alongside the .bin.
+     *
+     * Use this to populate the resolution selector — picking a resolution
+     * not in the returned list silently produces noise output because the
+     * UNet only updates the part of the latent its baked shape covers.
+     *
+     * @param modelDir Directory containing unet.bin and any patches
+     * @param baseWidth Width baked into the UNet (default 512)
+     * @param baseHeight Height baked into the UNet (default 512)
+     * @return list of supported (width, height) pairs, sorted ascending
+     *         by total pixel count
+     */
+    fun getSupportedResolutions(
+        modelDir: String,
+        baseWidth: Int = 512,
+        baseHeight: Int = 512
+    ): List<Pair<Int, Int>> {
+        val flat = nativeLib.nativeGetSupportedResolutions(modelDir, baseWidth, baseHeight)
+        if (flat.isEmpty()) return emptyList()
+        val out = ArrayList<Pair<Int, Int>>(flat.size / 2)
+        var i = 0
+        while (i + 1 < flat.size) {
+            out.add(flat[i] to flat[i + 1])
+            i += 2
+        }
+        return out
+    }
+
     fun getCurrentModel(): DiffusionModelConfig? = currentModel
 
     fun isBackendRunning(): Boolean = _backendState.value is DiffusionBackendState.Running

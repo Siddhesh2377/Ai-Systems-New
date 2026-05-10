@@ -149,6 +149,21 @@ class StableDiffusionManager private constructor(context: Context) {
     }
 
     /**
+     * List every (width, height) the model in [modelDir] supports.
+     *
+     * The UNet binary is compiled for one base resolution (typically 512x512
+     * for SD-1.5 `min` variants); other resolutions require sibling `.patch`
+     * files. This call enumerates the base + every `.patch` it finds, so the
+     * UI can offer only resolutions that will actually produce a real image.
+     * Picking a resolution not in this list silently produces noise output.
+     */
+    fun getSupportedResolutions(
+        modelDir: String,
+        baseWidth: Int = 512,
+        baseHeight: Int = 512
+    ): List<Pair<Int, Int>> = diffusionManager.getSupportedResolutions(modelDir, baseWidth, baseHeight)
+
+    /**
      * Get the currently loaded model.
      */
     fun getCurrentModel(): DiffusionModelConfig? {

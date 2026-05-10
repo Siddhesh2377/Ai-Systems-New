@@ -722,6 +722,78 @@ bool loadStandaloneQnnUpscaler(const std::string& modelPath) {
     return true;
 }
 
+std::vector<Resolution> get_supported_resolutions(const std::string& modelDir,
+                                                   int baseW, int baseH) {
+    std::vector<Resolution> result;
+    std::vector<std::pair<int,int>> seen;
+    auto already_seen = [&](int w, int h) {
+        for (auto& p : seen) if (p.first == w && p.second == h) return true;
+        return false;
+    };
+
+    if (baseW > 0 && baseH > 0) {
+        result.push_back({baseW, baseH});
+        seen.push_back({baseW, baseH});
+    }
+
+    if (modelDir.empty()) return result;
+
+    std::error_code ec;
+    std::filesystem::path dir(modelDir);
+    if (!std::filesystem::is_directory(dir, ec)) {
+        QNN_WARN("get_supported_resolutions: not a directory: %s",
+                 modelDir.c_str());
+        return result;
+    }
+
+    auto parse_uint = [](const std::string& s) -> int {
+        if (s.empty()) return -1;
+        for (char c : s) if (c < '0' || c > '9') return -1;
+        try { return std::stoi(s); } catch (...) { return -1; }
+    };
+
+    for (auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file(ec)) continue;
+        std::string name = entry.path().filename().string();
+        // Must end with ".patch"
+        const std::string suffix = ".patch";
+        if (name.size() <= suffix.size()) continue;
+        if (name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0)
+            continue;
+        std::string stem = name.substr(0, name.size() - suffix.size());
+
+        int w = -1, h = -1;
+        auto x_pos = stem.find('x');
+        if (x_pos == std::string::npos) {
+            // Square: <N>.patch
+            int n = parse_uint(stem);
+            if (n > 0) { w = n; h = n; }
+        } else {
+            // Rectangular: <W>x<H>.patch
+            int parsed_w = parse_uint(stem.substr(0, x_pos));
+            int parsed_h = parse_uint(stem.substr(x_pos + 1));
+            if (parsed_w > 0 && parsed_h > 0) { w = parsed_w; h = parsed_h; }
+        }
+        if (w < 0 || h < 0) continue;
+
+        if (!already_seen(w, h)) {
+            result.push_back({w, h});
+            seen.push_back({w, h});
+        }
+    }
+
+    std::sort(result.begin(), result.end(),
+              [](const Resolution& a, const Resolution& b) {
+        long la = static_cast<long>(a.width) * a.height;
+        long lb = static_cast<long>(b.width) * b.height;
+        if (la != lb) return la < lb;
+        return a.width < b.width;
+    });
+
+    return result;
+}
+
 void releaseStandaloneQnnUpscaler() {
     if (upscalerApp) {
         upscalerApp.reset();
