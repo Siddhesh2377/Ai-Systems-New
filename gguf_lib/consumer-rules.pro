@@ -36,10 +36,28 @@
 # Enums — name()/ordinal() are used at runtime.
 -keep enum com.dark.gguf_lib.DeviceTier { *; }
 -keep enum com.dark.gguf_lib.DocKind { *; }
+-keep enum com.dark.gguf_lib.ImageQuality { *; }
+-keep enum com.dark.gguf_lib.GpuVendor { *; }
+-keep enum com.dark.gguf_lib.GpuDeviceType { *; }
+-keep enum com.dark.gguf_lib.VlmEncoder$EncodeStrategy { *; }
 
 # Public data classes.
 -keep class com.dark.gguf_lib.LoadingParams { *; }
 -keep class com.dark.gguf_lib.GenerationResult { *; }
+-keep class com.dark.gguf_lib.GpuProfile { *; }
+
+# Public process-wide error tracker.
+-keep class com.dark.gguf_lib.ErrorTracker { *; }
+
+# Public VLM scheduler + hardware probe.
+-keep class com.dark.gguf_lib.HardwareEngine { *; }
+-keep class com.dark.gguf_lib.VlmEncoder { public *; }
+-keep class com.dark.gguf_lib.VlmEncoder$* { *; }
+-keep class com.dark.gguf_lib.VlmEncodeEvent { *; }
+-keep class com.dark.gguf_lib.VlmEncodeEvent$* { *; }
+-keep class com.dark.gguf_lib.VlmPrewarmEvent { *; }
+-keep class com.dark.gguf_lib.VlmPrewarmEvent$* { *; }
+-keep interface com.dark.gguf_lib.models.VlmPrewarmCallback { *; }
 
 # Suspend functions generate Continuation subclasses; preserve them.
 -keep class kotlin.coroutines.Continuation
