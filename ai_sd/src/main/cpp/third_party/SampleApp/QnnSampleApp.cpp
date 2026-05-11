@@ -6,6 +6,7 @@
 //
 //==============================================================================
 
+#include <dlfcn.h>
 #include <inttypes.h>
 
 #include <cstring>
@@ -55,13 +56,55 @@ sample_app::QnnSampleApp::QnnSampleApp(QnnFunctionPointers qnnFunctionPointers,
       m_dumpOutputs(dumpOutputs),
       m_isBackendInitialized(false),
       m_isContextCreated(false),
-      m_numInferences(numInferences) {
+      m_numInferences(numInferences),
+      m_backendLibraryHandle(backendLibraryHandle) {
   split(m_inputListPaths, inputListPaths, ',');
   split(m_opPackagePaths, opPackagePaths, ',');
   if (m_outputPath.empty()) {
     m_outputPath = s_defaultOutputPath;
   }
   return;
+}
+
+sample_app::QnnSampleApp::~QnnSampleApp() {
+  // Defensive teardown: any of these may have been left half-initialized
+  // by a failed initializeBackend / createContext / createFromBinary.
+  // Free in reverse construction order; ignore individual failures since
+  // we have no way to recover from them in a destructor.
+  if (m_isContextCreated) {
+    if (m_qnnFunctionPointers.qnnInterface.contextFree) {
+      m_qnnFunctionPointers.qnnInterface.contextFree(m_context, nullptr);
+    }
+    m_isContextCreated = false;
+    m_context = nullptr;
+  }
+  if (m_profileBackendHandle && m_qnnFunctionPointers.qnnInterface.profileFree) {
+    m_qnnFunctionPointers.qnnInterface.profileFree(m_profileBackendHandle);
+    m_profileBackendHandle = nullptr;
+  }
+  if (m_isDeviceCreated && m_qnnFunctionPointers.qnnInterface.deviceFree) {
+    m_qnnFunctionPointers.qnnInterface.deviceFree(m_deviceHandle);
+    m_isDeviceCreated = false;
+    m_deviceHandle = nullptr;
+  }
+  if (m_isBackendInitialized && m_qnnFunctionPointers.qnnInterface.backendFree) {
+    m_qnnFunctionPointers.qnnInterface.backendFree(m_backendHandle);
+    m_isBackendInitialized = false;
+    m_backendHandle = nullptr;
+  }
+  if (m_logHandle && m_qnnFunctionPointers.qnnInterface.logFree) {
+    m_qnnFunctionPointers.qnnInterface.logFree(m_logHandle);
+    m_logHandle = nullptr;
+  }
+  if (m_graphsInfo) {
+    qnn_wrapper_api::freeGraphsInfo(&m_graphsInfo, m_graphsCount);
+    m_graphsInfo = nullptr;
+    m_graphsCount = 0;
+  }
+  if (m_backendLibraryHandle) {
+    dlclose(m_backendLibraryHandle);
+    m_backendLibraryHandle = nullptr;
+  }
 }
 
 std::string sample_app::QnnSampleApp::getBackendBuildId() {
@@ -392,8 +435,11 @@ sample_app::StatusCode sample_app::QnnSampleApp::createFromBinary() {
   if (ProfilingLevel::OFF != m_profilingLevel) {
     extractBackendProfilingInfo(m_profileBackendHandle);
   }
-  m_isContextCreated = true;
+  // Only mark the context created if contextCreateFromBinary succeeded.
+  // The previous unconditional set caused the destructor / freeContext
+  // to call contextFree on a never-created handle when init failed.
   if (StatusCode::SUCCESS == returnStatus) {
+    m_isContextCreated = true;
     for (size_t graphIdx = 0; graphIdx < m_graphsCount; graphIdx++) {
       if (nullptr == m_qnnFunctionPointers.qnnInterface.graphRetrieve) {
         QNN_ERROR("graphRetrieveFnHandle is nullptr.");
@@ -573,18 +619,23 @@ sample_app::StatusCode sample_app::QnnSampleApp::createDevice() {
       QNN_ERROR("Failed to create device");
       return verifyFailReturnStatus(qnnStatus);
     }
+    if (QNN_SUCCESS == qnnStatus) {
+      m_isDeviceCreated = true;
+    }
   }
   return StatusCode::SUCCESS;
 }
 
 sample_app::StatusCode sample_app::QnnSampleApp::freeDevice() {
-  if (nullptr != m_qnnFunctionPointers.qnnInterface.deviceFree) {
+  if (m_isDeviceCreated && nullptr != m_qnnFunctionPointers.qnnInterface.deviceFree) {
     auto qnnStatus = m_qnnFunctionPointers.qnnInterface.deviceFree(m_deviceHandle);
     if (QNN_SUCCESS != qnnStatus && QNN_DEVICE_ERROR_UNSUPPORTED_FEATURE != qnnStatus) {
       QNN_ERROR("Failed to free device");
       return verifyFailReturnStatus(qnnStatus);
     }
   }
+  m_isDeviceCreated = false;
+  m_deviceHandle = nullptr;
   return StatusCode::SUCCESS;
 }
 

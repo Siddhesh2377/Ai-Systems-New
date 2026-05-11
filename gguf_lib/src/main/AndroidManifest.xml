@@ -1,4 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <application>
+        <!-- Required by GGML_OPENCL backend on Android 12+ (uses-native-library
+             gating). libvulkan.so is part of the platform NDK and does not need
+             a uses-native-library declaration, but we add it for clarity. -->
+        <uses-native-library
+            android:name="libOpenCL.so"
+            android:required="false" />
+        <uses-native-library
+            android:name="libOpenCL-pixel.so"
+            android:required="false" />
+    </application>
+
 </manifest>

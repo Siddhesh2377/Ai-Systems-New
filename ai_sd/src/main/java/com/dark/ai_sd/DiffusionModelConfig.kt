@@ -98,13 +98,96 @@ sealed class UpscaleState {
 }
 
 /**
- * Configuration for the runtime environment
+ * Sealed class representing the state of a segmentation operation
+ */
+sealed class SegmenterState {
+    object Idle : SegmenterState()
+    object Processing : SegmenterState()
+    data class Complete(
+        val mask: Bitmap,
+        val score: Float,
+        val width: Int,
+        val height: Int,
+        val timeMs: Int
+    ) : SegmenterState()
+    data class Error(val message: String) : SegmenterState()
+}
+
+/**
+ * Sealed class representing the state of a LaMa inpainting operation
+ */
+sealed class LamaState {
+    object Idle : LamaState()
+    object Processing : LamaState()
+    data class Complete(
+        val bitmap: Bitmap,
+        val timeMs: Int
+    ) : LamaState()
+    data class Error(val message: String) : LamaState()
+}
+
+/**
+ * Sealed class representing the state of a depth estimation operation
+ */
+sealed class DepthState {
+    object Idle : DepthState()
+    object Processing : DepthState()
+    data class Complete(
+        val depthMap: Bitmap,
+        val timeMs: Int
+    ) : DepthState()
+    data class Error(val message: String) : DepthState()
+}
+
+/**
+ * Sealed class representing the state of a style transfer operation
+ */
+sealed class StyleState {
+    object Idle : StyleState()
+    object Processing : StyleState()
+    data class Complete(
+        val bitmap: Bitmap,
+        val timeMs: Int
+    ) : StyleState()
+    data class Error(val message: String) : StyleState()
+}
+
+/**
+ * Configuration for applying a LoRA to the loaded model.
+ *
+ * @param path Absolute path to the .safetensors LoRA file
+ * @param weight LoRA strength multiplier (typically 0.5-1.5, negative inverts)
+ */
+data class LoRAConfig(
+    val path: String,
+    val weight: Float = 1.0f
+)
+
+/**
+ * Sealed class representing the state of LoRA operations
+ */
+sealed class LoRAState {
+    object None : LoRAState()
+    object Applying : LoRAState()
+    data class Applied(val loras: List<LoRAConfig>) : LoRAState()
+    data class Error(val message: String) : LoRAState()
+}
+
+/**
+ * Configuration for the runtime environment.
+ *
+ * When [tarXzSourcePath] or [safetyCheckerSourcePath] are set, the manager
+ * copies from those local files instead of extracting from bundled assets.
+ * This supports downloading files externally (e.g. from HuggingFace) before
+ * initializing the runtime.
  */
 data class DiffusionRuntimeConfig(
     val runtimeDir: String,
     val qnnLibsAssetPath: String = "qnnlibs",
     val safetyCheckerEnabled: Boolean = true,
-    val safetyCheckerPath: String = "assets/safety_checker.mnn"
+    val safetyCheckerAssetPath: String = "safety_checker.mnn",
+    val tarXzSourcePath: String? = null,
+    val safetyCheckerSourcePath: String? = null
 )
 
 /**
@@ -112,6 +195,7 @@ data class DiffusionRuntimeConfig(
  */
 sealed class RuntimeSetupState {
     object Idle : RuntimeSetupState()
+    data class Downloading(val bytesDownloaded: Long, val totalBytes: Long, val fileName: String) : RuntimeSetupState()
     data class CopyingAsset(val bytesWritten: Long, val totalBytes: Long) : RuntimeSetupState()
     data class Extracting(val filesExtracted: Int, val currentFile: String) : RuntimeSetupState()
     object CopyingSafetyChecker : RuntimeSetupState()

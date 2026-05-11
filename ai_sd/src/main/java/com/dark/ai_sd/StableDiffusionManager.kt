@@ -90,6 +90,27 @@ class StableDiffusionManager private constructor(context: Context) {
         diffusionManager.stopBackend()
     }
 
+    // LoRA state
+    val loraState: StateFlow<LoRAState> = diffusionManager.loraState
+
+    /**
+     * Apply a LoRA to the currently loaded model.
+     * Requires MNN/CPU mode. The model directory must contain the base .safetensors file.
+     *
+     * @param config LoRA configuration (path to .safetensors + weight)
+     * @return true if successfully applied
+     */
+    fun applyLora(config: LoRAConfig): Boolean {
+        return diffusionManager.applyLora(config)
+    }
+
+    /**
+     * Remove all active LoRAs and restore original model weights.
+     */
+    fun clearLora() {
+        diffusionManager.clearLora()
+    }
+
     /**
      * Generate an image asynchronously.
      * Monitor progress through [diffusionGenerationState] flow.
@@ -126,6 +147,21 @@ class StableDiffusionManager private constructor(context: Context) {
     fun getSocInfo(): String {
         return diffusionManager.getSocInfo()
     }
+
+    /**
+     * List every (width, height) the model in [modelDir] supports.
+     *
+     * The UNet binary is compiled for one base resolution (typically 512x512
+     * for SD-1.5 `min` variants); other resolutions require sibling `.patch`
+     * files. This call enumerates the base + every `.patch` it finds, so the
+     * UI can offer only resolutions that will actually produce a real image.
+     * Picking a resolution not in this list silently produces noise output.
+     */
+    fun getSupportedResolutions(
+        modelDir: String,
+        baseWidth: Int = 512,
+        baseHeight: Int = 512
+    ): List<Pair<Int, Int>> = diffusionManager.getSupportedResolutions(modelDir, baseWidth, baseHeight)
 
     /**
      * Get the currently loaded model.
@@ -171,5 +207,85 @@ class StableDiffusionManager private constructor(context: Context) {
      */
     fun releaseUpscaler() {
         diffusionManager.releaseUpscaler()
+    }
+
+    // ========================================================================
+    // Segmenter (Phase 5.3 — MobileSAM)
+    // ========================================================================
+
+    val segmenterState: StateFlow<SegmenterState> = diffusionManager.segmenterState
+
+    fun loadSegmenter(encoderPath: String, decoderPath: String, useOpenCL: Boolean = false): Boolean {
+        return diffusionManager.loadSegmenter(encoderPath, decoderPath, useOpenCL)
+    }
+
+    fun segmenterEncodeImage(inputBitmap: Bitmap): Boolean {
+        return diffusionManager.segmenterEncodeImage(inputBitmap)
+    }
+
+    fun segmentAtPoint(x: Float, y: Float) {
+        diffusionManager.segmentAtPoint(x, y)
+    }
+
+    fun segmentWithBox(x1: Float, y1: Float, x2: Float, y2: Float) {
+        diffusionManager.segmentWithBox(x1, y1, x2, y2)
+    }
+
+    fun releaseSegmenter() {
+        diffusionManager.releaseSegmenter()
+    }
+
+    // ========================================================================
+    // LaMa Inpainter (Phase 5.4)
+    // ========================================================================
+
+    val lamaState: StateFlow<LamaState> = diffusionManager.lamaState
+
+    fun loadLamaInpainter(modelPath: String, useOpenCL: Boolean = false): Boolean {
+        return diffusionManager.loadLamaInpainter(modelPath, useOpenCL)
+    }
+
+    fun lamaInpaint(inputBitmap: Bitmap, maskBitmap: Bitmap) {
+        diffusionManager.lamaInpaint(inputBitmap, maskBitmap)
+    }
+
+    fun releaseLamaInpainter() {
+        diffusionManager.releaseLamaInpainter()
+    }
+
+    // ========================================================================
+    // Depth Estimator (Phase 5.5)
+    // ========================================================================
+
+    val depthState: StateFlow<DepthState> = diffusionManager.depthState
+
+    fun loadDepthEstimator(modelPath: String, useOpenCL: Boolean = false): Boolean {
+        return diffusionManager.loadDepthEstimator(modelPath, useOpenCL)
+    }
+
+    fun estimateDepth(inputBitmap: Bitmap) {
+        diffusionManager.estimateDepth(inputBitmap)
+    }
+
+    fun releaseDepthEstimator() {
+        diffusionManager.releaseDepthEstimator()
+    }
+
+    // ========================================================================
+    // Style Transfer (Phase 5.6)
+    // ========================================================================
+
+    val styleState: StateFlow<StyleState> = diffusionManager.styleState
+
+    fun loadStyleTransfer(modelPath: String, useOpenCL: Boolean = false): Boolean {
+        return diffusionManager.loadStyleTransfer(modelPath, useOpenCL)
+    }
+
+    fun stylize(contentBitmap: Bitmap, styleBitmap: Bitmap, strength: Float = 1.0f) {
+        diffusionManager.stylize(contentBitmap, styleBitmap, strength)
+    }
+
+    fun releaseStyleTransfer() {
+        diffusionManager.releaseStyleTransfer()
     }
 }

@@ -6,45 +6,39 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 
 /**
- * RAG Engine - Context-preserving retrieval-augmented generation.
+ * Retrieval-augmented generation index with a separate embedding model and
+ * a binary-quantized vector index.
  *
- * Uses a separate embedding model (e.g., EmbeddingGemma-300M Q4) with late chunking
- * for context-aware embeddings and binary quantization for compact storage.
- * Model-agnostic: the RAG index survives LLM swaps.
+ * Two-stage retrieval: a binary-quantization Hamming search produces top-K
+ * candidates, then cosine similarity re-ranks down to top-N. Indexes are
+ * model-agnostic — re-loading a different LLM doesn't invalidate them; only
+ * the embedding model fingerprint must match for [importIndex].
  *
- * Usage:
- * ```
- * val rag = RAGEngine()
- * rag.create()
- * rag.loadModel("/path/to/embedding-model.gguf")
- *
- * rag.addDocument("Long document text...", "doc-1")
- * rag.addDocument("Another document...", "doc-2")
- *
- * val results = rag.query("search query")
- * results.forEach { println("${it.docId}: ${it.score} - ${it.text}") }
- *
- * // Or build an augmented prompt for LLM generation
- * val prompt = rag.buildPrompt("user question", "Answer based on context:")
- *
- * rag.close()
+ * ```kotlin
+ * RAGEngine().use { rag ->
+ *     rag.create()
+ *     rag.loadModel("/path/to/embedding-model.gguf")
+ *     rag.addDocument("Long document text...", docId = "doc-1")
+ *     val hits = rag.query("search query")
+ * }
  * ```
  */
 class RAGEngine : AutoCloseable {
 
-    private var created = false
-    private var modelLoaded = false
+    @Volatile private var created = false
+    @Volatile private var modelLoaded = false
 
     /**
-     * Create the RAG engine with given parameters.
+     * Configure the engine. Must be called before any other method.
      *
-     * @param threads Number of threads (0 = auto-detect)
-     * @param chunkSize Tokens per chunk (default 256)
-     * @param chunkOverlap Overlap tokens between chunks (default 32)
-     * @param dims Matryoshka embedding dimensions: 768/512/256/128 (default 256)
-     * @param topK BQ search candidates before re-ranking (default 32)
-     * @param topN Final results after cosine re-rank (default 5)
-     * @param lateChunking Embed full doc then chunk for context-aware embeddings (default true)
+     * @param threads      0 = auto-detect.
+     * @param chunkSize    Tokens per chunk.
+     * @param chunkOverlap Tokens overlapping between adjacent chunks.
+     * @param dims         Matryoshka embedding truncation: 768/512/256/128.
+     * @param topK         BQ candidates retrieved before re-ranking.
+     * @param topN         Final results returned after cosine re-rank.
+     * @param lateChunking Embed the full document once, then chunk the
+     *                     context-aware token embeddings (preferred).
      */
     fun create(
         threads: Int = 0,
@@ -53,10 +47,10 @@ class RAGEngine : AutoCloseable {
         dims: Int = 256,
         topK: Int = 32,
         topN: Int = 5,
-        lateChunking: Boolean = true
+        lateChunking: Boolean = true,
     ): Boolean {
         created = GGUFNativeLib.nativeCreateRagEngine(
-            threads, chunkSize, chunkOverlap, dims, topK, topN, lateChunking
+            threads, chunkSize, chunkOverlap, dims, topK, topN, lateChunking,
         )
         modelLoaded = false
         return created
@@ -65,34 +59,24 @@ class RAGEngine : AutoCloseable {
     val isCreated: Boolean get() = created
     val isModelLoaded: Boolean get() = modelLoaded && GGUFNativeLib.nativeRagIsLoaded()
 
-    /**
-     * Load the embedding model for RAG. Call after [create].
-     *
-     * @param path Path to the embedding model GGUF file
-     */
-    fun loadModel(path: String): Boolean {
-        if (!created) return false
+    /** Load the embedding model. Call after [create]. */
+    suspend fun loadModel(path: String): Boolean = withContext(Dispatchers.IO) {
+        if (!created) return@withContext false
         modelLoaded = GGUFNativeLib.nativeLoadRagModel(path)
-        return modelLoaded
+        modelLoaded
     }
 
-    /**
-     * Load the embedding model from a file descriptor (Android SAF).
-     *
-     * @param fd File descriptor from ContentResolver.openFileDescriptor()
-     */
-    fun loadModelFromFd(fd: Int): Boolean {
-        if (!created) return false
+    /** Load the embedding model from a file descriptor (Android SAF). */
+    suspend fun loadModelFromFd(fd: Int): Boolean = withContext(Dispatchers.IO) {
+        if (!created) return@withContext false
         modelLoaded = GGUFNativeLib.nativeLoadRagModelFromFd(fd)
-        return modelLoaded
+        modelLoaded
     }
 
     /**
-     * Add a document to the RAG index. The document is chunked and embedded.
+     * Chunk [text] and add the embeddings to the index.
      *
-     * @param text Full document text
-     * @param docId Unique document identifier
-     * @return Number of chunks created, or -1 on error
+     * @return Number of chunks created, or -1 on error.
      */
     suspend fun addDocument(text: String, docId: String): Int = withContext(Dispatchers.IO) {
         if (!isModelLoaded) return@withContext -1
@@ -100,42 +84,63 @@ class RAGEngine : AutoCloseable {
     }
 
     /**
-     * Remove a document and all its chunks from the index.
+     * Parse raw document bytes natively (PDF, DOCX, EPUB, ODT, PPTX, XLSX,
+     * RTF, HTML, or plain text), extract text, and index it.
      *
-     * @param docId Document identifier to remove
-     * @return 0 on success, -1 if not found
+     * @return Number of chunks (>= 0) or a negative error code:
+     *   -1 unsupported format, -2 parse error, -3 empty, -4 OOM, -5 internal,
+     *   -6 engine not ready.
      */
-    fun removeDocument(docId: String): Int {
-        if (!created) return -1
-        return GGUFNativeLib.nativeRagRemoveDocument(docId)
+    suspend fun ingestBytes(
+        bytes: ByteArray,
+        mimeHint: String? = null,
+        nameHint: String? = null,
+        docId: String,
+    ): Int = withContext(Dispatchers.IO) {
+        if (!isModelLoaded) return@withContext -6
+        GGUFNativeLib.nativeRagIngestBytes(bytes, mimeHint, nameHint, docId)
     }
 
-    /** Clear all documents and chunks from the index. */
-    fun clear() {
-        if (created) GGUFNativeLib.nativeRagClear()
-    }
-
-    /** Number of indexed documents. */
-    val documentCount: Int get() = if (created) GGUFNativeLib.nativeRagDocumentCount() else 0
-
-    /** Number of indexed chunks across all documents. */
-    val chunkCount: Int get() = if (created) GGUFNativeLib.nativeRagChunkCount() else 0
+    /** Detect document kind from raw bytes / MIME / filename hints. */
+    fun detectKind(
+        bytes: ByteArray? = null,
+        mimeHint: String? = null,
+        nameHint: String? = null,
+    ): DocKind = DocKind.fromNative(GGUFNativeLib.nativeRagDetectKind(bytes, mimeHint, nameHint))
 
     /**
-     * Query the RAG index. Returns ranked results by relevance.
+     * Remove a document and all its chunks.
      *
-     * Uses two-stage retrieval: binary quantization Hamming search for candidates,
-     * then cosine similarity re-ranking for final results.
-     *
-     * @param query The search query
-     * @return List of [RAGResult] sorted by descending score
+     * @return 0 on success, -1 if not found.
      */
+    fun removeDocument(docId: String): Int =
+        if (created) GGUFNativeLib.nativeRagRemoveDocument(docId) else -1
+
+    /** Drop everything from the index. */
+    fun clear() { if (created) GGUFNativeLib.nativeRagClear() }
+
+    val documentCount: Int get() = if (created) GGUFNativeLib.nativeRagDocumentCount() else 0
+    val chunkCount: Int    get() = if (created) GGUFNativeLib.nativeRagChunkCount()    else 0
+
+    /** Run a query. Results are sorted by descending score. */
     suspend fun query(query: String): List<RAGResult> = withContext(Dispatchers.IO) {
         if (!isModelLoaded) return@withContext emptyList()
+        parseResults(GGUFNativeLib.nativeRagQuery(query))
+    }
 
-        val jsonStr = GGUFNativeLib.nativeRagQuery(query) ?: return@withContext emptyList()
+    /**
+     * Query restricted to chunks whose docId starts with [docIdPrefix]. An
+     * empty prefix is equivalent to [query].
+     */
+    suspend fun queryFiltered(query: String, docIdPrefix: String): List<RAGResult> =
+        withContext(Dispatchers.IO) {
+            if (!isModelLoaded) return@withContext emptyList()
+            parseResults(GGUFNativeLib.nativeRagQueryFiltered(query, docIdPrefix))
+        }
 
-        try {
+    private fun parseResults(jsonStr: String?): List<RAGResult> {
+        if (jsonStr.isNullOrEmpty()) return emptyList()
+        return try {
             val arr = JSONArray(jsonStr)
             (0 until arr.length()).map { i ->
                 val obj = arr.getJSONObject(i)
@@ -143,7 +148,7 @@ class RAGEngine : AutoCloseable {
                     text = obj.getString("text"),
                     docId = obj.getString("doc_id"),
                     chunkIndex = obj.getInt("chunk_index"),
-                    score = obj.getDouble("score").toFloat()
+                    score = obj.getDouble("score").toFloat(),
                 )
             }
         } catch (_: Exception) {
@@ -152,25 +157,51 @@ class RAGEngine : AutoCloseable {
     }
 
     /**
-     * Query the index and build an augmented prompt with retrieved context.
+     * Extract plain UTF-8 text from raw bytes without ingesting. Useful for
+     * downstream Kotlin-side text handling (FTS5, summarization, etc.).
      *
-     * @param query The search query (used for retrieval)
-     * @param userPrompt The user's prompt template to augment with context
-     * @return Augmented prompt with context injected, or null on error
+     * @return null on parse failure / unsupported / empty bytes.
+     */
+    suspend fun extractText(
+        bytes: ByteArray,
+        mimeHint: String? = null,
+        nameHint: String? = null,
+    ): String? = withContext(Dispatchers.IO) {
+        GGUFNativeLib.nativeRagExtractText(bytes, mimeHint, nameHint)
+    }
+
+    /**
+     * Serialize the in-memory index (chunks, BQ vectors, float embeddings,
+     * doc metadata, model fingerprint) to a portable byte buffer. Persist
+     * this and call [importIndex] on the next launch to skip re-embedding.
+     *
+     * @return null on error / engine not created.
+     */
+    fun exportIndex(): ByteArray? =
+        if (created) GGUFNativeLib.nativeRagExportIndex() else null
+
+    /**
+     * Restore an index serialized by [exportIndex]. The embedding model must
+     * be loaded and match the fingerprint stored in the buffer.
+     *
+     * @return 0 on success; otherwise:
+     *   -1 magic mismatch, -2 version mismatch, -3 dim mismatch,
+     *   -4 model fingerprint mismatch, -5 corrupt buffer, -6 engine not ready.
+     */
+    fun importIndex(buf: ByteArray): Int =
+        if (created) GGUFNativeLib.nativeRagImportIndex(buf) else -6
+
+    /**
+     * Run [query], retrieve context, and return [userPrompt] augmented with
+     * the retrieved passages.
      */
     suspend fun buildPrompt(query: String, userPrompt: String): String? = withContext(Dispatchers.IO) {
         if (!isModelLoaded) return@withContext null
         GGUFNativeLib.nativeRagBuildPrompt(query, userPrompt)
     }
 
-    /**
-     * Get RAG engine info as JSON string.
-     * Includes model status, chunk count, document count, and configuration.
-     */
-    fun info(): String? {
-        if (!created) return null
-        return GGUFNativeLib.nativeRagInfo()
-    }
+    /** Engine info as JSON: model status, chunk count, document count, configuration. */
+    fun info(): String? = if (created) GGUFNativeLib.nativeRagInfo() else null
 
     override fun close() {
         if (created) {

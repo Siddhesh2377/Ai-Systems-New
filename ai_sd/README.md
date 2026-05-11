@@ -1,45 +1,43 @@
-# ai_sd — Image Generation & Processing SDK
+# ai_sd
 
-On-device Stable Diffusion and AI image processing for Android.
+On-device Stable Diffusion inference and image processing for Android.
 
-**Package**: `com.dark.ai_sd`
-**ABI**: `arm64-v8a`
-**Min SDK**: 27
-
----
+Runs entirely on-device with no network dependency. Supports Qualcomm NPU
+acceleration via QNN and cross-device CPU/GPU inference via MNN.
 
 ## Backends
 
-| Backend | Hardware | Precision | Models |
-|---------|----------|-----------|--------|
-| QNN (Hexagon HTP) | Snapdragon 8 Gen 1+ | W8A16 | QNN-compiled .bin |
-| MNN (CPU) | Any ARM64 | FP32 | .mnn converted models |
-| MNN + OpenCL | Adreno GPU | FP16 | .mnn converted models |
+| Backend | Hardware | Models |
+|---------|----------|--------|
+| QNN (Hexagon HTP) | Snapdragon 8 Gen 1+ | Pre-compiled `.bin` contexts |
+| MNN (CPU) | Any ARM64 | `.mnn` converted models |
+| MNN + OpenCL | Adreno/Mali GPU | `.mnn` converted models |
 
----
-
-## Quick Start
+## Usage
 
 ```kotlin
-val sdManager = StableDiffusionManager.getInstance(context)
+val sd = StableDiffusionManager.getInstance(context)
 
-// Load model
-sdManager.loadModel(DiffusionModelConfig(
+// 1. Initialize runtime (extracts QNN libs from assets)
+sd.initialize()
+
+// 2. Load model
+sd.loadModel(DiffusionModelConfig(
     name = "SD 1.5",
     modelDir = "/path/to/model/",
     runOnCpu = true
 ))
 
-// Generate
-sdManager.generateImage(DiffusionGenerationParams(
+// 3. Generate
+sd.generateImage(DiffusionGenerationParams(
     prompt = "a photo of a cat",
     steps = 28,
     width = 512,
     height = 512
 ))
 
-// Observe state
-sdManager.diffusionGenerationState.collect { state ->
+// 4. Observe results
+sd.diffusionGenerationState.collect { state ->
     when (state) {
         is DiffusionGenerationState.Progress -> updateUI(state.progress)
         is DiffusionGenerationState.Complete -> showImage(state.bitmap)
@@ -49,149 +47,92 @@ sdManager.diffusionGenerationState.collect { state ->
 }
 ```
 
----
+## LoRA
 
-## Generation API
-
-### StableDiffusionManager (High-Level)
-
-```kotlin
-// Lifecycle
-loadModel(config: DiffusionModelConfig, width: Int = 512, height: Int = 512): Boolean
-cleanup()
-
-// Generation
-generateImage(params: DiffusionGenerationParams)
-cancelGeneration()
-resetGenerationState()
-
-// State flows
-diffusionBackendState: StateFlow<DiffusionBackendState>
-diffusionGenerationState: StateFlow<DiffusionGenerationState>
-isGenerating: StateFlow<Boolean>
-
-// Upscaler
-loadUpscaler(modelPath: String, useMnn: Boolean = true, useOpenCL: Boolean = false): Boolean
-upscaleImage(inputBitmap: Bitmap)
-releaseUpscaler()
-upscaleState: StateFlow<UpscaleState>
-```
-
-### SDNativeLib (Low-Level JNI)
+Runtime LoRA support for MNN/CPU mode. Requires the base `.safetensors` file
+in the model directory alongside the `.mnn` files.
 
 ```kotlin
-nativeInitRuntime(qnnLibDir: String): Boolean
-nativeLoadModel(clipPath, unetPath, vaeDecoderPath, vaeEncoderPath,
-                tokenizerPath, safetyCheckerPath, patchPath, modelDir,
-                qnnBackendPath, qnnSystemLibPath, textEmbeddingSize,
-                runOnCpu, useCpuClip, isPony, useSafetyChecker): Boolean
-nativeGenerate(prompt, negativePrompt, steps, cfgScale, seed,
-               width, height, scheduler, useOpenCL, inputImage,
-               mask, denoiseStrength, showProcess, showStride,
-               callback: SDCallback): Boolean
-nativeStopGeneration()
-nativeRelease(): Boolean
-nativeGetModelInfo(): String
-nativeLoadUpscaler(modelPath, useMnn, useOpenCL): Boolean
-nativeUpscaleImage(inputRgb, width, height, callback): Boolean
-nativeReleaseUpscaler()
-```
+// Apply a LoRA
+sd.applyLora(LoRAConfig(
+    path = "/path/to/lora.safetensors",
+    weight = 0.8f
+))
 
-### SDCallback
+// Stack multiple LoRAs
+sd.applyLora(LoRAConfig(path = "/path/to/another.safetensors", weight = 0.5f))
 
-```kotlin
-interface SDCallback {
-    fun onProgress(step: Int, totalSteps: Int)
-    fun onImageProgress(step: Int, totalSteps: Int, rgbData: ByteArray, width: Int, height: Int)
-    fun onComplete(rgbData: ByteArray, width: Int, height: Int, seed: Long, generationTimeMs: Int)
-    fun onError(message: String)
+// Observe state
+sd.loraState.collect { state ->
+    when (state) {
+        is LoRAState.Applying -> showProgress()
+        is LoRAState.Applied -> showActive(state.loras)
+        is LoRAState.Error -> showError(state.message)
+        else -> {}
+    }
 }
+
+// Clear all LoRAs (restores original weights)
+sd.clearLora()
 ```
 
----
+LoRA application regenerates CLIP and UNet weights from the base model, which
+takes 30-90 seconds depending on storage speed. Generation after that is
+unchanged. QNN mode does not support LoRA.
 
 ## Generation Modes
 
-| Mode | Inputs | Use Case |
-|------|--------|----------|
+| Mode | Inputs | Description |
+|------|--------|-------------|
 | txt2img | prompt | Generate from text |
 | img2img | prompt + image | Transform existing image |
-| inpainting | prompt + image + mask | Edit specific regions |
+| inpainting | prompt + image + mask | Edit masked regions |
 
-### Schedulers
+Schedulers: `dpm` (DPM-Solver++, ~28 steps) and `euler_a` (Euler Ancestral, ~20 steps).
 
-| Scheduler | Quality | Speed |
-|-----------|---------|-------|
-| `dpm` (DPM-Solver++) | Higher | ~28 steps |
-| `euler_a` (Euler Ancestral) | Good | ~20 steps |
+## Image Processing
 
----
+Five standalone modules, each with load/process/release lifecycle:
 
-## Image Processing Modules
+| Module | Model | Typical Latency |
+|--------|-------|-----------------|
+| 4x Upscaler | Real-ESRGAN | ~2s per image |
+| Segmentation | MobileSAM | ~12ms per query |
+| Inpainting | LaMa | 100-300ms |
+| Depth Estimation | MiDaS / DepthAnything | 15-60ms |
+| Style Transfer | AdaIN | 30-60ms |
 
-C++ implementations ready for MNN-converted models:
-
-| Module | Class | Model | Speed |
-|--------|-------|-------|-------|
-| **4x Super-Resolution** | `upscaler/` | Real-ESRGAN x4v3 (17MB) | 4-8ms/tile |
-| **Segmentation** | `segmenter/` | MobileSAM TinyViT (~50MB) | ~12ms/query |
-| **Object Removal** | `lama_inpainter/` | LaMa-Dilated (~100MB) | 100-300ms |
-| **Depth Estimation** | `depth_estimator/` | MiDaS v2.1 / DepthAnything (25-50MB) | 15-60ms |
-| **Style Transfer** | `style_transfer/` | AdaIN arbitrary (10-70MB) | 30-60 FPS |
-
-### Combo Pipelines
-
-- **Smart Object Removal**: tap -> MobileSAM (12ms) -> LaMa (200ms) -> upscale (8ms) = ~220ms
-- **Background Swap**: MobileSAM foreground + SD-generated background
-- **Depth Bokeh**: depth estimation -> selective blur by depth
-- **AI Photo Enhance**: depth + bokeh + upscale
-
----
-
-## Data Classes
+All modules follow the same pattern:
 
 ```kotlin
-data class DiffusionModelConfig(
-    val name: String,
-    val modelDir: String,
-    val textEmbeddingSize: Int = 768,
-    val runOnCpu: Boolean = false,
-    val useCpuClip: Boolean = false,
-    val isPony: Boolean = false,
-    val safetyMode: Boolean = false
-)
-
-data class DiffusionGenerationParams(
-    val prompt: String,
-    val negativePrompt: String = "",
-    val steps: Int = 28,
-    val cfgScale: Float = 7f,
-    val seed: Long? = null,
-    val width: Int = 512,
-    val height: Int = 512,
-    val scheduler: String = "dpm",
-    val useOpenCL: Boolean = false,
-    val inputImage: String? = null,
-    val mask: String? = null,
-    val denoiseStrength: Float = 0.6f,
-    val showDiffusionProcess: Boolean = false,
-    val showDiffusionStride: Int = 1
-)
-
-// State sealed classes: DiffusionBackendState, DiffusionGenerationState,
-// DiffusionGenerationResult, UpscaleState
+sd.loadSegmenter(encoderPath, decoderPath)
+sd.segmenterEncodeImage(bitmap)
+sd.segmentAtPoint(x, y)
+sd.segmenterState.collect { /* SegmenterState.Complete has mask bitmap */ }
+sd.releaseSegmenter()
 ```
 
----
+## State Flows
+
+All operations expose reactive state via `StateFlow`:
+
+- `diffusionBackendState` -- Idle, Starting, Running, Error
+- `diffusionGenerationState` -- Idle, Progress, Complete, Error
+- `isGenerating` -- boolean guard
+- `loraState` -- None, Applying, Applied, Error
+- `upscaleState` -- Idle, Processing, Complete, Error
+- `segmenterState`, `lamaState`, `depthState`, `styleState`
 
 ## Build
 
-```
-NDK: 27.3.13750724
-CMake: 3.31.4
-ABI: arm64-v8a (16KB page alignment)
-C++: -O3 -ffast-math -march=armv8.2-a+dotprod+fp16 -flto=thin
-R8: Enabled (consumer-rules.pro auto-applied to consumers)
-```
+- NDK 27.3, CMake 3.31.4, arm64-v8a only
+- C++17 with `-O3 -ffast-math -march=armv8.2-a+dotprod+fp16 -flto=thin`
+- 16KB page alignment for Android 15+ compatibility
+- R8 minification enabled, consumer ProGuard rules included
 
-Dependencies: MNN (static), QNN SDK (dlopen at runtime), tokenizers-cpp, xtensor, stb, zstd, nlohmann/json.
+Native dependencies (statically linked): MNN, tokenizers-cpp, xtensor, zstd,
+nlohmann/json, stb. QNN SDK loaded at runtime via `dlopen`.
+
+## License
+
+Proprietary. Internal use only.

@@ -1,3 +1,4 @@
+#pragma once
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -31,7 +32,7 @@ struct Shape {
   }
 };
 
-std::vector<uint8_t> fillBuffer(const std::vector<uint32_t> &values,
+inline std::vector<uint8_t> fillBuffer(const std::vector<uint32_t> &values,
                                 int need_bits) {
   if (need_bits == 8) {
     std::vector<uint8_t> result(values.size());
@@ -72,7 +73,7 @@ std::vector<uint8_t> fillBuffer(const std::vector<uint32_t> &values,
   return buffer;
 }
 
-std::vector<uint8_t> quantizeWeights(const std::vector<float> &weights,
+inline std::vector<uint8_t> quantizeWeights(const std::vector<float> &weights,
                                      const Shape &shape) {
   if (shape.dims.size() != 4) return {};
 
@@ -169,7 +170,7 @@ std::vector<uint8_t> quantizeWeights(const std::vector<float> &weights,
   return result;
 }
 
-std::vector<float> applyLoRA(
+inline std::vector<float> applyLoRA(
     const std::vector<float> &original_weights, const std::string &weight_name,
     const std::vector<SafeTensorReader *> &lora_readers,
     const std::vector<float> &lora_weights = {}) {
@@ -190,8 +191,6 @@ std::vector<float> applyLoRA(
 
       if (!lora_reader->has_tensor(lora_down_key) ||
           !lora_reader->has_tensor(lora_up_key)) {
-        // std::cout << "Missing LoRA tensors for weight: " << weight_name
-        //           << std::endl;
         continue;
       }
 
@@ -236,7 +235,7 @@ std::vector<float> applyLoRA(
   return final_weights;
 }
 
-void generateModel(const std::string &dir, const std::string &safetensor_file,
+inline void generateModel(const std::string &dir, const std::string &safetensor_file,
                    const std::string &model_name,
                    const std::vector<std::vector<std::string>> &structure,
                    const std::vector<std::string> &loras = {},
@@ -247,8 +246,11 @@ void generateModel(const std::string &dir, const std::string &safetensor_file,
   std::vector<SafeTensorReader *> lora_readers;
   std::vector<std::unique_ptr<SafeTensorReader>> lora_reader_holders;
   for (const auto &lora_file : loras) {
+    // Support both relative (dir + "/" + file) and absolute paths
+    std::string lora_path = (!lora_file.empty() && lora_file[0] == '/')
+        ? lora_file : (dir + "/" + lora_file);
     auto lora_reader =
-        std::make_unique<SafeTensorReader>(dir + "/" + lora_file);
+        std::make_unique<SafeTensorReader>(lora_path);
     lora_readers.push_back(lora_reader.get());
     lora_reader_holders.push_back(std::move(lora_reader));
   }
@@ -297,7 +299,7 @@ void generateModel(const std::string &dir, const std::string &safetensor_file,
   std::rename((dir + "/model.mnn.weight").c_str(), final_name.c_str());
 }
 
-void patchModel(const std::string &dir, const std::string &safetensor_file,
+inline void patchModel(const std::string &dir, const std::string &safetensor_file,
                 const std::string &model_name,
                 const std::unordered_map<std::string, int> &small_weights,
                 bool fp16 = false) {
@@ -342,7 +344,7 @@ void patchModel(const std::string &dir, const std::string &safetensor_file,
   mnn_file.close();
 }
 
-void generateClipModel(const std::string &dir,
+inline void generateClipModel(const std::string &dir,
                        const std::string &safetensor_file,
                        bool clip_skip_2 = false,
                        const std::vector<std::string> &loras = {},
@@ -376,7 +378,7 @@ void generateClipModel(const std::string &dir,
   token_emb_file.close();
 }
 
-void generateMNNModels(const std::string &dir,
+inline void generateMNNModels(const std::string &dir,
                        const std::string &safetensor_file,
                        bool clip_skip_2 = false,
                        const std::vector<std::string> &loras = {},

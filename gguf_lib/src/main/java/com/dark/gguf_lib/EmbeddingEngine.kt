@@ -9,49 +9,52 @@ import kotlinx.coroutines.withTimeout
 import kotlin.coroutines.resume
 
 /**
- * EmbeddingEngine - Separate model instance for text embeddings.
+ * Standalone text embedding engine. Holds its own llama.cpp model + context,
+ * independent of [GGMLEngine] — both can run concurrently.
  *
- * Runs independently of the main GGMLEngine, allowing simultaneous
- * LLM generation and embedding computation.
+ * Each call to [embed] tokenizes the text, decodes a single batch, and pulls
+ * the sequence embedding (or the last-token embedding if the model doesn't
+ * expose pooled embeddings). [embedBatch] is a simple sequential map; consumers
+ * with concurrent batching needs should drive [embed] from their own dispatcher.
  *
- * Usage:
- * ```
- * val embedder = EmbeddingEngine()
- * embedder.load("/path/to/embedding-model.gguf")
- *
- * val vector = embedder.embed("Hello world")
- * println("Dimension: ${vector?.size}")
- *
- * embedder.close()
+ * ```kotlin
+ * EmbeddingEngine().use { embedder ->
+ *     embedder.load("/path/to/embedding-model.gguf")
+ *     val v = embedder.embed("hello world")
+ * }
  * ```
  */
 class EmbeddingEngine : AutoCloseable {
 
-    private var loaded = false
+    @Volatile private var loaded = false
 
     /**
      * Load an embedding model.
      *
-     * @param path Path to the .gguf embedding model
-     * @param threads Number of threads (0 = auto-detect)
-     * @param contextSize Context size for embeddings (default 512)
+     * @param path        Absolute path to the .gguf embedding model.
+     * @param threads     0 = inherit batch threads from the current thread mode.
+     * @param contextSize Max input length in tokens. Default 512 — bump only
+     *                    if you need to embed long passages.
      */
-    fun load(path: String, threads: Int = 0, contextSize: Int = 512): Boolean {
-        loaded = GGUFNativeLib.nativeLoadEmbeddingModel(path, threads, contextSize)
-        return loaded
-    }
+    suspend fun load(path: String, threads: Int = 0, contextSize: Int = 512): Boolean =
+        withContext(Dispatchers.IO) {
+            loaded = GGUFNativeLib.nativeLoadEmbeddingModel(path, threads, contextSize)
+            loaded
+        }
 
     val isLoaded: Boolean get() = loaded
 
     /**
-     * Generate embeddings for text. Returns normalized float vector.
-     * Times out after 15 seconds.
+     * Compute an embedding for [text]. Returns null on tokenize/decode failure
+     * or if the model isn't loaded. Times out after 15 seconds.
+     *
+     * @param normalize L2-normalize the result so cosine similarity reduces to a dot product.
      */
     suspend fun embed(text: String, normalize: Boolean = true): FloatArray? = withContext(Dispatchers.IO) {
         if (!loaded) return@withContext null
         try {
             withTimeout(15_000) {
-                suspendCancellableCoroutine { cont ->
+                suspendCancellableCoroutine<FloatArray?> { cont ->
                     val cb = object : EmbeddingCallback {
                         override fun onComplete(result: EmbeddingResult) {
                             if (cont.isActive) cont.resume(result.embeddings)
@@ -68,9 +71,7 @@ class EmbeddingEngine : AutoCloseable {
         }
     }
 
-    /**
-     * Batch embed multiple texts.
-     */
+    /** Sequential batch embedding. Returns one FloatArray per input (null on per-item failure). */
     suspend fun embedBatch(texts: List<String>, normalize: Boolean = true): List<FloatArray?> =
         texts.map { embed(it, normalize) }
 

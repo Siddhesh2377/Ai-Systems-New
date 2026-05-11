@@ -12,7 +12,13 @@
 
 #include "state/diffusion_state.h"
 #include "upscaler/upscaler.h"
+#include "segmentation/segmenter.h"
+#include "inpainting/lama_inpainter.h"
+#include "depth/depth_estimator.h"
+#include "style/style_transfer.h"
 #include "pipeline/pipeline_globals.h"
+#include "model/qnn_model.h"  // full type needed for unique_ptr<QnnModel>::reset()
+#include "loader/model_loader.h"  // ensureQnnSystemReady + loadStandaloneQnnUpscaler
 #include "utils/cpu_affinity.h"
 #include "utils/jni_utils.h"
 #include "utils/sd_logger.h"
@@ -36,6 +42,10 @@ static DiffusionState g_sd_state;
 // This prevents release-during-generate race (Bug 5 fix).
 static std::shared_mutex g_sd_mtx;
 static std::atomic<bool> g_sd_stop{false};
+
+// QNN runtime lib dir captured by nativeInitRuntime — used by the standalone
+// QNN upscaler load to compute libQnnHtp.so / libQnnSystem.so paths.
+static std::string g_qnn_lib_dir;
 
 // Helper: convert jstring to std::string
 static std::string jstring_to_string(JNIEnv* env, jstring jstr) {
@@ -88,6 +98,19 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeInitRuntime(
     setenv("ADSP_LIBRARY_PATH", adsp_path.c_str(), 1);
 
     SD_LOG_INFO("ADSP_LIBRARY_PATH set to: %s", adsp_path.c_str());
+
+    // Cache the lib dir so standalone helpers (e.g. QNN upscaler load)
+    // can resolve libQnnHtp.so / libQnnSystem.so paths without a separate
+    // diffusion-model load. Best-effort populate the QNN system funcs now;
+    // failures here don't block runtime init since callers may still use
+    // CPU/MNN paths.
+    g_qnn_lib_dir = libDir;
+    std::string qnnSystemLibPath = libDir + "/libQnnSystem.so";
+    std::string qnnBackendPath = libDir + "/libQnnHtp.so";
+    if (!sd_pipeline::ensureQnnSystemReady(qnnSystemLibPath, qnnBackendPath)) {
+        SD_LOG_WARN("ensureQnnSystemReady failed — QNN-only paths will fail "
+                    "until a diffusion model load succeeds");
+    }
     return JNI_TRUE;
 }
 
@@ -218,35 +241,49 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeGenerate(
         }
     }
 
-    // Handle mask input
+    // Handle mask input.
+    // Two valid sizes: latent-space (sampleW*sampleH*3) or full-resolution
+    // (width*height*3). Anything else means the caller passed the wrong shape
+    // and would silently produce a wrong inpaint without this check.
     if (mask) {
         jsize maskLen = env->GetArrayLength(mask);
         if (maskLen > 0) {
-            params.hasMask = true;
-            // Mask processing is handled inside the pipeline
-            // (same as xororz's server handler)
-            jbyte* maskBytes = env->GetByteArrayElements(mask, nullptr);
-            JniByteArrayGuard maskGuard(env, mask, maskBytes);
             int sampleW = width / 8;
             int sampleH = height / 8;
+            jsize expectedLatent = sampleW * sampleH * 3;
+            jsize expectedFull   = width * height * 3;
+            if (maskLen != expectedLatent && maskLen != expectedFull) {
+                SD_LOG_ERROR(
+                    "Mask size mismatch: got %d bytes; expected %d (latent %dx%dx3) "
+                    "or %d (full %dx%dx3). Skipping mask.",
+                    (int)maskLen, expectedLatent, sampleW, sampleH,
+                    expectedFull, width, height);
+            } else {
+                params.hasMask = true;
+                jbyte* maskBytes = env->GetByteArrayElements(mask, nullptr);
+                JniByteArrayGuard maskGuard(env, mask, maskBytes);
 
-            // Latent-space mask (4 channels)
-            params.mask.resize(4 * sampleW * sampleH);
-            for (int y = 0; y < sampleH; y++) {
-                for (int x = 0; x < sampleW; x++) {
-                    // Average RGB to grayscale, normalize to [0,1]
-                    int srcIdx = (y * sampleW + x) * 3;
-                    float val = (static_cast<uint8_t>(maskBytes[srcIdx]) +
-                                 static_cast<uint8_t>(maskBytes[srcIdx + 1]) +
-                                 static_cast<uint8_t>(maskBytes[srcIdx + 2])) / (3.0f * 255.0f);
-                    for (int c = 0; c < 4; c++) {
-                        params.mask[c * sampleW * sampleH + y * sampleW + x] = val;
+                // Latent-space mask (4 channels). Downsample if caller passed
+                // full-resolution bytes; otherwise read directly.
+                params.mask.resize(4 * sampleW * sampleH);
+                bool isFullRes = (maskLen == expectedFull);
+                for (int y = 0; y < sampleH; y++) {
+                    for (int x = 0; x < sampleW; x++) {
+                        int srcIdx = isFullRes
+                            ? ((y * 8) * width + (x * 8)) * 3
+                            : (y * sampleW + x) * 3;
+                        float val = (static_cast<uint8_t>(maskBytes[srcIdx]) +
+                                     static_cast<uint8_t>(maskBytes[srcIdx + 1]) +
+                                     static_cast<uint8_t>(maskBytes[srcIdx + 2])) / (3.0f * 255.0f);
+                        for (int c = 0; c < 4; c++) {
+                            params.mask[c * sampleW * sampleH + y * sampleW + x] = val;
+                        }
                     }
                 }
-            }
 
-            // Full-resolution mask (3 channels)
-            params.maskFull.resize(3 * width * height);
+                // Full-resolution mask (3 channels)
+                params.maskFull.resize(3 * width * height);
+            }
         }
     }
 
@@ -310,13 +347,21 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeStopGeneration(
 /**
  * Release all model resources.
  */
+// Defined at the bottom of this TU — needs the full unique_ptr<T> types of
+// the module globals which appear later in the file.
+static void cleanup_secondary_modules();
+
 JNIEXPORT jboolean JNICALL
 Java_com_dark_ai_1sd_SDNativeLib_nativeRelease(
         JNIEnv* /* env */, jobject /* thiz */) {
     std::unique_lock lock(g_sd_mtx);
     g_sd_state.release();
     sd_jni::reset_cache();
-    SD_LOG_INFO("Models released");
+    // Tear down upscaler / segmenter / lama / depth / style globals too. Host
+    // apps call nativeRelease expecting a clean slate before model swap or
+    // shutdown; those secondary modules used to leak across.
+    cleanup_secondary_modules();
+    SD_LOG_INFO("Models released (full)");
     return JNI_TRUE;
 }
 
@@ -382,11 +427,23 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeLoadUpscaler(
     }
 
     if (!useMnn) {
-        // QNN path: upscalerApp is a global managed by model_loader
-        // It should be loaded during nativeLoadModel if upscaler_path was provided
-        // For standalone upscaler loading, we'd need to create QnnModel here
-        // For now, check if it's already loaded via the pipeline
-        SD_LOG_INFO("[UPSCALER] QNN upscaler path set: %s", g_upscaler_model_path.c_str());
+        // Standalone QNN upscaler load: createQnnModel + initializeQnnApp,
+        // mirroring LocalDream's per-request /upscale handler.
+        // ensureQnnSystemReady was best-effort'd inside nativeInitRuntime;
+        // re-attempt here if it didn't take (e.g. caller skipped init).
+        if (!g_qnn_lib_dir.empty()) {
+            std::string sys = g_qnn_lib_dir + "/libQnnSystem.so";
+            std::string bk = g_qnn_lib_dir + "/libQnnHtp.so";
+            (void)sd_pipeline::ensureQnnSystemReady(sys, bk);
+        }
+        if (!sd_pipeline::loadStandaloneQnnUpscaler(g_upscaler_model_path)) {
+            SD_LOG_ERROR("[UPSCALER] Standalone QNN load failed for %s",
+                         g_upscaler_model_path.c_str());
+            g_upscaler_loaded = false;
+            return JNI_FALSE;
+        }
+        SD_LOG_INFO("[UPSCALER] QNN upscaler loaded: %s",
+                    g_upscaler_model_path.c_str());
     } else {
         // MNN path: model is loaded on-demand in upscaleImageWithMNN()
         SD_LOG_INFO("[UPSCALER] MNN upscaler path set: %s (opencl=%d)",
@@ -419,6 +476,18 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeUpscaleImage(
     jsize inputLen = env->GetArrayLength(inputRgb);
     if (inputLen != width * height * 3) {
         sd_jni::on_error(env, callback, "Input size mismatch (expected width*height*3)");
+        return JNI_FALSE;
+    }
+
+    // Cap input at 2048×2048: 4× output = 8192×8192 → ~768 MB heap. Larger
+    // inputs OOM-crash on most Android devices.
+    constexpr int UPSCALER_MAX_DIM = 2048;
+    if (width > UPSCALER_MAX_DIM || height > UPSCALER_MAX_DIM) {
+        char buf[160];
+        snprintf(buf, sizeof(buf),
+                 "Upscaler input too large (%dx%d). Max %d on each side; downscale first.",
+                 width, height, UPSCALER_MAX_DIM);
+        sd_jni::on_error(env, callback, buf);
         return JNI_FALSE;
     }
 
@@ -470,6 +539,12 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeReleaseUpscaler(
     std::lock_guard<std::mutex> lock(g_upscaler_mtx);
     g_upscaler_loaded = false;
     g_upscaler_model_path.clear();
+    // Free the QNN upscaler global so memory is reclaimed without a full
+    // nativeRelease. MNN path uses a function-local interpreter; nothing to do.
+    if (upscalerApp) {
+        upscalerApp.reset();
+        SD_LOG_INFO("[UPSCALER] Released QNN upscalerApp");
+    }
     SD_LOG_INFO("[UPSCALER] Released");
 }
 
@@ -488,17 +563,53 @@ static std::string read_sysfs(const char* path) {
     return buf;
 }
 
+// Map known Qualcomm soc_id -> {chipset, marketing generation, sdxl support,
+// recommended QNN model variant}. The soc_id is the canonical sysfs identifier
+// (kernel exposes it as a decimal int). When soc_id is not in the table we
+// fall back to inferring from `machine` if possible. Unknown -> conservative
+// "min" variant which the xororz bundles target as their broadest fallback.
+struct SocEntry {
+    int soc_id;
+    const char* chipset;       // SM-number
+    const char* marketing;     // "8 Gen 3" etc.
+    bool supports_sdxl;
+    const char* recommended_variant; // "8gen1", "8gen2", "8gen3", "min"
+};
+static const SocEntry kSocTable[] = {
+    // 7-series
+    { 530, "SM7325", "778G",          false, "min"   },
+    { 636, "SM7475", "7s Gen 3",      false, "min"   },
+    // 8-series
+    { 415, "SM8350", "8 Gen 1",       false, "8gen1" },
+    { 475, "SM8450", "8 Gen 1+",      false, "8gen1" },
+    { 502, "SM8475", "8+ Gen 1",      false, "8gen1" },
+    { 519, "SM8550", "8 Gen 2",       true,  "8gen2" },
+    { 557, "SM8650", "8 Gen 3",       true,  "8gen3" },
+    { 614, "SM8750", "8 Elite",       true,  "8gen3" },
+    // 8 Gen 5 / sm8845 — added in xororz Apr 2026 commit. Real id verified at
+    // device first-boot; placeholder until confirmed.
+    { 678, "SM8845", "8 Gen 5",       true,  "8gen3" },
+};
+static const SocEntry* find_soc(int id) {
+    for (const auto& e : kSocTable) if (e.soc_id == id) return &e;
+    return nullptr;
+}
+
 /**
  * Get SoC hardware info from sysfs + detect QNN HTP at native level.
  *
- * Returns JSON string:
+ * Returns JSON string with raw sysfs data plus a derived capability section:
  * {
  *   "soc_id": "636",
  *   "machine": "VOLCANO",
  *   "family": "Snapdragon",
  *   "revision": "1.0",
  *   "htp_version": 73,
- *   "has_qnn_htp": true
+ *   "has_qnn_htp": true,
+ *   "chipset": "SM7475",
+ *   "marketing": "7s Gen 3",
+ *   "supports_sdxl": false,
+ *   "recommended_variant": "min"
  * }
  */
 JNIEXPORT jstring JNICALL
@@ -541,15 +652,435 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeGetSocInfo(
         if (f) { fclose(f); hasQnnHtp = true; break; }
     }
 
-    char json[512];
+    // Capability lookup. Unknown soc_id -> conservative defaults.
+    int soc_id_int = atoi(socId.c_str());
+    const SocEntry* soc = find_soc(soc_id_int);
+    const char* chipset = soc ? soc->chipset : "unknown";
+    const char* marketing = soc ? soc->marketing : "unknown";
+    bool supports_sdxl = soc ? soc->supports_sdxl : false;
+    const char* recommended_variant = soc ? soc->recommended_variant : "min";
+
+    // HTP version cross-check: SDXL needs at least HTP V73 (8 Gen 2 era).
+    // If SoC table says yes but HTP libs are older, downgrade.
+    if (supports_sdxl && htpVersion > 0 && htpVersion < 73) {
+        supports_sdxl = false;
+    }
+
+    char json[1024];
     snprintf(json, sizeof(json),
         "{\"soc_id\":\"%s\",\"machine\":\"%s\",\"family\":\"%s\","
-        "\"revision\":\"%s\",\"htp_version\":%d,\"has_qnn_htp\":%s}",
+        "\"revision\":\"%s\",\"htp_version\":%d,\"has_qnn_htp\":%s,"
+        "\"chipset\":\"%s\",\"marketing\":\"%s\","
+        "\"supports_sdxl\":%s,\"recommended_variant\":\"%s\"}",
         socId.c_str(), machine.c_str(), family.c_str(), rev.c_str(),
-        htpVersion, hasQnnHtp ? "true" : "false");
+        htpVersion, hasQnnHtp ? "true" : "false",
+        chipset, marketing,
+        supports_sdxl ? "true" : "false", recommended_variant);
 
     SD_LOG_INFO("SoC Info: %s", json);
     return env->NewStringUTF(json);
 }
 
+// =========================================================================
+// Segmenter (Phase 5.3 — MobileSAM)
+// =========================================================================
+
+static std::mutex g_segmenter_mtx;
+static std::unique_ptr<Segmenter> g_segmenter;
+
+JNIEXPORT jboolean JNICALL
+Java_com_dark_ai_1sd_SDNativeLib_nativeLoadSegmenter(
+        JNIEnv* env, jobject /* thiz */,
+        jstring encoderPath, jstring decoderPath, jboolean useOpenCL) {
+    std::lock_guard<std::mutex> lock(g_segmenter_mtx);
+
+    std::string encoder = jstring_to_string(env, encoderPath);
+    std::string decoder = jstring_to_string(env, decoderPath);
+
+    if (encoder.empty() || decoder.empty()) {
+        SD_LOG_ERROR("[SEGMENTER] Encoder or decoder path is empty");
+        return JNI_FALSE;
+    }
+
+    g_segmenter = std::make_unique<Segmenter>();
+    bool ok = g_segmenter->loadModel(encoder, decoder, useOpenCL);
+    if (!ok) {
+        g_segmenter.reset();
+        SD_LOG_ERROR("[SEGMENTER] Failed to load models");
+    } else {
+        SD_LOG_INFO("[SEGMENTER] Loaded encoder=%s decoder=%s", encoder.c_str(), decoder.c_str());
+    }
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_dark_ai_1sd_SDNativeLib_nativeSegmenterEncodeImage(
+        JNIEnv* env, jobject /* thiz */,
+        jbyteArray rgbBytes, jint width, jint height) {
+    std::lock_guard<std::mutex> lock(g_segmenter_mtx);
+
+    if (!g_segmenter || !g_segmenter->isLoaded()) {
+        SD_LOG_ERROR("[SEGMENTER] Not loaded");
+        return JNI_FALSE;
+    }
+
+    jbyte* bytes = env->GetByteArrayElements(rgbBytes, nullptr);
+    JniByteArrayGuard guard(env, rgbBytes, bytes);
+
+    bool ok = g_segmenter->encodeImage(reinterpret_cast<const uint8_t*>(bytes), width, height);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_dark_ai_1sd_SDNativeLib_nativeSegmentAtPoint(
+        JNIEnv* env, jobject /* thiz */,
+        jfloat x, jfloat y, jobject callback) {
+    std::lock_guard<std::mutex> lock(g_segmenter_mtx);
+
+    if (!g_segmenter || !g_segmenter->isEncoded()) {
+        sd_jni::on_error(env, callback, "Segmenter not ready (load model + encode image first)");
+        return JNI_FALSE;
+    }
+
+    try {
+        auto start = std::chrono::high_resolution_clock::now();
+        float score = 0.0f;
+        auto mask = g_segmenter->segmentAtPoint(x, y, score);
+        auto end = std::chrono::high_resolution_clock::now();
+        int timeMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+        // Return mask as single-channel data through the callback
+        // We pack score into the seed field (reinterpreted as long)
+        long scoreAsLong = static_cast<long>(score * 10000);  // score * 10000 for precision
+        int maskW = static_cast<int>(std::sqrt(mask.size()));  // mask is square (encoder output size)
+        int maskH = maskW;
+        sd_jni::on_complete(env, callback, mask.data(), static_cast<int>(mask.size()),
+                            maskW, maskH, scoreAsLong, timeMs);
+        return JNI_TRUE;
+    } catch (const std::exception& e) {
+        SD_LOG_ERROR("[SEGMENTER] segmentAtPoint failed: %s", e.what());
+        sd_jni::on_error(env, callback, e.what());
+        return JNI_FALSE;
+    }
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_dark_ai_1sd_SDNativeLib_nativeSegmentWithBox(
+        JNIEnv* env, jobject /* thiz */,
+        jfloat x1, jfloat y1, jfloat x2, jfloat y2, jobject callback) {
+    std::lock_guard<std::mutex> lock(g_segmenter_mtx);
+
+    if (!g_segmenter || !g_segmenter->isEncoded()) {
+        sd_jni::on_error(env, callback, "Segmenter not ready (load model + encode image first)");
+        return JNI_FALSE;
+    }
+
+    try {
+        auto start = std::chrono::high_resolution_clock::now();
+        float score = 0.0f;
+        auto mask = g_segmenter->segmentWithBox(x1, y1, x2, y2, score);
+        auto end = std::chrono::high_resolution_clock::now();
+        int timeMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+        long scoreAsLong = static_cast<long>(score * 10000);
+        int maskW = static_cast<int>(std::sqrt(mask.size()));
+        int maskH = maskW;
+        sd_jni::on_complete(env, callback, mask.data(), static_cast<int>(mask.size()),
+                            maskW, maskH, scoreAsLong, timeMs);
+        return JNI_TRUE;
+    } catch (const std::exception& e) {
+        SD_LOG_ERROR("[SEGMENTER] segmentWithBox failed: %s", e.what());
+        sd_jni::on_error(env, callback, e.what());
+        return JNI_FALSE;
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_dark_ai_1sd_SDNativeLib_nativeReleaseSegmenter(
+        JNIEnv* /* env */, jobject /* thiz */) {
+    std::lock_guard<std::mutex> lock(g_segmenter_mtx);
+    if (g_segmenter) {
+        g_segmenter->release();
+        g_segmenter.reset();
+    }
+    SD_LOG_INFO("[SEGMENTER] Released");
+}
+
+// =========================================================================
+// LaMa Inpainter (Phase 5.4)
+// =========================================================================
+
+static std::mutex g_lama_mtx;
+static std::unique_ptr<LamaInpainter> g_lama;
+
+JNIEXPORT jboolean JNICALL
+Java_com_dark_ai_1sd_SDNativeLib_nativeLoadLamaInpainter(
+        JNIEnv* env, jobject /* thiz */,
+        jstring modelPath, jboolean useOpenCL) {
+    std::lock_guard<std::mutex> lock(g_lama_mtx);
+
+    std::string path = jstring_to_string(env, modelPath);
+    if (path.empty()) {
+        SD_LOG_ERROR("[LAMA] Model path is empty");
+        return JNI_FALSE;
+    }
+
+    g_lama = std::make_unique<LamaInpainter>();
+    bool ok = g_lama->loadModel(path, useOpenCL);
+    if (!ok) {
+        g_lama.reset();
+        SD_LOG_ERROR("[LAMA] Failed to load model");
+    } else {
+        SD_LOG_INFO("[LAMA] Loaded: %s", path.c_str());
+    }
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_dark_ai_1sd_SDNativeLib_nativeLamaInpaint(
+        JNIEnv* env, jobject /* thiz */,
+        jbyteArray rgbBytes, jbyteArray maskBytes, jint width, jint height,
+        jobject callback) {
+    std::lock_guard<std::mutex> lock(g_lama_mtx);
+
+    if (!g_lama || !g_lama->isLoaded()) {
+        sd_jni::on_error(env, callback, "LaMa inpainter not loaded");
+        return JNI_FALSE;
+    }
+
+    jbyte* rgb = env->GetByteArrayElements(rgbBytes, nullptr);
+    JniByteArrayGuard rgbGuard(env, rgbBytes, rgb);
+    jbyte* mask = env->GetByteArrayElements(maskBytes, nullptr);
+    JniByteArrayGuard maskGuard(env, maskBytes, mask);
+
+    try {
+        auto start = std::chrono::high_resolution_clock::now();
+        auto result = g_lama->inpaint(
+            reinterpret_cast<const uint8_t*>(rgb),
+            reinterpret_cast<const uint8_t*>(mask),
+            width, height);
+        auto end = std::chrono::high_resolution_clock::now();
+        int timeMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+        sd_jni::on_complete(env, callback, result.data(), static_cast<int>(result.size()),
+                            width, height, 0, timeMs);
+        return JNI_TRUE;
+    } catch (const std::exception& e) {
+        SD_LOG_ERROR("[LAMA] Inpaint failed: %s", e.what());
+        sd_jni::on_error(env, callback, e.what());
+        return JNI_FALSE;
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_dark_ai_1sd_SDNativeLib_nativeReleaseLamaInpainter(
+        JNIEnv* /* env */, jobject /* thiz */) {
+    std::lock_guard<std::mutex> lock(g_lama_mtx);
+    if (g_lama) {
+        g_lama->release();
+        g_lama.reset();
+    }
+    SD_LOG_INFO("[LAMA] Released");
+}
+
+// =========================================================================
+// Depth Estimator (Phase 5.5)
+// =========================================================================
+
+static std::mutex g_depth_mtx;
+static std::unique_ptr<DepthEstimator> g_depth;
+
+JNIEXPORT jboolean JNICALL
+Java_com_dark_ai_1sd_SDNativeLib_nativeLoadDepthEstimator(
+        JNIEnv* env, jobject /* thiz */,
+        jstring modelPath, jboolean useOpenCL) {
+    std::lock_guard<std::mutex> lock(g_depth_mtx);
+
+    std::string path = jstring_to_string(env, modelPath);
+    if (path.empty()) {
+        SD_LOG_ERROR("[DEPTH] Model path is empty");
+        return JNI_FALSE;
+    }
+
+    g_depth = std::make_unique<DepthEstimator>();
+    bool ok = g_depth->loadModel(path, useOpenCL);
+    if (!ok) {
+        g_depth.reset();
+        SD_LOG_ERROR("[DEPTH] Failed to load model");
+    } else {
+        SD_LOG_INFO("[DEPTH] Loaded: %s", path.c_str());
+    }
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_dark_ai_1sd_SDNativeLib_nativeEstimateDepthColorized(
+        JNIEnv* env, jobject /* thiz */,
+        jbyteArray rgbBytes, jint width, jint height, jobject callback) {
+    std::lock_guard<std::mutex> lock(g_depth_mtx);
+
+    if (!g_depth || !g_depth->isLoaded()) {
+        sd_jni::on_error(env, callback, "Depth estimator not loaded");
+        return JNI_FALSE;
+    }
+
+    jbyte* bytes = env->GetByteArrayElements(rgbBytes, nullptr);
+    JniByteArrayGuard guard(env, rgbBytes, bytes);
+
+    try {
+        auto start = std::chrono::high_resolution_clock::now();
+        auto result = g_depth->estimateDepthColorized(
+            reinterpret_cast<const uint8_t*>(bytes), width, height);
+        auto end = std::chrono::high_resolution_clock::now();
+        int timeMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+        sd_jni::on_complete(env, callback, result.data(), static_cast<int>(result.size()),
+                            width, height, 0, timeMs);
+        return JNI_TRUE;
+    } catch (const std::exception& e) {
+        SD_LOG_ERROR("[DEPTH] Estimation failed: %s", e.what());
+        sd_jni::on_error(env, callback, e.what());
+        return JNI_FALSE;
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_dark_ai_1sd_SDNativeLib_nativeReleaseDepthEstimator(
+        JNIEnv* /* env */, jobject /* thiz */) {
+    std::lock_guard<std::mutex> lock(g_depth_mtx);
+    if (g_depth) {
+        g_depth->release();
+        g_depth.reset();
+    }
+    SD_LOG_INFO("[DEPTH] Released");
+}
+
+// =========================================================================
+// Style Transfer (Phase 5.6)
+// =========================================================================
+
+static std::mutex g_style_mtx;
+static std::unique_ptr<StyleTransfer> g_style;
+
+JNIEXPORT jboolean JNICALL
+Java_com_dark_ai_1sd_SDNativeLib_nativeLoadStyleTransfer(
+        JNIEnv* env, jobject /* thiz */,
+        jstring modelPath, jboolean useOpenCL) {
+    std::lock_guard<std::mutex> lock(g_style_mtx);
+
+    std::string path = jstring_to_string(env, modelPath);
+    if (path.empty()) {
+        SD_LOG_ERROR("[STYLE] Model path is empty");
+        return JNI_FALSE;
+    }
+
+    g_style = std::make_unique<StyleTransfer>();
+    bool ok = g_style->loadModel(path, useOpenCL);
+    if (!ok) {
+        g_style.reset();
+        SD_LOG_ERROR("[STYLE] Failed to load model");
+    } else {
+        SD_LOG_INFO("[STYLE] Loaded: %s", path.c_str());
+    }
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_dark_ai_1sd_SDNativeLib_nativeStylize(
+        JNIEnv* env, jobject /* thiz */,
+        jbyteArray contentRgb, jint contentW, jint contentH,
+        jbyteArray styleRgb, jint styleW, jint styleH,
+        jfloat strength, jobject callback) {
+    std::lock_guard<std::mutex> lock(g_style_mtx);
+
+    if (!g_style || !g_style->isLoaded()) {
+        sd_jni::on_error(env, callback, "Style transfer not loaded");
+        return JNI_FALSE;
+    }
+
+    jbyte* content = env->GetByteArrayElements(contentRgb, nullptr);
+    JniByteArrayGuard contentGuard(env, contentRgb, content);
+    jbyte* style = env->GetByteArrayElements(styleRgb, nullptr);
+    JniByteArrayGuard styleGuard(env, styleRgb, style);
+
+    try {
+        auto start = std::chrono::high_resolution_clock::now();
+        auto result = g_style->stylize(
+            reinterpret_cast<const uint8_t*>(content), contentW, contentH,
+            reinterpret_cast<const uint8_t*>(style), styleW, styleH,
+            strength);
+        auto end = std::chrono::high_resolution_clock::now();
+        int timeMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+        sd_jni::on_complete(env, callback, result.data(), static_cast<int>(result.size()),
+                            contentW, contentH, 0, timeMs);
+        return JNI_TRUE;
+    } catch (const std::exception& e) {
+        SD_LOG_ERROR("[STYLE] Stylize failed: %s", e.what());
+        sd_jni::on_error(env, callback, e.what());
+        return JNI_FALSE;
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_dark_ai_1sd_SDNativeLib_nativeReleaseStyleTransfer(
+        JNIEnv* /* env */, jobject /* thiz */) {
+    std::lock_guard<std::mutex> lock(g_style_mtx);
+    if (g_style) {
+        g_style->release();
+        g_style.reset();
+    }
+    SD_LOG_INFO("[STYLE] Released");
+}
+
+// Returns a flat int[] of supported (w, h) pairs the loaded UNet binary
+// can run at. Filesystem-only — no model load required, no QNN init.
+// Caller passes the model directory and the base resolution baked into
+// the .bin (xororz/Mr-J-369 packs put this in the dir name, e.g.
+// `output_512` → 512×512). Used by the consuming app to populate the
+// resolution selector, which is the cleanest fix for the silent
+// noise-on-1024² problem we hit when the patch file is missing.
+JNIEXPORT jintArray JNICALL
+Java_com_dark_ai_1sd_SDNativeLib_nativeGetSupportedResolutions(
+        JNIEnv* env, jobject /* thiz */,
+        jstring modelDir, jint baseWidth, jint baseHeight) {
+    std::string dir = jstring_to_string(env, modelDir);
+    auto resolutions = sd_pipeline::get_supported_resolutions(
+        dir, static_cast<int>(baseWidth), static_cast<int>(baseHeight));
+
+    jsize n = static_cast<jsize>(resolutions.size() * 2);
+    jintArray result = env->NewIntArray(n);
+    if (!result) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return nullptr;
+    }
+    if (n == 0) return result;
+
+    std::vector<jint> flat;
+    flat.reserve(static_cast<size_t>(n));
+    for (const auto& r : resolutions) {
+        flat.push_back(r.width);
+        flat.push_back(r.height);
+    }
+    env->SetIntArrayRegion(result, 0, n, flat.data());
+    return result;
+}
+
 } // extern "C"
+
+// Defined here so the unique_ptr<T> globals' full types are in scope for
+// reset(). Each module owns its own mutex; we lock then drop the pointer so
+// the destructor runs on each.
+static void cleanup_secondary_modules() {
+    {
+        std::lock_guard<std::mutex> u(g_upscaler_mtx);
+        g_upscaler_loaded = false;
+        g_upscaler_model_path.clear();
+        if (upscalerApp) upscalerApp.reset();
+    }
+    { std::lock_guard<std::mutex> l(g_segmenter_mtx); g_segmenter.reset(); }
+    { std::lock_guard<std::mutex> l(g_lama_mtx);      g_lama.reset();      }
+    { std::lock_guard<std::mutex> l(g_depth_mtx);     g_depth.reset();     }
+    { std::lock_guard<std::mutex> l(g_style_mtx);     g_style.reset();     }
+    SD_LOG_INFO("Secondary modules released");
+}

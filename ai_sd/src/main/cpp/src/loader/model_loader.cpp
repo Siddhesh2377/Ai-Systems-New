@@ -215,7 +215,12 @@ static int initializeQnnApp(const std::string &modelName,
             return app->reportError(modelName + " Create From Binary failure");
     }
 
-    if (StatusCode::SUCCESS != app->enablePerformaceMode())
+    // BURST mode for the UNet denoising loop only — the inner loop runs
+    // 10-30+ short calls back to back, so we want peak HTP frequency for
+    // the first few steps. CLIP and VAE are single-shot per generation,
+    // so PERFORMANCE_MODE (sustained) is appropriate there.
+    bool useBurstMode = (modelName == "UNET");
+    if (StatusCode::SUCCESS != app->enablePerformaceMode(useBurstMode))
         return app->reportError(modelName + " Enable Performance Mode failure");
 
     if (buffer && bufferSize > 0) {
@@ -237,6 +242,9 @@ static int initializeQnnApp(const std::string &modelName,
 namespace sd_pipeline {
 
 bool initialize_models(const SDModelConfig& config) {
+    // Loading a new model invalidates any previously-cached CLIP embeddings.
+    clear_clip_cache();
+
     using namespace qnn::tools;
 
     if (!qnn::log::initializeLogging()) {
@@ -259,10 +267,11 @@ bool initialize_models(const SDModelConfig& config) {
     text_embedding_size = config.textEmbeddingSize;
     modelDir = config.modelDir;
 
-    // Check for clip_v2 variant
-    if (clipPath.length() >= 8 &&
-        clipPath.substr(clipPath.length() - 8) == "clip.mnn") {
-        std::filesystem::path clipPathObj(clipPath);
+    // Check for clip_v2 variant. Match by exact filename (not raw substr) so a
+    // custom name like `myclip.mnn` doesn't accidentally trigger the v2 sibling
+    // lookup.
+    std::filesystem::path clipPathObj(clipPath);
+    if (clipPathObj.filename() == "clip.mnn") {
         std::filesystem::path parentDir = clipPathObj.parent_path();
         std::filesystem::path v2Path = parentDir / "clip_v2.mnn";
 
@@ -331,9 +340,14 @@ bool initialize_models(const SDModelConfig& config) {
             modelPath.parent_path().parent_path() / "embeddings";
         if (std::filesystem::exists(embeddingsPath)) {
             try {
-                promptProcessor.loadEmbeddings(embeddingsPath.string());
-                QNN_INFO("Loaded %zu embeddings from %s",
+                // Pass the model's text embedding dim so TI files that don't
+                // match (e.g. SDXL 1280/2048 in an SD1.5 769 pipeline) are
+                // skipped instead of crashing the memcpy in text_encoder.cpp.
+                promptProcessor.loadEmbeddings(embeddingsPath.string(),
+                                               config.textEmbeddingSize);
+                QNN_INFO("Loaded %zu embeddings (dim=%d filter) from %s",
                          promptProcessor.getEmbeddingCount(),
+                         config.textEmbeddingSize,
                          embeddingsPath.string().c_str());
             } catch (const std::exception& e) {
                 QNN_WARN("Failed to load embeddings: %s", e.what());
@@ -388,6 +402,18 @@ bool initialize_models(const SDModelConfig& config) {
             clipInterpreter->resizeSession(clipSession);
             clipInterpreter->releaseModel();
         }
+    }
+
+    // MNN CPU mode — validate that required MNN model files exist
+    if (use_mnn) {
+        // UNET is loaded lazily in UNetRunner::initIfNeeded(), but we validate now
+        // to fail fast with a clear message instead of crashing during generation
+        std::ifstream unetTest(unetPath);
+        if (!unetTest.good()) {
+            QNN_ERROR("CPU mode requires unet.mnn but file not found: %s", unetPath.c_str());
+            return false;
+        }
+        QNN_INFO("MNN CPU mode: validated unet exists at %s", unetPath.c_str());
     }
 
     // QNN models — log SoC info before attempting HTP init
@@ -504,11 +530,91 @@ bool initialize_models(const SDModelConfig& config) {
     return true;
 }
 
+void recreateClipSession() {
+    // Tear down existing CLIP session
+    if (clipSession && clipInterpreter) {
+        clipInterpreter->releaseSession(clipSession);
+        clipSession = nullptr;
+    }
+    delete clipInterpreter;
+    clipInterpreter = nullptr;
+
+    if (!use_mnn_clip) {
+        SD_LOG_WARN("[LORA] CLIP session recreation only supported in MNN/CPU mode");
+        return;
+    }
+
+    // Recreate from (potentially LoRA-modified) file
+    clipInterpreter = MNN::Interpreter::createFromFile(clipPath.c_str());
+    if (!clipInterpreter) {
+        SD_LOG_ERROR("[LORA] Failed to recreate MNN CLIP interpreter");
+        return;
+    }
+
+    MNN::ScheduleConfig cfg;
+    cfg.type = MNN_FORWARD_CPU;
+    cfg.numThread = 4;
+    MNN::BackendConfig bkCfg;
+    bkCfg.memory = MNN::BackendConfig::Memory_Low;
+    bkCfg.power = MNN::BackendConfig::Power_High;
+    cfg.backendConfig = &bkCfg;
+
+    clipSession = clipInterpreter->createSession(cfg);
+    if (clipSession) {
+        if (use_clip_v2) {
+            auto input = clipInterpreter->getSessionInput(clipSession, "input_embedding");
+            clipInterpreter->resizeTensor(input, {1, 77, 768});
+        } else {
+            auto input = clipInterpreter->getSessionInput(clipSession, "input_ids");
+            clipInterpreter->resizeTensor(input, {1, 77});
+        }
+        clipInterpreter->resizeSession(clipSession);
+        clipInterpreter->releaseModel();
+    }
+
+    // Reload pos_emb and token_emb if clip_v2 (LoRA regeneration rewrites these)
+    if (use_clip_v2) {
+        std::string posEmbPath = std::string(modelDir) + "/pos_emb.bin";
+        std::string tokenEmbPath = std::string(modelDir) + "/token_emb.bin";
+
+        std::ifstream posFile(posEmbPath, std::ios::binary);
+        if (posFile.good()) {
+            posFile.seekg(0, std::ios::end);
+            size_t posSize = posFile.tellg() / sizeof(float);
+            posFile.seekg(0, std::ios::beg);
+            pos_emb.resize(posSize);
+            posFile.read(reinterpret_cast<char*>(pos_emb.data()), posSize * sizeof(float));
+        }
+
+        std::ifstream tokenFile(tokenEmbPath, std::ios::binary);
+        if (tokenFile.good()) {
+            tokenFile.seekg(0, std::ios::end);
+            size_t fileSize = tokenFile.tellg();
+            tokenFile.seekg(0, std::ios::beg);
+            size_t tokenSize = fileSize / sizeof(uint16_t);
+            token_emb.resize(tokenSize);
+            tokenFile.read(reinterpret_cast<char*>(token_emb.data()), fileSize);
+        }
+    }
+
+    SD_LOG_INFO("[LORA] CLIP session recreated");
+}
+
+void recreateUNetSession() {
+    // Just cleanup the persistent UNet runner — it will auto-recreate
+    // on the next generation call via initIfNeeded()
+    cleanup_persistent_sessions();
+    SD_LOG_INFO("[LORA] UNet session invalidated (will recreate on next generation)");
+}
+
 void cleanup() {
     QNN_INFO("Cleaning up pipeline resources");
 
     // Perf 7: release persistent UNet runner + reset VAE dimension tracking
     cleanup_persistent_sessions();
+    // Drop CLIP embedding cache so a new model never sees stale embeddings
+    // from a different tokenizer / dimension.
+    clear_clip_cache();
 
     if (clipSession && clipInterpreter) {
         clipInterpreter->releaseSession(clipSession);
@@ -550,6 +656,149 @@ void cleanup() {
     token_emb.clear();
 
     QNN_INFO("Pipeline resources cleaned up");
+}
+
+// ============================================================================
+// Standalone QNN upscaler load — mirrors LocalDream's per-request /upscale
+// handler so the upscaler can be loaded without first loading a diffusion
+// model.
+// ============================================================================
+
+bool ensureQnnSystemReady(const std::string& qnnSystemLibPath,
+                           const std::string& qnnBackendPath) {
+    using namespace qnn::tools;
+    if (qnnSystemLibPath.empty() || qnnBackendPath.empty()) {
+        QNN_ERROR("ensureQnnSystemReady: empty paths (system='%s' backend='%s')",
+                  qnnSystemLibPath.c_str(), qnnBackendPath.c_str());
+        return false;
+    }
+    if (!g_backendPathCmd.empty()) {
+        // Already initialized by initialize_models() or a prior call.
+        return true;
+    }
+    g_backendPathCmd = qnnBackendPath;
+    dynamicloadutil::StatusCode sysStatus =
+        dynamicloadutil::getQnnSystemFunctionPointers(qnnSystemLibPath,
+                                                       &g_qnnSystemFuncs);
+    if (sysStatus != dynamicloadutil::StatusCode::SUCCESS) {
+        QNN_ERROR("ensureQnnSystemReady: getQnnSystemFunctionPointers failed");
+        g_backendPathCmd.clear();
+        return false;
+    }
+    QNN_INFO("ensureQnnSystemReady: QNN system funcs loaded from %s",
+             qnnSystemLibPath.c_str());
+    return true;
+}
+
+bool loadStandaloneQnnUpscaler(const std::string& modelPath) {
+    if (g_backendPathCmd.empty()) {
+        QNN_ERROR("loadStandaloneQnnUpscaler: QNN system not initialized; "
+                  "call ensureQnnSystemReady() first");
+        return false;
+    }
+    if (modelPath.empty()) {
+        QNN_ERROR("loadStandaloneQnnUpscaler: empty modelPath");
+        return false;
+    }
+
+    upscalerApp = createQnnModel(modelPath, "upscaler");
+    if (!upscalerApp) {
+        QNN_ERROR("loadStandaloneQnnUpscaler: createQnnModel failed for %s",
+                  modelPath.c_str());
+        return false;
+    }
+
+    int status = initializeQnnApp("Upscaler", upscalerApp,
+                                  /*buffer=*/nullptr, /*bufferSize=*/0);
+    if (status != EXIT_SUCCESS) {
+        QNN_ERROR("loadStandaloneQnnUpscaler: initializeQnnApp failed "
+                  "(status=%d)", status);
+        upscalerApp.reset();
+        return false;
+    }
+
+    QNN_INFO("loadStandaloneQnnUpscaler: upscaler ready at %s",
+             modelPath.c_str());
+    return true;
+}
+
+std::vector<Resolution> get_supported_resolutions(const std::string& modelDir,
+                                                   int baseW, int baseH) {
+    std::vector<Resolution> result;
+    std::vector<std::pair<int,int>> seen;
+    auto already_seen = [&](int w, int h) {
+        for (auto& p : seen) if (p.first == w && p.second == h) return true;
+        return false;
+    };
+
+    if (baseW > 0 && baseH > 0) {
+        result.push_back({baseW, baseH});
+        seen.push_back({baseW, baseH});
+    }
+
+    if (modelDir.empty()) return result;
+
+    std::error_code ec;
+    std::filesystem::path dir(modelDir);
+    if (!std::filesystem::is_directory(dir, ec)) {
+        QNN_WARN("get_supported_resolutions: not a directory: %s",
+                 modelDir.c_str());
+        return result;
+    }
+
+    auto parse_uint = [](const std::string& s) -> int {
+        if (s.empty()) return -1;
+        for (char c : s) if (c < '0' || c > '9') return -1;
+        try { return std::stoi(s); } catch (...) { return -1; }
+    };
+
+    for (auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file(ec)) continue;
+        std::string name = entry.path().filename().string();
+        // Must end with ".patch"
+        const std::string suffix = ".patch";
+        if (name.size() <= suffix.size()) continue;
+        if (name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0)
+            continue;
+        std::string stem = name.substr(0, name.size() - suffix.size());
+
+        int w = -1, h = -1;
+        auto x_pos = stem.find('x');
+        if (x_pos == std::string::npos) {
+            // Square: <N>.patch
+            int n = parse_uint(stem);
+            if (n > 0) { w = n; h = n; }
+        } else {
+            // Rectangular: <W>x<H>.patch
+            int parsed_w = parse_uint(stem.substr(0, x_pos));
+            int parsed_h = parse_uint(stem.substr(x_pos + 1));
+            if (parsed_w > 0 && parsed_h > 0) { w = parsed_w; h = parsed_h; }
+        }
+        if (w < 0 || h < 0) continue;
+
+        if (!already_seen(w, h)) {
+            result.push_back({w, h});
+            seen.push_back({w, h});
+        }
+    }
+
+    std::sort(result.begin(), result.end(),
+              [](const Resolution& a, const Resolution& b) {
+        long la = static_cast<long>(a.width) * a.height;
+        long lb = static_cast<long>(b.width) * b.height;
+        if (la != lb) return la < lb;
+        return a.width < b.width;
+    });
+
+    return result;
+}
+
+void releaseStandaloneQnnUpscaler() {
+    if (upscalerApp) {
+        upscalerApp.reset();
+        QNN_INFO("releaseStandaloneQnnUpscaler: released");
+    }
 }
 
 }  // namespace sd_pipeline

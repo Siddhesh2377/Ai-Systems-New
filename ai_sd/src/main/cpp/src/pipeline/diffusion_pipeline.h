@@ -52,6 +52,16 @@ bool apply_lora(const std::string& path, float weight);
 void clear_lora();
 
 /**
+ * Recreate CLIP MNN session after LoRA weight regeneration.
+ */
+void recreateClipSession();
+
+/**
+ * Invalidate UNet session so it recreates on next generation.
+ */
+void recreateUNetSession();
+
+/**
  * Release all model resources and reset state.
  */
 void cleanup();

@@ -1,42 +1,68 @@
-# ============================================================================
-# Tool-Neuron gguf_lib — Consumer ProGuard Rules
-# Bundled with the AAR; auto-applied when the consuming app enables R8.
-# ============================================================================
+# Consumer ProGuard rules for com.dark.gguf_lib (gguf_lib AAR).
+# Bundled with the AAR; auto-applied when the consuming app enables R8/ProGuard.
 
-# --- JNI native methods (called by name from C++ via RegisterNatives/dlsym) ---
+# JNI bridge object — native method names are resolved by C++ at runtime via
+# auto-discovery (Java_com_dark_gguf_1lib_GGUFNativeLib_*). Renaming or
+# stripping any method here crashes at the lookup site.
 -keep class com.dark.gguf_lib.GGUFNativeLib {
+    public static ** INSTANCE;
     native <methods>;
 }
+-keepclassmembers class com.dark.gguf_lib.GGUFNativeLib {
+    public static ** INSTANCE;
+}
 
-# --- Callback interfaces invoked from JNI via env->CallVoidMethod ---
-# Method names and signatures must match exactly what native code looks up.
+# JNI callback interfaces — native code resolves methods via env->GetMethodID.
 -keep interface com.dark.gguf_lib.models.StreamCallback { *; }
 -keep interface com.dark.gguf_lib.models.EmbeddingCallback { *; }
 
-# --- Data classes constructed from JNI via env->NewObject ---
+# Constructed from JNI via env->NewObject.
 -keep class com.dark.gguf_lib.models.EmbeddingResult { *; }
 
-# --- Data classes parsed from JSON (field names must survive for org.json) ---
+# Surface across AIDL / JSON / sealed-class hierarchies — keep names + members.
 -keep class com.dark.gguf_lib.models.RAGResult { *; }
 -keep class com.dark.gguf_lib.models.DecodingMetrics { *; }
 -keep class com.dark.gguf_lib.models.GenerationEvent { *; }
 -keep class com.dark.gguf_lib.models.GenerationEvent$* { *; }
 
-# --- Public API classes (keep for SDK consumers) ---
+# Public SDK classes.
 -keep class com.dark.gguf_lib.GGMLEngine { public *; }
--keep class com.dark.gguf_lib.ToolManager { public *; }
--keep class com.dark.gguf_lib.CharacterEngine { public *; }
+-keep class com.dark.gguf_lib.GGMLEngine$* { public *; }
 -keep class com.dark.gguf_lib.EmbeddingEngine { public *; }
 -keep class com.dark.gguf_lib.RAGEngine { public *; }
+-keep class com.dark.gguf_lib.TextDigest { *; }
+-keep class com.dark.gguf_lib.TextDigest$* { *; }
 
-# --- Tool calling models (serialized to/from JSON) ---
--keep class com.dark.gguf_lib.toolcalling.ToolCall { *; }
--keep class com.dark.gguf_lib.toolcalling.ToolCallingConfig { *; }
--keep class com.dark.gguf_lib.toolcalling.GrammarMode { *; }
--keep class com.dark.gguf_lib.toolcalling.ToolDefinitionBuilder { public *; }
+# Enums — name()/ordinal() are used at runtime.
+-keep enum com.dark.gguf_lib.DeviceTier { *; }
+-keep enum com.dark.gguf_lib.DocKind { *; }
+-keep enum com.dark.gguf_lib.ImageQuality { *; }
+-keep enum com.dark.gguf_lib.GpuVendor { *; }
+-keep enum com.dark.gguf_lib.GpuDeviceType { *; }
+-keep enum com.dark.gguf_lib.VlmEncoder$EncodeStrategy { *; }
 
-# --- Keep Kotlin coroutine continuations (used by suspend functions) ---
--keep class kotlin.coroutines.Continuation { *; }
+# Public data classes.
+-keep class com.dark.gguf_lib.LoadingParams { *; }
+-keep class com.dark.gguf_lib.GenerationResult { *; }
+-keep class com.dark.gguf_lib.GpuProfile { *; }
 
-# --- Suppress warnings for internal llama.cpp JNI symbols ---
--dontwarn com.dark.gguf_lib.**
+# Public process-wide error tracker.
+-keep class com.dark.gguf_lib.ErrorTracker { *; }
+
+# Public VLM scheduler + hardware probe.
+-keep class com.dark.gguf_lib.HardwareEngine { *; }
+-keep class com.dark.gguf_lib.VlmEncoder { public *; }
+-keep class com.dark.gguf_lib.VlmEncoder$* { *; }
+-keep class com.dark.gguf_lib.VlmEncodeEvent { *; }
+-keep class com.dark.gguf_lib.VlmEncodeEvent$* { *; }
+-keep class com.dark.gguf_lib.VlmPrewarmEvent { *; }
+-keep class com.dark.gguf_lib.VlmPrewarmEvent$* { *; }
+-keep interface com.dark.gguf_lib.models.VlmPrewarmCallback { *; }
+
+# Suspend functions generate Continuation subclasses; preserve them.
+-keep class kotlin.coroutines.Continuation
+-keepclassmembers class * implements kotlin.coroutines.Continuation { *; }
+
+-keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod,RuntimeVisibleAnnotations
+
+-dontwarn com.dark.gguf_lib.GGUFNativeLib

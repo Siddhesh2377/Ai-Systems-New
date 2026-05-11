@@ -22,6 +22,9 @@
 #include <string>
 #include <vector>
 #include <atomic>
+#include <unordered_map>
+#include <deque>
+#include <mutex>
 
 // Model headers (ported from xororz)
 #include "../utils/config.h"
@@ -176,6 +179,47 @@ static UNetRunner g_unet_runner;
 static int g_vae_dec_sample_w = 0, g_vae_dec_sample_h = 0;
 static int g_vae_enc_out_w = 0, g_vae_enc_out_h = 0;
 
+// ============================================================================
+// CLIP output cache (Perf — skip re-encoding identical prompts).
+// Same (prompt, negative_prompt, embedding_dim, clip_v2) produces identical
+// embeddings on a given model. Cache holds at most CLIP_CACHE_MAX entries
+// in FIFO order; cleared on model load/release.
+// ============================================================================
+namespace {
+struct ClipCacheKey {
+    std::string prompt;
+    std::string negative_prompt;
+    int embedding_dim;
+    bool use_clip_v2;
+    bool operator==(const ClipCacheKey& o) const {
+        return prompt == o.prompt && negative_prompt == o.negative_prompt
+            && embedding_dim == o.embedding_dim && use_clip_v2 == o.use_clip_v2;
+    }
+};
+struct ClipCacheKeyHash {
+    size_t operator()(const ClipCacheKey& k) const noexcept {
+        size_t h = std::hash<std::string>{}(k.prompt);
+        auto mix = [&](size_t v) { h ^= v + 0x9e3779b9u + (h << 6) + (h >> 2); };
+        mix(std::hash<std::string>{}(k.negative_prompt));
+        mix(static_cast<size_t>(k.embedding_dim));
+        mix(static_cast<size_t>(k.use_clip_v2));
+        return h;
+    }
+};
+constexpr size_t CLIP_CACHE_MAX = 8;
+std::unordered_map<ClipCacheKey, std::vector<float>, ClipCacheKeyHash> g_clip_cache;
+std::deque<ClipCacheKey> g_clip_cache_order;
+std::mutex g_clip_cache_mtx;
+} // namespace
+
+namespace sd_pipeline {
+void clear_clip_cache() {
+    std::lock_guard<std::mutex> lock(g_clip_cache_mtx);
+    g_clip_cache.clear();
+    g_clip_cache_order.clear();
+}
+} // namespace sd_pipeline
+
 // createQnnModel() moved to loader/model_loader.cpp (Phase 1.2)
 // ZSTD patch functions + initializeQnnApp moved to loader/model_loader.cpp (Phase 1.2)
 // processWeightedPrompt/processPromptPair moved to clip/text_encoder.cpp (Phase 1.3)
@@ -224,21 +268,46 @@ GenerationResult generateImage(
     int current_step = 0;
     const int batch_size = 2;
 
-    // Perf 1: Pre-allocate loop buffers once (eliminates ~7MB alloc/free per generation)
+    if (unetApp) unetApp->clearCachedEmbeddings();
+
     ctx.buffers.resize_for_generation(sample_width, sample_height,
                                       output_width, output_height);
 
     // --- CLIP ---
-    ProcessedPromptPair processed =
-        processPromptPair(prompt, negative_prompt, 77);
-
-    std::vector<int> clip_input_ids = processed.ids;  // old (2*77)
-    auto parsed_input_text = tokenizer->Decode(clip_input_ids);
-    SD_LOG_INFO("Parsed Input Text: %s", parsed_input_text.c_str());
     std::vector<float> text_embedding_float(batch_size * 77 *
                                             text_embedding_size);
+
+    // Cache lookup: same (prompt, neg, dim, v2) → identical embedding on a
+    // given model. Skip the entire CLIP inference on hit.
+    ClipCacheKey cache_key{prompt, negative_prompt, text_embedding_size, use_clip_v2};
+    bool clip_cache_hit = false;
+    {
+        std::lock_guard<std::mutex> lock(g_clip_cache_mtx);
+        auto it = g_clip_cache.find(cache_key);
+        if (it != g_clip_cache.end() &&
+            it->second.size() == text_embedding_float.size()) {
+            std::copy(it->second.begin(), it->second.end(),
+                      text_embedding_float.begin());
+            clip_cache_hit = true;
+        }
+    }
+
+    if (clip_cache_hit) {
+        SD_LOG_INFO("CLIP cache HIT — skipping inference");
+    }
+
+    ProcessedPromptPair processed;
+    if (!clip_cache_hit) {
+        processed = processPromptPair(prompt, negative_prompt, 77);
+    }
+    std::vector<int> clip_input_ids = clip_cache_hit ? std::vector<int>{}
+                                                     : processed.ids;
+    if (!clip_cache_hit) {
+        auto parsed_input_text = tokenizer->Decode(clip_input_ids);
+        SD_LOG_INFO("Parsed Input Text: %s", parsed_input_text.c_str());
+    }
     auto clip_start = std::chrono::high_resolution_clock::now();
-    int32_t *input_ids_ptr = clip_input_ids.data();
+    int32_t *input_ids_ptr = clip_cache_hit ? nullptr : clip_input_ids.data();
     float *embed_ptr = text_embedding_float.data();
 
     // Log CLIP input IDs for both prompts
@@ -253,7 +322,9 @@ GenerationResult generateImage(
                 (int)use_mnn, (int)use_mnn_clip, (int)use_clip_v2);
 #endif
 
-    if (use_mnn || use_mnn_clip) {
+    if (clip_cache_hit) {
+      // Skip both MNN/QNN branches entirely.
+    } else if (use_mnn || use_mnn_clip) {
       MNN::Interpreter *currentClipInterpreter = nullptr;
       MNN::Session *currentClipSession = nullptr;
       bool dynamicCreated = false;
@@ -361,9 +432,23 @@ GenerationResult generateImage(
     }
 
     auto clip_end = std::chrono::high_resolution_clock::now();
-    SD_LOG_INFO("CLIP dur: %dms",
-                (int)std::chrono::duration_cast<std::chrono::milliseconds>(
-                    clip_end - clip_start).count());
+    if (!clip_cache_hit) {
+        SD_LOG_INFO("CLIP dur: %dms",
+                    (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+                        clip_end - clip_start).count());
+
+        // Store result for next identical (prompt, neg) pair. Bounded FIFO; the
+        // cache is cleared on every model load/release.
+        std::lock_guard<std::mutex> lock(g_clip_cache_mtx);
+        if (g_clip_cache.find(cache_key) == g_clip_cache.end()) {
+            if (g_clip_cache_order.size() >= CLIP_CACHE_MAX) {
+                g_clip_cache.erase(g_clip_cache_order.front());
+                g_clip_cache_order.pop_front();
+            }
+            g_clip_cache.emplace(cache_key, text_embedding_float);
+            g_clip_cache_order.push_back(cache_key);
+        }
+    }
 #ifdef SD_ENABLE_DIAGNOSTICS
     log_tensor_stats("clip_embed_neg", text_embedding_float.data(),
                      77 * text_embedding_size);
@@ -772,9 +857,10 @@ GenerationResult generateImage(
                 latents_in_ptr + single_latent_size);
       float* unet_out_ptr = ctx.buffers.unet_out.data();
 
-      // UNetRunner dispatches to MNN or QNN internally
+      // UNetRunner dispatches to MNN or QNN internally; cfg lets the runner
+      // skip the uncond pass on QNN when cfg == 1 (huge win on 1-4 step LCM).
       g_unet_runner.step(latents_in_ptr, static_cast<int>(current_ts),
-                       text_embedding_float.data(), unet_out_ptr);
+                       text_embedding_float.data(), unet_out_ptr, cfg);
 
       auto step_end_time = std::chrono::high_resolution_clock::now();
       auto step_dur = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1175,6 +1261,8 @@ GenerationResult generateImage(
   }
 }
 
+#include "../lora/lora_engine.h"
+
 // =============================================================================
 // sd_pipeline namespace - JNI-callable functions replacing HTTP server
 // =============================================================================
@@ -1269,18 +1357,35 @@ SDGenerationResult run_generation(PipelineContext& ctx,
   return sdResult;
 }
 
+// ============================================================================
+// LoRA — runtime weight patching (MNN-only)
+// ============================================================================
+static LoRAEngine g_lora_engine;
+
 bool apply_lora(const std::string& path, float weight) {
-  // LoRA application uses the SafeTensor2MNN utilities
-  // This is model-format dependent and will be implemented
-  // when the full LoRA pipeline is tested
-  QNN_INFO("LoRA apply requested: %s (weight=%.2f)", path.c_str(), weight);
-  // TODO: Implement LoRA application using generateMNNModels with lora params
+  if (!use_mnn) {
+    SD_LOG_ERROR("[LORA] LoRA requires MNN/CPU mode — QNN uses pre-compiled contexts");
+    return false;
+  }
+
+  if (!g_lora_engine.apply(path, weight, modelDir, use_clip_v2)) {
+    return false;
+  }
+
+  // Recreate sessions to pick up modified weights
+  recreateClipSession();
+  recreateUNetSession();
   return true;
 }
 
 void clear_lora() {
-  QNN_INFO("LoRA clear requested");
-  // TODO: Reload base weights
+  if (!g_lora_engine.has_active()) return;
+
+  g_lora_engine.clear(modelDir, use_clip_v2);
+
+  // Recreate sessions with restored original weights
+  recreateClipSession();
+  recreateUNetSession();
 }
 
 // cleanup() moved to loader/model_loader.cpp (Phase 1.2)
@@ -1306,6 +1411,7 @@ void cleanup_persistent_sessions() {
     g_vae_dec_sample_h = 0;
     g_vae_enc_out_w = 0;
     g_vae_enc_out_h = 0;
+    g_lora_engine.reset();
 }
 
 } // namespace sd_pipeline

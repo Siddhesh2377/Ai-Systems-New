@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # ============================================================================
 # QNN SDK (Qualcomm Neural Network)
 # ============================================================================
-set(QNN_SDK_ROOT /home/home/dev/lib/qairt)
+set(QNN_SDK_ROOT /home/home/dev/include/qairt)
 if(NOT EXISTS "${QNN_SDK_ROOT}/include")
     message(FATAL_ERROR "QNN SDK not found at ${QNN_SDK_ROOT}")
 endif()
@@ -202,6 +202,7 @@ set(AI_SD_SOURCES
     src/inpainting/lama_inpainter.cpp
     src/depth/depth_estimator.cpp
     src/style/style_transfer.cpp
+    src/lora/lora_engine.cpp
 )
 
 # ============================================================================

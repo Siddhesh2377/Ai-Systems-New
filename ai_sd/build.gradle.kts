@@ -20,7 +20,11 @@ android {
 
         externalNativeBuild {
             cmake {
-                arguments += "-DCMAKE_BUILD_TYPE=Release"
+                arguments += listOf(
+                    "-DCMAKE_BUILD_TYPE=Release",
+                    "-Wno-deprecated",
+                    "-Wno-dev",
+                )
                 targets += "ai_sd"
                 cppFlags += listOf(
                     "-O3",
@@ -64,12 +68,9 @@ android {
 }
 
 dependencies {
-    // tar.xz extraction for QNN libs
-    // NOTE: AAR does not bundle transitive deps — consuming apps must also declare:
-    //   implementation("org.apache.commons:commons-compress:1.28.0")
-    //   implementation("org.tukaani:xz:1.11")
-    implementation(libs.commons.compress)
-    implementation(libs.xz)
+    // tar.xz extraction for QNN libs — api scope so consumers get these transitively
+    api(libs.commons.compress)
+    api(libs.xz)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.appcompat)
     implementation(libs.material)
