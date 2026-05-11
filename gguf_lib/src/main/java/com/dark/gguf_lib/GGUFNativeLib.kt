@@ -71,6 +71,7 @@ internal object GGUFNativeLib {
 
     external fun nativeGetStateSize(): Long
     external fun nativeGetContextUsage(): Float
+    external fun nativeGetMemoryStatsJson(): String?
     external fun nativeStateSaveToFile(path: String): Boolean
     external fun nativeStateLoadFromFile(path: String): Boolean
 

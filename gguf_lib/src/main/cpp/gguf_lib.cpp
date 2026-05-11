@@ -2988,6 +2988,38 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGetDefaultMarker(JNIEnv * env, jo
     return env->NewStringUTF(mtmd_default_marker());
 }
 
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGetMemoryStatsJson(JNIEnv * env, jobject) {
+    json info;
+
+    info["model_mb"]      = g_state.model ? (double)llama_model_size(g_state.model) / (1024.0 * 1024.0) : 0.0;
+    info["kv_cache_mb"]   = g_state.ctx   ? (double)llama_state_get_size(g_state.ctx) / (1024.0 * 1024.0) : 0.0;
+    info["current_rss_mb"]   = (double)read_proc_status_mb("VmRSS");
+    info["peak_rss_mb"]      = (double)read_proc_status_mb("VmHWM");
+    info["mem_total_mb"]     = (double)read_mem_total_mb();
+    info["mem_available_mb"] = (double)read_mem_available_mb();
+
+    if (g_state.ctx) {
+        const int n_ctx_total = (int)llama_n_ctx(g_state.ctx);
+        info["n_ctx"]   = n_ctx_total;
+        info["n_used"]  = g_state.n_past;
+        info["context_usage_pct"] = n_ctx_total > 0 ? 100.0 * (double)g_state.n_past / (double)n_ctx_total : 0.0;
+    } else {
+        info["n_ctx"]  = 0;
+        info["n_used"] = 0;
+        info["context_usage_pct"] = 0.0;
+    }
+
+    info["thread_mode"]       = g_state.thread_mode;
+    info["vt_cache_init"]     = g_vt.cache != nullptr;
+    info["vlm_kv_cache_init"] = g_vkv.cache != nullptr;
+    info["vlm_loaded"]        = g_vlm.ctx != nullptr;
+    info["model_loaded"]      = g_state.model != nullptr;
+
+    std::string s = info.dump();
+    return safe_new_string_utf(env, s.c_str());
+}
+
 // Run ONLY the vision encoder for an image and store the embeddings in the
 // VT cache. Skips the LLM context entirely — no llama_decode, no token
 // generation. Use to pre-warm the VT cache so the first user query against a

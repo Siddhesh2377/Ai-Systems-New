@@ -350,6 +350,15 @@ class GGMLEngine {
     fun getContextUsage(): Float = if (loaded) GGUFNativeLib.nativeGetContextUsage() else 0f
 
     /**
+     * Comprehensive process-wide stats snapshot in one JSON blob. Includes
+     * accurate resident memory (VmRSS/VmHWM, not virtual VmPeak), context
+     * usage (raw n_ctx + n_used + percentage), and which sub-systems are
+     * initialized (VT cache, VLM-KV cache, projector, model). Use for
+     * diagnostic UIs.
+     */
+    fun getMemoryStatsJson(): String? = GGUFNativeLib.nativeGetMemoryStatsJson()
+
+    /**
      * Set the directory used for the disk-backed prompt cache. When set, the
      * system prompt KV state is saved/restored across sessions, eliminating
      * re-evaluation of the system prompt on cold starts.
