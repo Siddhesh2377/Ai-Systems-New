@@ -86,6 +86,57 @@ internal object GGUFNativeLib {
 
     external fun nativeSetThreadMode(mode: Int)
 
+    // ── Power engine / decode diagnostics ──────────────────────────────────
+    //
+    // The thermal/auto-mode surface lives outside the load path so the host
+    // can toggle it independently of the model lifecycle. All these calls are
+    // safe to invoke when no model is loaded — they just no-op on ctx-touching
+    // sub-paths (e.g. nativeAutoModeTick won't re-attach a threadpool when
+    // there's no context yet).
+
+    /**
+     * JSON snapshot of the last completed generate call's per-stage timing:
+     * `{tokens, sample_us, detok_us, stop_us, decode_us, total_us}`.
+     * All `_us` fields are aggregate microseconds across the run; divide by
+     * `tokens` for per-token cost. Returns "{}"-equivalent if no generate has
+     * happened on this process yet.
+     */
+    external fun nativeGetLastDecodeBreakdown(): String
+
+    /**
+     * Thermal snapshot:
+     * `{maxTempMilliC, batteryTempMilliC, throttlingLevel, nZonesRead}`.
+     * `throttlingLevel`: 0 COOL, 1 WARM, 2 HOT, 3 CRITICAL.
+     * Reading is stateless and safe to call concurrently with generation.
+     */
+    external fun nativeGetThermalState(): String
+
+    /**
+     * Enable/disable auto-mode. When on, the engine reads thermal state at
+     * each [nativeAutoModeTick] and may de-rate the requested thread mode if
+     * the device is hot.
+     */
+    external fun nativeSetAutoMode(enabled: Boolean)
+
+    external fun nativeIsAutoModeEnabled(): Boolean
+
+    /** Returns the *effective* thread mode (what the engine is actually running). */
+    external fun nativeGetEffectiveThreadMode(): Int
+
+    /**
+     * Override default thermal thresholds. Defaults: warm=60000, hot=75000,
+     * crit=85000 (milli-Celsius). Pass <=0 to keep a field's current value.
+     */
+    external fun nativeSetThermalThresholds(warmMilliC: Int, hotMilliC: Int, critMilliC: Int)
+
+    /**
+     * Tick the auto-mode loop. When auto-mode is on, polls thermal state and
+     * adjusts the effective thread mode if needed. Returns the effective mode
+     * after the tick (0/1/2). Cheap to call (~100 us); host typically calls
+     * it once before each generate.
+     */
+    external fun nativeAutoModeTick(): Int
+
     /**
      * Token-batching threshold in bytes. Larger = fewer Binder/JNI calls but
      * higher latency to first visible token. 64 = direct JNI; 256 = default;
