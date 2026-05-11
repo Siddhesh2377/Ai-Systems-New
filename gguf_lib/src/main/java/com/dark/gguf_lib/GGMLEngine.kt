@@ -166,6 +166,111 @@ class GGMLEngine {
      */
     fun setThreadMode(mode: Int) = GGUFNativeLib.nativeSetThreadMode(mode)
 
+    // ── Power engine + decode diagnostics ──────────────────────────────────
+
+    /**
+     * Per-stage breakdown of the last completed generate call's time. All
+     * fields are aggregate microseconds across the run — divide by [tokens]
+     * for per-token cost. Returned by [getLastDecodeBreakdown].
+     *
+     * @property tokens    Number of tokens decoded in the run.
+     * @property sampleUs  Time inside the sampler chain (temp / top-k / etc).
+     * @property detokUs   Time spent converting token IDs to UTF-8 bytes.
+     * @property stopUs    Time spent matching antiprompt strings.
+     * @property decodeUs  Time inside `llama_decode` — the model forward pass.
+     *                     On a memory-bandwidth-bound model this dominates.
+     * @property totalUs   Sum of the four; ~equal to wall time per token.
+     */
+    data class DecodeBreakdown(
+        val tokens: Long,
+        val sampleUs: Long,
+        val detokUs: Long,
+        val stopUs: Long,
+        val decodeUs: Long,
+        val totalUs: Long,
+    )
+
+    fun getLastDecodeBreakdown(): DecodeBreakdown {
+        val raw = runCatching { GGUFNativeLib.nativeGetLastDecodeBreakdown() }
+            .getOrNull() ?: "{}"
+        val j = runCatching { org.json.JSONObject(raw) }.getOrNull() ?: org.json.JSONObject()
+        return DecodeBreakdown(
+            tokens   = j.optLong("tokens"),
+            sampleUs = j.optLong("sample_us"),
+            detokUs  = j.optLong("detok_us"),
+            stopUs   = j.optLong("stop_us"),
+            decodeUs = j.optLong("decode_us"),
+            totalUs  = j.optLong("total_us"),
+        )
+    }
+
+    /** Severity buckets that the power-engine maps the hottest SoC zone into. */
+    enum class ThrottlingLevel(val value: Int) {
+        COOL(0), WARM(1), HOT(2), CRITICAL(3);
+        companion object {
+            fun of(i: Int): ThrottlingLevel = values().firstOrNull { it.value == i } ?: COOL
+        }
+    }
+
+    /**
+     * Snapshot of the device's thermal state as seen by the engine.
+     *
+     * @property maxTempMilliC      Hottest *compute* zone in milli-Celsius. `-1`
+     *                              when no /sys/class/thermal entries could be
+     *                              read (sandboxed device or unsupported OS).
+     * @property batteryTempMilliC  Battery zone reading, `-1` if unavailable.
+     * @property level              Mapped severity. The auto-mode loop uses
+     *                              this to decide whether to de-rate.
+     * @property nZonesRead         How many thermal_zoneN entries were parsed.
+     */
+    data class ThermalState(
+        val maxTempMilliC: Int,
+        val batteryTempMilliC: Int,
+        val level: ThrottlingLevel,
+        val nZonesRead: Int,
+    )
+
+    fun getThermalState(): ThermalState {
+        val raw = runCatching { GGUFNativeLib.nativeGetThermalState() }
+            .getOrNull() ?: "{}"
+        val j = runCatching { org.json.JSONObject(raw) }.getOrNull() ?: org.json.JSONObject()
+        return ThermalState(
+            maxTempMilliC     = j.optInt("maxTempMilliC", -1),
+            batteryTempMilliC = j.optInt("batteryTempMilliC", -1),
+            level             = ThrottlingLevel.of(j.optInt("throttlingLevel", 0)),
+            nZonesRead        = j.optInt("nZonesRead", 0),
+        )
+    }
+
+    /**
+     * Enable auto-mode: the engine reads thermal state on each
+     * [autoModeTick] and may step the effective thread mode down if the SoC
+     * is hot. Disabling restores the user's requested mode.
+     */
+    fun setAutoMode(enabled: Boolean) = GGUFNativeLib.nativeSetAutoMode(enabled)
+    fun isAutoModeEnabled(): Boolean = GGUFNativeLib.nativeIsAutoModeEnabled()
+
+    /** The thread mode the engine is actually running (after any auto-mode adjustment). */
+    fun getEffectiveThreadMode(): Int = GGUFNativeLib.nativeGetEffectiveThreadMode()
+
+    /**
+     * Override the per-level thermal thresholds (milli-Celsius). Pass `<=0`
+     * for any field to keep the current value. Values are clamped to
+     * `[30000, 110000]`. Defaults are tuned for Snapdragon 7-class SoCs:
+     *
+     *   warm=60000  hot=75000  crit=85000
+     */
+    fun setThermalThresholds(warmMilliC: Int, hotMilliC: Int, critMilliC: Int) =
+        GGUFNativeLib.nativeSetThermalThresholds(warmMilliC, hotMilliC, critMilliC)
+
+    /**
+     * Tick the auto-mode loop. Polls thermal state; if auto-mode is on, may
+     * adjust the effective thread mode. Returns the effective mode (0/1/2)
+     * after the tick. Cheap (~100 us); host typically calls it before each
+     * generate call. No-op when auto-mode is off.
+     */
+    fun autoModeTick(): Int = GGUFNativeLib.nativeAutoModeTick()
+
     /**
      * Tune the token-batching threshold (bytes accumulated before each callback).
      *
