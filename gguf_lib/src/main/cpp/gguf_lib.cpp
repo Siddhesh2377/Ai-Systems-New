@@ -2884,22 +2884,19 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmLoadProjector(
     const char * path = env->GetStringUTFChars(jpath, nullptr);
 
     auto params = mtmd_context_params_default();
-    // use_gpu is wired through clip.cpp (registers Vulkan + allocates
-    // weights on GPU buft so ggml_backend_sched produces 1 split, not
-    // 202). Architecturally correct AND verified on-device:
-    //   "alloc_compute_meta: graph splits = 1, nodes = 406"
+    // Vulkan ViT is wired through (clip.cpp registers GPU + allocates
+    // weights on GPU buft → 1 split, architecturally clean) but Adreno
+    // 810 TDRs the queue on sustained compute regardless of memory
+    // layout or attention shader. Same vk::DeviceLostError after ~6s in
+    // every config we tried. Driver-level limit, not a userspace fix.
     //
-    // BUT: Adreno 810's Vulkan driver still TDRs (vk::DeviceLostError
-    // after ~6 seconds of sustained compute) even with the clean
-    // single-split graph. This is a kernel-level GPU watchdog issue, not
-    // something we can engineer around from userspace.
-    //
-    // Default to false here so the SDK is stable on the device family
-    // where this matters most. Hosts running on Mali / desktop GPUs /
-    // Adreno 6xx-7xx can flip to true via an SDK API once we expose one.
-    // The clip.cpp infrastructure stays in place — when a clean Vulkan
-    // path becomes possible, only this flag changes.
-    params.use_gpu       = false;
+    // Hard-disabled here. Ship CPU ViT (~50 s pre-warm, stable). All the
+    // SDK infra above (HardwareEngine, VlmEncoder, clip.cpp Vulkan path)
+    // stays in place — just doesn't get exercised on this device. When
+    // we ship on hardware with usable Vulkan compute (newer Adreno,
+    // Mali, desktop), flip to true and it just works.
+    params.use_gpu          = false;
+    params.flash_attn_type  = LLAMA_FLASH_ATTN_TYPE_AUTO;
     params.n_threads     = nThreads > 0
         ? nThreads
         : tn_thread_config_for_mode((tn_thread_mode)g_state.thread_mode).n_threads_batch;
