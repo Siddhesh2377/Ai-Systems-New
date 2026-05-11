@@ -440,14 +440,22 @@ static ggml_type cache_type_from_string(const std::string & s) {
 // nullptr if n_threads <= 1 — ggml is happy to run inline on the calling
 // thread in that case, no need to spawn a worker pool.
 //
-// affinity is enforced via the cpumask field. If all bits are zero the pool
-// is created without affinity (kernel scheduler decides). priority maps 1:1
-// onto ggml_sched_priority. poll=0 = futex wait (mobile-friendly).
+// affinity is best-effort. cpumask is a *hint* — strict_cpu is forced false
+// because (a) on Android, the foreground/background cpuset can refuse the
+// requested CPUs (sched_setaffinity returns EPERM), (b) strict=true pins
+// each worker to ONE core, which defeats the goal of sharing L3 within the
+// perf cluster. With strict=false ggml gives every worker the same mask and
+// lets the kernel place them within it.
+//
+// priority is *aspirational*. On Android we never get CAP_SYS_NICE, so
+// HIGH/REALTIME (which would map to SCHED_FIFO) silently fail in
+// pthread_setschedparam. Clamp to NORMAL or LOW — the only two policies the
+// kernel will accept without capabilities.
 static ggml_threadpool_t build_threadpool(int n_threads,
                                           const bool * cpumask,
                                           tn_thread_priority prio,
                                           int poll,
-                                          bool strict) {
+                                          bool /*strict_unused*/) {
     if (n_threads <= 1) return nullptr;
 
     ggml_threadpool_params p;
@@ -459,21 +467,24 @@ static ggml_threadpool_t build_threadpool(int n_threads,
         if (cpumask[i]) any = true;
     }
     if (!any) {
-        // Zero-mask = "no affinity"; ggml's params_init already zeroed it but
-        // be explicit so a future change to the default doesn't surprise us.
         std::memset(p.cpumask, 0, sizeof(p.cpumask));
     }
 
+    // Map TN priorities onto ggml priorities, clamping HIGH/REALTIME (which
+    // ggml would route through SCHED_FIFO) down to NORMAL on Android — we
+    // lack CAP_SYS_NICE so SCHED_FIFO returns EPERM and the worker keeps its
+    // inherited scheduler class anyway. Cleaner to ask for NORMAL up-front
+    // than to log a confusing "priority failed" warning every load.
     switch (prio) {
-        case TN_PRIO_LOW:      p.prio = GGML_SCHED_PRIO_LOW;      break;
-        case TN_PRIO_NORMAL:   p.prio = GGML_SCHED_PRIO_NORMAL;   break;
-        case TN_PRIO_MEDIUM:   p.prio = GGML_SCHED_PRIO_MEDIUM;   break;
-        case TN_PRIO_HIGH:     p.prio = GGML_SCHED_PRIO_HIGH;     break;
-        case TN_PRIO_REALTIME: p.prio = GGML_SCHED_PRIO_REALTIME; break;
-        default:               p.prio = GGML_SCHED_PRIO_NORMAL;   break;
+        case TN_PRIO_LOW:      p.prio = GGML_SCHED_PRIO_LOW;    break;
+        case TN_PRIO_HIGH:
+        case TN_PRIO_MEDIUM:
+        case TN_PRIO_REALTIME:
+        case TN_PRIO_NORMAL:
+        default:               p.prio = GGML_SCHED_PRIO_NORMAL; break;
     }
     p.poll        = (uint32_t)(poll < 0 ? 0 : (poll > 100 ? 100 : poll));
-    p.strict_cpu  = strict && any;
+    p.strict_cpu  = false;
     p.paused      = false;
 
     return ggml_threadpool_new(&p);
@@ -586,9 +597,36 @@ struct chat_template_result {
     std::vector<std::string> stops;
 };
 
+// One-time best-effort init for the model's chat template. Cached state:
+//   * chat_templates set     → use the model's Jinja template
+//   * chat_templates null + tried → bare-prompt fallback (template was bad)
+//   * chat_templates null + !tried → first call, attempt init
+//
+// Why lazy: see comment in nativeLoadModel where we deliberately skip the
+// load-time init. Triggering minja parse here means a bad template fails the
+// generate call (recoverable) instead of bricking the load (unrecoverable on
+// our pdfium-static-libcxx setup).
+static bool g_chat_templates_tried = false;
+static void ensure_chat_templates_loaded() {
+    if (g_state.chat_templates || g_chat_templates_tried || !g_state.model) return;
+    g_chat_templates_tried = true;
+    try {
+        g_state.chat_templates = common_chat_templates_init(g_state.model, g_state.chat_template_override);
+        LOGI("chat templates lazy-initialized successfully");
+    } catch (const std::exception & e) {
+        LOGE("chat_templates_init threw: %s — falling back to bare-prompt mode", e.what());
+        g_state.chat_templates.reset();
+    } catch (...) {
+        LOGE("chat_templates_init threw unknown exception — falling back to bare-prompt mode");
+        g_state.chat_templates.reset();
+    }
+}
+
 static chat_template_result apply_chat_template(const std::vector<common_chat_msg> & messages,
                                                  bool add_generation_prompt = true) {
     chat_template_result out;
+
+    ensure_chat_templates_loaded();
 
     if (!g_state.chat_templates) {
         std::string prompt;
@@ -1070,6 +1108,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModel(
     if (g_state.threadpool_batch) { ggml_threadpool_free(g_state.threadpool_batch); g_state.threadpool_batch = nullptr; }
     if (g_state.model)   { llama_model_free(g_state.model); g_state.model = nullptr; }
     g_state.chat_templates.reset();
+    g_chat_templates_tried = false;
     g_state.n_past = 0;
     g_state.session_tokens.clear();
     g_state.prev_prompt_tokens.clear();
@@ -1177,22 +1216,67 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModel(
         return JNI_FALSE;
     }
 
-    apply_thread_mode(g_state.thread_mode);
-    g_state.chat_templates = common_chat_templates_init(g_state.model, g_state.chat_template_override);
-    rebuild_sampler();
+    // Each of these can throw — and uncaught C++ exceptions in this .so
+    // unwind through libpdfium's static libunwind (mismatched ABI), which is
+    // observed to crash with SIGBUS instead of cleanly propagating. Catch
+    // here, log which step failed, and either continue with degraded state
+    // or fail the load with a usable error message.
+    LOGI("post-ctx: applying thread mode...");
+    try {
+        apply_thread_mode(g_state.thread_mode);
+    } catch (const std::exception & e) {
+        LOGE("apply_thread_mode threw: %s — continuing with default ggml pool", e.what());
+    } catch (...) {
+        LOGE("apply_thread_mode threw unknown exception — continuing with default ggml pool");
+    }
+
+    // Chat template init is DEFERRED to first generate call (see ensure_chat_templates
+    // in apply_chat_template). Reason: this lib statically links pdfium, which ships
+    // its own libcxx/libunwind. When minja (the Jinja parser inside common_chat_
+    // templates_init) throws on a tricky template — Llama-3.2 with custom_tools is
+    // one observed offender — the unwinder finds pdfium's tables instead of ours
+    // and corrupts PC mid-stack-walk → SIGBUS instead of clean exception propagation.
+    // try/catch can't help when the unwinder itself is broken.
+    //
+    // Lazy init means: the load completes successfully, and if the template parse
+    // does throw later, the calling thread (a worker, not the load thread) crashes
+    // there — not during model load, where it bricks the whole UX. The bare-prompt
+    // fallback at apply_chat_template:489-501 keeps generation working with a
+    // simple "User:/Assistant:" formatter when chat_templates stays null.
+    g_state.chat_templates.reset();
+    g_chat_templates_tried = false;
+    LOGI("post-ctx: chat templates DEFERRED to first generate call");
+
+    LOGI("post-ctx: building sampler...");
+    try {
+        rebuild_sampler();
+    } catch (const std::exception & e) {
+        LOGE("rebuild_sampler threw: %s", e.what());
+    } catch (...) {
+        LOGE("rebuild_sampler threw unknown exception");
+    }
 
     // Warm-up: single-token decode to fault-in hot weight pages so the first
-    // real query doesn't pay the page-fault tax in TTFT.
-    {
+    // real query doesn't pay the page-fault tax in TTFT. This is the first
+    // exercise of the freshly-attached threadpool, so it's also the most
+    // likely place for a threadpool/affinity issue to manifest. Wrap it.
+    LOGI("post-ctx: warm-up decode...");
+    try {
         const llama_vocab * vocab = llama_model_get_vocab(g_state.model);
         llama_token bos = llama_vocab_bos(vocab);
         if (bos != LLAMA_TOKEN_NULL) {
             llama_batch & sb = get_single_batch();
             common_batch_clear(sb);
             common_batch_add(sb, bos, 0, {0}, true);
-            llama_decode(g_state.ctx, sb);
+            if (llama_decode(g_state.ctx, sb) != 0) {
+                LOGW("Warm-up llama_decode returned non-zero — skipping page fault-in");
+            }
             llama_memory_clear(llama_get_memory(g_state.ctx), true);
         }
+    } catch (const std::exception & e) {
+        LOGE("Warm-up decode threw: %s — continuing (warm-up is not load-critical)", e.what());
+    } catch (...) {
+        LOGE("Warm-up decode threw unknown exception — continuing");
     }
 
     LOGI("Model loaded (ctx=%d threads_gen=%d threads_batch=%d batch=%d mode=%d)",
@@ -1884,6 +1968,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRelease(JNIEnv *, jobject) {
         g_state.model = nullptr;
     }
     g_state.chat_templates.reset();
+    g_chat_templates_tried = false;
     g_state.n_past = 0;
     g_state.session_tokens.clear();
     g_state.prev_prompt_tokens.clear();

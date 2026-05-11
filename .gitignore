@@ -38,3 +38,4 @@ CMakeCache.txt
 Thumbs.db
 desktop.ini
 /gguf_lib/plans/
+/web/src/routes/[chip]/[layer]/+page.svelte
