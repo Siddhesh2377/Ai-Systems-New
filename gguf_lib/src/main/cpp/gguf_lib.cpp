@@ -23,11 +23,13 @@
 #include "sampling.h"
 #include "chat.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #ifdef GGML_USE_VULKAN
 #include "ggml-vulkan.h"
 #endif
 
 #include "thread-engine.h"
+#include "power-engine.h"
 #include "rag-engine.h"
 #include "vt_cache.h"
 #include "vlm_kv_cache.h"
@@ -86,6 +88,27 @@ static void ensure_backend_init() {
 #endif
         LOGI("ggml backends registered: %zu, devices: %zu",
              ggml_backend_reg_count(), ggml_backend_dev_count());
+
+        // Enumerate registered backends and devices. With GGML_CPU_ALL_VARIANTS,
+        // ggml ships 7 .so variants (armv8.0..armv9.2+sme2) and dynamically picks
+        // the best one at runtime via getauxval(AT_HWCAP). Surfacing the choice
+        // here is the only way to confirm KleidiAI / armv9 features actually
+        // engaged on the device — without this log, a fallback to armv8.0 is
+        // silent and looks identical from the Java side.
+        for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
+            ggml_backend_reg_t r = ggml_backend_reg_get(i);
+            if (r) {
+                LOGI("  backend[%zu]: %s (%zu device(s))",
+                     i, ggml_backend_reg_name(r), ggml_backend_reg_dev_count(r));
+            }
+        }
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t d = ggml_backend_dev_get(i);
+            if (d) {
+                LOGI("  device[%zu]: %s | %s",
+                     i, ggml_backend_dev_name(d), ggml_backend_dev_description(d));
+            }
+        }
     });
 }
 
@@ -310,6 +333,30 @@ static struct {
     // for runtime knobs. Lets the caller revert to model-load defaults.
     bool use_mmap  = true;
     bool use_mlock = false;
+
+    // Per-stage decode timings (microseconds) from the LAST completed generate.
+    // Surfaced via nativeGetLastDecodeBreakdown(). Reset at the top of each
+    // streaming generate function so the breakdown is per-call, not cumulative.
+    uint64_t last_sample_us   = 0;
+    uint64_t last_detok_us    = 0;
+    uint64_t last_stop_us     = 0;
+    uint64_t last_decode_us   = 0;
+    uint64_t last_decode_tokens = 0;
+
+    // Explicit ggml threadpool, pre-spawned at model load and re-spawned on
+    // setThreadMode. nullptr = let ggml create an implicit on-demand pool
+    // (the historical behavior — slower because threads are spawned each
+    // llama_decode call). batch pool is separate so prompt-eval can use a
+    // wider thread count than single-token decode.
+    ggml_threadpool_t threadpool       = nullptr;
+    ggml_threadpool_t threadpool_batch = nullptr;
+
+    // Auto-mode: when true, requested_mode is what the user asked for but
+    // effective mode at the next apply_thread_mode() is whatever the power-
+    // engine recommends given current thermal state. Lets the user keep
+    // "PERFORMANCE" selected without the SoC actually hitting tjmax.
+    bool auto_mode      = false;
+    int  requested_mode = 1; // mirror of thread_mode prior to auto-derate
 } g_state;
 
 static void kv_evict_streaming();
@@ -389,28 +436,85 @@ static ggml_type cache_type_from_string(const std::string & s) {
     return GGML_TYPE_Q8_0;
 }
 
-// mode: 0=power_saving, 1=balanced, 2=performance
+// Build a ggml_threadpool from a tn_thread_config slot (gen or batch). Returns
+// nullptr if n_threads <= 1 — ggml is happy to run inline on the calling
+// thread in that case, no need to spawn a worker pool.
+//
+// affinity is enforced via the cpumask field. If all bits are zero the pool
+// is created without affinity (kernel scheduler decides). priority maps 1:1
+// onto ggml_sched_priority. poll=0 = futex wait (mobile-friendly).
+static ggml_threadpool_t build_threadpool(int n_threads,
+                                          const bool * cpumask,
+                                          tn_thread_priority prio,
+                                          int poll,
+                                          bool strict) {
+    if (n_threads <= 1) return nullptr;
+
+    ggml_threadpool_params p;
+    ggml_threadpool_params_init(&p, n_threads);
+
+    bool any = false;
+    for (int i = 0; i < TN_MAX_CPUS && i < GGML_MAX_N_THREADS; i++) {
+        p.cpumask[i] = cpumask[i];
+        if (cpumask[i]) any = true;
+    }
+    if (!any) {
+        // Zero-mask = "no affinity"; ggml's params_init already zeroed it but
+        // be explicit so a future change to the default doesn't surprise us.
+        std::memset(p.cpumask, 0, sizeof(p.cpumask));
+    }
+
+    switch (prio) {
+        case TN_PRIO_LOW:      p.prio = GGML_SCHED_PRIO_LOW;      break;
+        case TN_PRIO_NORMAL:   p.prio = GGML_SCHED_PRIO_NORMAL;   break;
+        case TN_PRIO_MEDIUM:   p.prio = GGML_SCHED_PRIO_MEDIUM;   break;
+        case TN_PRIO_HIGH:     p.prio = GGML_SCHED_PRIO_HIGH;     break;
+        case TN_PRIO_REALTIME: p.prio = GGML_SCHED_PRIO_REALTIME; break;
+        default:               p.prio = GGML_SCHED_PRIO_NORMAL;   break;
+    }
+    p.poll        = (uint32_t)(poll < 0 ? 0 : (poll > 100 ? 100 : poll));
+    p.strict_cpu  = strict && any;
+    p.paused      = false;
+
+    return ggml_threadpool_new(&p);
+}
+
+// mode: 0=power_saving, 1=balanced, 2=performance.
+//
+// Always rebuilds both threadpools. Free-and-recreate is cheap (the pool is
+// just N pthreads + a couple of futexes) and avoids an "is the cpumask the
+// same as before" comparison that would have to canonicalize identical zero
+// masks. Called both at load time (via load_model) and live from JNI on user
+// pref changes.
 static void apply_thread_mode(int mode) {
     tn_thread_config cfg = tn_thread_config_for_mode((tn_thread_mode)mode);
     g_state.thread_mode = mode;
+
+    // Detach + free old pools first. detach must precede free or llama_context
+    // ends up with dangling pool pointers.
+    if (g_state.ctx) llama_detach_threadpool(g_state.ctx);
+    if (g_state.threadpool)       { ggml_threadpool_free(g_state.threadpool);       g_state.threadpool = nullptr; }
+    if (g_state.threadpool_batch) { ggml_threadpool_free(g_state.threadpool_batch); g_state.threadpool_batch = nullptr; }
+
+    bool strict = cfg.pin_to_perf_cores || cfg.pin_to_eff_cores;
+
+    g_state.threadpool = build_threadpool(
+        cfg.n_threads_generation, cfg.cpumask_generation,
+        cfg.priority, cfg.poll, strict);
+    g_state.threadpool_batch = build_threadpool(
+        cfg.n_threads_batch, cfg.cpumask_batch,
+        cfg.priority, cfg.poll, strict);
 
     if (g_state.ctx) {
         llama_set_n_threads(g_state.ctx,
             cfg.n_threads_generation,
             cfg.n_threads_batch);
-    }
-
-    if (cfg.pin_to_perf_cores && cfg.n_perf_core_ids > 0) {
-        cpu_set_t set;
-        CPU_ZERO(&set);
-        for (int i = 0; i < cfg.n_perf_core_ids; i++) {
-            CPU_SET(cfg.perf_core_ids[i], &set);
-        }
-        if (sched_setaffinity(0, sizeof(set), &set) == 0) {
-            LOGI("Pinned to %d perf cores (mode=%d)", cfg.n_perf_core_ids, mode);
-        } else {
-            LOGW("sched_setaffinity failed: %s", strerror(errno));
-        }
+        llama_attach_threadpool(g_state.ctx,
+            g_state.threadpool ? g_state.threadpool : g_state.threadpool_batch,
+            g_state.threadpool_batch ? g_state.threadpool_batch : g_state.threadpool);
+        LOGI("Threadpools attached: gen=%d batch=%d (gen_pool=%p batch_pool=%p)",
+             cfg.n_threads_generation, cfg.n_threads_batch,
+             (void *)g_state.threadpool, (void *)g_state.threadpool_batch);
     }
 }
 
@@ -961,7 +1065,9 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModel(
     std::lock_guard<std::mutex> lock(g_state.gen_mutex);
 
     if (g_state.sampler) { common_sampler_free(g_state.sampler); g_state.sampler = nullptr; }
-    if (g_state.ctx)     { llama_free(g_state.ctx); g_state.ctx = nullptr; }
+    if (g_state.ctx)     { llama_detach_threadpool(g_state.ctx); llama_free(g_state.ctx); g_state.ctx = nullptr; }
+    if (g_state.threadpool)       { ggml_threadpool_free(g_state.threadpool);       g_state.threadpool = nullptr; }
+    if (g_state.threadpool_batch) { ggml_threadpool_free(g_state.threadpool_batch); g_state.threadpool_batch = nullptr; }
     if (g_state.model)   { llama_model_free(g_state.model); g_state.model = nullptr; }
     g_state.chat_templates.reset();
     g_state.n_past = 0;
@@ -1023,8 +1129,28 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModel(
     }
 
     if (flashAttn) cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-    cparams.type_k = cache_type_from_string(cacheK_s);
-    cparams.type_v = cache_type_from_string(cacheV_s);
+
+    // Auto-promote KV cache type for sub-1B models. The default "q8_0" is a
+    // reasonable choice for 3B+ where saving ~50% of KV memory is worth the
+    // per-attention-op dequant cost. For <1.2B models the absolute KV size
+    // is already small (tens of MB) and the dequant tax becomes the dominant
+    // attention cost — F16 KV is measurably faster on the same model and
+    // ARM CPU. We only promote when the caller passed q8_0 (the default);
+    // an explicit user choice (e.g. q4_0 to fit a 7B on 8 GB) is respected.
+    const uint64_t n_params = llama_model_n_params(g_state.model);
+    auto auto_kv = [&](const std::string & s) -> std::string {
+        if (s == "q8_0" && n_params > 0 && n_params < 1200000000ULL) return "f16";
+        return s;
+    };
+    std::string eff_k = auto_kv(cacheK_s);
+    std::string eff_v = auto_kv(cacheV_s);
+    if (eff_k != cacheK_s || eff_v != cacheV_s) {
+        LOGI("KV cache auto-promote (n_params=%.2fB): %s/%s -> %s/%s",
+             (double)n_params / 1e9,
+             cacheK_s.c_str(), cacheV_s.c_str(), eff_k.c_str(), eff_v.c_str());
+    }
+    cparams.type_k = cache_type_from_string(eff_k);
+    cparams.type_v = cache_type_from_string(eff_v);
 
     // Per-op CPU/GPU routing. When true and a non-CPU backend (Vulkan, etc.)
     // is registered with ggml, large ops (batch ≥ 32 by default) get offloaded
@@ -1272,6 +1398,13 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStream(
 
     rebuild_sampler();
 
+    // Reset per-stage decode timings. Surfaced via nativeGetLastDecodeBreakdown().
+    g_state.last_sample_us = 0;
+    g_state.last_detok_us  = 0;
+    g_state.last_stop_us   = 0;
+    g_state.last_decode_us = 0;
+    g_state.last_decode_tokens = 0;
+
     auto t_start = std::chrono::high_resolution_clock::now();
 
     // evaluate only the new tokens beyond the cached prefix
@@ -1308,8 +1441,11 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStream(
     while (n_generated < maxTokens && !g_state.cancel_flag.load()) {
         if (!g_state.sampler) break;
 
+        auto ts0 = std::chrono::high_resolution_clock::now();
         llama_token id = common_sampler_sample(g_state.sampler, g_state.ctx, -1);
         common_sampler_accept(g_state.sampler, id, true);
+        auto ts1 = std::chrono::high_resolution_clock::now();
+        g_state.last_sample_us += std::chrono::duration_cast<std::chrono::microseconds>(ts1 - ts0).count();
 
         if (llama_vocab_is_eog(vocab, id)) {
             break;
@@ -1318,6 +1454,8 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStream(
         // Detokenize
         char buf[256];
         int n = llama_token_to_piece(vocab, id, buf, sizeof(buf) - 1, 0, true);
+        auto ts2 = std::chrono::high_resolution_clock::now();
+        g_state.last_detok_us += std::chrono::duration_cast<std::chrono::microseconds>(ts2 - ts1).count();
         if (n > 0) {
             buf[n] = '\0';
             generated_text.append(buf, n);
@@ -1359,6 +1497,8 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStream(
                 break;
             }
         }
+        auto ts3 = std::chrono::high_resolution_clock::now();
+        g_state.last_stop_us += std::chrono::duration_cast<std::chrono::microseconds>(ts3 - ts2).count();
 
         // shift context if we're about to overflow
         if (g_state.n_past >= (int)llama_n_ctx(g_state.ctx) - 1) {
@@ -1375,8 +1515,10 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStream(
         if (llama_decode(g_state.ctx, sb) != 0) break;
         g_state.n_past++;
         n_generated++;
-
+        auto ts4 = std::chrono::high_resolution_clock::now();
+        g_state.last_decode_us += std::chrono::duration_cast<std::chrono::microseconds>(ts4 - ts3).count();
     }
+    g_state.last_decode_tokens = (uint64_t)n_generated;
 
     // flush any remaining buffered text
     if (sent_count < generated_text.size()) {
@@ -1411,6 +1553,13 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStream(
 
     LOGI("Generation complete: %d tokens, %.1f t/s, %.1f ms total",
          n_generated, tps, total_ms);
+    if (n_generated > 0) {
+        LOGI("Stage breakdown (us/tok): sample=%llu detok=%llu stop=%llu decode=%llu",
+            (unsigned long long)(g_state.last_sample_us / (uint64_t)n_generated),
+            (unsigned long long)(g_state.last_detok_us  / (uint64_t)n_generated),
+            (unsigned long long)(g_state.last_stop_us   / (uint64_t)n_generated),
+            (unsigned long long)(g_state.last_decode_us / (uint64_t)n_generated));
+    }
 
     return JNI_TRUE;
 }
@@ -1580,6 +1729,13 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStreamMultiTurn(
 
     auto t_prompt_done = std::chrono::high_resolution_clock::now();
 
+    // Reset per-stage timings for breakdown reporting.
+    g_state.last_sample_us = 0;
+    g_state.last_detok_us  = 0;
+    g_state.last_stop_us   = 0;
+    g_state.last_decode_us = 0;
+    g_state.last_decode_tokens = 0;
+
     const llama_vocab * vocab = llama_model_get_vocab(g_state.model);
     int n_generated = 0;
     std::string generated_text;
@@ -1591,13 +1747,18 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStreamMultiTurn(
     while (n_generated < maxTokens && !g_state.cancel_flag.load()) {
         if (!g_state.sampler) break;
 
+        auto ts0 = std::chrono::high_resolution_clock::now();
         llama_token id = common_sampler_sample(g_state.sampler, g_state.ctx, -1);
         common_sampler_accept(g_state.sampler, id, true);
+        auto ts1 = std::chrono::high_resolution_clock::now();
+        g_state.last_sample_us += std::chrono::duration_cast<std::chrono::microseconds>(ts1 - ts0).count();
 
         if (llama_vocab_is_eog(vocab, id)) break;
 
         char buf[256];
         int n = llama_token_to_piece(vocab, id, buf, sizeof(buf) - 1, 0, true);
+        auto ts2 = std::chrono::high_resolution_clock::now();
+        g_state.last_detok_us += std::chrono::duration_cast<std::chrono::microseconds>(ts2 - ts1).count();
         if (n > 0) {
             buf[n] = '\0';
             generated_text.append(buf, n);
@@ -1629,6 +1790,8 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStreamMultiTurn(
 
             if (env->ExceptionCheck()) { env->ExceptionClear(); break; }
         }
+        auto ts3 = std::chrono::high_resolution_clock::now();
+        g_state.last_stop_us += std::chrono::duration_cast<std::chrono::microseconds>(ts3 - ts2).count();
 
         if (g_state.n_past >= (int)llama_n_ctx(g_state.ctx) - 1) {
             if (!try_context_shift()) break;
@@ -1640,8 +1803,10 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStreamMultiTurn(
         if (llama_decode(g_state.ctx, sb) != 0) break;
         g_state.n_past++;
         n_generated++;
-
+        auto ts4 = std::chrono::high_resolution_clock::now();
+        g_state.last_decode_us += std::chrono::duration_cast<std::chrono::microseconds>(ts4 - ts3).count();
     }
+    g_state.last_decode_tokens = (uint64_t)n_generated;
 
     if (sent_count < generated_text.size()) {
         batcher.add(generated_text.data() + sent_count, generated_text.size() - sent_count);
@@ -1673,6 +1838,13 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStreamMultiTurn(
     env->CallVoidMethod(callback, g_onDone);
 
     LOGI("Multi-turn generation complete: %d tokens, %.1f t/s", n_generated, tps);
+    if (n_generated > 0) {
+        LOGI("Stage breakdown (us/tok): sample=%llu detok=%llu stop=%llu decode=%llu",
+            (unsigned long long)(g_state.last_sample_us / (uint64_t)n_generated),
+            (unsigned long long)(g_state.last_detok_us  / (uint64_t)n_generated),
+            (unsigned long long)(g_state.last_stop_us   / (uint64_t)n_generated),
+            (unsigned long long)(g_state.last_decode_us / (uint64_t)n_generated));
+    }
 
     return JNI_TRUE;
 }
@@ -1692,8 +1864,20 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRelease(JNIEnv *, jobject) {
         g_state.sampler = nullptr;
     }
     if (g_state.ctx) {
+        // Detach before free so the threadpool free below doesn't race with
+        // any lingering context callbacks. llama_free is what the SDK was
+        // doing; detach is harmless if no pool was attached.
+        llama_detach_threadpool(g_state.ctx);
         llama_free(g_state.ctx);
         g_state.ctx = nullptr;
+    }
+    if (g_state.threadpool) {
+        ggml_threadpool_free(g_state.threadpool);
+        g_state.threadpool = nullptr;
+    }
+    if (g_state.threadpool_batch) {
+        ggml_threadpool_free(g_state.threadpool_batch);
+        g_state.threadpool_batch = nullptr;
     }
     if (g_state.model) {
         llama_model_free(g_state.model);
@@ -2128,8 +2312,107 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetThreadMode(JNIEnv *, jobject, jint mode) {
     std::lock_guard<std::mutex> lock(g_state.gen_mutex);
     if (mode < 0 || mode > 2) mode = 1;
-    apply_thread_mode(mode);
-    LOGI("Thread mode set: %d", mode);
+    g_state.requested_mode = mode;
+    int effective = mode;
+    if (g_state.auto_mode) {
+        tn_power_state st = tn_power_get_thermal_state();
+        effective = (int)tn_power_recommend_mode((tn_thread_mode)mode, &st);
+    }
+    apply_thread_mode(effective);
+    LOGI("Thread mode set: requested=%d effective=%d auto=%d",
+         mode, effective, (int)g_state.auto_mode);
+}
+
+// Power-engine surface. The Kotlin SDK polls nativeGetThermalState() at its
+// own cadence (typically per-decode) and uses it to drive the auto-mode loop
+// or surface the temperature in the UI.
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGetThermalState(JNIEnv * env, jobject) {
+    tn_power_state s = tn_power_get_thermal_state();
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "{\"maxTempMilliC\":%d,\"batteryTempMilliC\":%d,"
+        "\"throttlingLevel\":%d,\"nZonesRead\":%d}",
+        (int)s.max_temp_milli_c, (int)s.battery_temp_milli_c,
+        (int)s.throttling_level, (int)s.n_zones_read);
+    return env->NewStringUTF(buf);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetAutoMode(JNIEnv *, jobject, jboolean enabled) {
+    std::lock_guard<std::mutex> lock(g_state.gen_mutex);
+    bool now = (enabled == JNI_TRUE);
+    bool was = g_state.auto_mode;
+    g_state.auto_mode = now;
+    LOGI("Auto-mode: %d -> %d", (int)was, (int)now);
+    // Re-evaluate immediately so a freshly-toggled auto-mode kicks in without
+    // waiting for the next nativeSetThreadMode call.
+    if (now && g_state.ctx) {
+        tn_power_state st = tn_power_get_thermal_state();
+        int eff = (int)tn_power_recommend_mode((tn_thread_mode)g_state.requested_mode, &st);
+        if (eff != g_state.thread_mode) apply_thread_mode(eff);
+    } else if (!now && g_state.ctx && g_state.thread_mode != g_state.requested_mode) {
+        // Auto-mode off — restore whatever the user asked for.
+        apply_thread_mode(g_state.requested_mode);
+    }
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeIsAutoModeEnabled(JNIEnv *, jobject) {
+    return g_state.auto_mode ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGetEffectiveThreadMode(JNIEnv *, jobject) {
+    return (jint)g_state.thread_mode;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetThermalThresholds(
+        JNIEnv *, jobject, jint warmMilliC, jint hotMilliC, jint critMilliC) {
+    tn_power_set_thresholds((int32_t)warmMilliC,
+                            (int32_t)hotMilliC,
+                            (int32_t)critMilliC);
+}
+
+// Called by the Kotlin SDK between generate calls when auto-mode is enabled.
+// Returns the effective mode (mirrors g_state.thread_mode) so the caller can
+// surface "AUTO -> POWER_SAVING (CRITICAL)" in the UI without a second call.
+extern "C" JNIEXPORT jint JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeAutoModeTick(JNIEnv *, jobject) {
+    std::lock_guard<std::mutex> lock(g_state.gen_mutex);
+    if (!g_state.auto_mode) return (jint)g_state.thread_mode;
+    tn_power_state st = tn_power_get_thermal_state();
+    int eff = (int)tn_power_recommend_mode((tn_thread_mode)g_state.requested_mode, &st);
+    if (eff != g_state.thread_mode && g_state.ctx) {
+        LOGI("Auto-mode tick: %d -> %d (max_temp=%d mC, level=%d)",
+             g_state.thread_mode, eff, st.max_temp_milli_c, st.throttling_level);
+        apply_thread_mode(eff);
+    }
+    return (jint)g_state.thread_mode;
+}
+
+// Per-stage decode timings from the LAST completed generate. Returns JSON:
+//   { "tokens": N, "sample_us": ..., "detok_us": ..., "stop_us": ...,
+//     "decode_us": ..., "total_us": ... }
+// All us values are AGGREGATE across the run; divide by tokens for per-token.
+// Returns "{}" if no generate has run yet.
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGetLastDecodeBreakdown(JNIEnv * env, jobject) {
+    uint64_t total = g_state.last_sample_us + g_state.last_detok_us
+                   + g_state.last_stop_us  + g_state.last_decode_us;
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "{\"tokens\":%llu,\"sample_us\":%llu,\"detok_us\":%llu,"
+        "\"stop_us\":%llu,\"decode_us\":%llu,\"total_us\":%llu}",
+        (unsigned long long)g_state.last_decode_tokens,
+        (unsigned long long)g_state.last_sample_us,
+        (unsigned long long)g_state.last_detok_us,
+        (unsigned long long)g_state.last_stop_us,
+        (unsigned long long)g_state.last_decode_us,
+        (unsigned long long)total);
+    return env->NewStringUTF(buf);
 }
 
 // Larger threshold = fewer IPC calls, higher latency to first visible token.
