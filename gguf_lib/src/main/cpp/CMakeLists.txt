@@ -57,7 +57,13 @@ set(GGML_LTO             ON  CACHE BOOL "" FORCE)
 # in the NDK. If you ever need OpenCL alongside, vendor in OpenCL-Headers
 # from Khronos and point `-DOpenCL_INCLUDE_DIR` + `-DOpenCL_LIBRARY` at
 # them, and re-enable here.
-set(GGML_VULKAN          ON  CACHE BOOL "" FORCE)
+# Vulkan disabled: Adreno 810 (Snapdragon 7s Gen 3) cannot sustain ML compute
+# without TDR'ing the queue (~6 s watchdog kill). Even with 0 layers offloaded
+# the backend still allocates ~489 MB Vulkan_Host pinned memory and inserts
+# itself into the scheduler, costing per-graph overhead. CPU-only is faster
+# in practice on every device we've measured. Re-enable per-device only when
+# the GPU has been validated for sustained sgemm.
+set(GGML_VULKAN          OFF CACHE BOOL "" FORCE)
 
 if(ANDROID_ABI STREQUAL "arm64-v8a")
     # Baseline armv8-a — KleidiAI dispatches dotprod/i8mm/SVE per-device at runtime.
