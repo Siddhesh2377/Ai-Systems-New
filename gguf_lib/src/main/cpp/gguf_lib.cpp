@@ -347,12 +347,35 @@ static float read_mem_total_mb() {
     return kb / 1024.f;
 }
 
+// Reports RESIDENT memory (VmRSS / VmHWM), not virtual size. mmap'd model
+// files inflate VmPeak by the entire on-disk size even when pages aren't
+// resident — so the prior VmPeak-based reading over-reported by GBs.
+//
+// peak_mb now = VmHWM (peak resident pages); mem_pct compares against
+// MemTotal so the percentage reflects what fraction of physical RAM the
+// process has actually pulled in.
 static void compute_memory_metrics(float & model_mb, float & ctx_mb, float & peak_mb, float & mem_pct) {
     model_mb = g_state.model ? (float)llama_model_size(g_state.model) / (1024.f * 1024.f) : 0.f;
     ctx_mb   = g_state.ctx   ? (float)llama_state_get_size(g_state.ctx) / (1024.f * 1024.f) : 0.f;
-    peak_mb  = read_proc_status_mb("VmPeak");
+    peak_mb  = read_proc_status_mb("VmHWM");
     float total_mb = read_mem_total_mb();
     mem_pct  = (total_mb > 0.f && peak_mb > 0.f) ? (peak_mb / total_mb) * 100.f : 0.f;
+}
+
+static float read_mem_available_mb() {
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (!f) return 0.f;
+    char line[256];
+    float kb = 0.f;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "MemAvailable:", 13) == 0) {
+            long v = 0;
+            if (sscanf(line + 13, " %ld", &v) == 1) kb = (float)v;
+            break;
+        }
+    }
+    fclose(f);
+    return kb / 1024.f;
 }
 
 static ggml_type cache_type_from_string(const std::string & s) {
