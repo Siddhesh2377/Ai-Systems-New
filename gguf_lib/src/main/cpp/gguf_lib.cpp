@@ -1276,7 +1276,10 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStream(
 
     // evaluate only the new tokens beyond the cached prefix
     std::vector<llama_token> new_tokens(tokens.begin() + g_state.n_past, tokens.end());
-    int prompt_tokens = (int)new_tokens.size();
+    // Reported as "tokensEvaluated" but means full prompt size — what the
+    // user sees in their UI as "Prompt tokens". new_tokens.size() under-
+    // reports when the KV prefix cache is hot (system prompt cached etc).
+    int prompt_tokens = (int)tokens.size();
 
     // set up progress reporting for long prompt evaluation
     jni_progress_ctx progress_ctx = { env, callback };
@@ -1554,7 +1557,9 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStreamMultiTurn(
 
     // only evaluate tokens beyond the cached prefix
     std::vector<llama_token> new_tokens(tokens.begin() + g_state.n_past, tokens.end());
-    int prompt_tokens = (int)new_tokens.size();
+    // Full prompt size, not just newly-evaluated. See generateStream above
+    // for the reasoning.
+    int prompt_tokens = (int)tokens.size();
 
     // progress reporting for long prompt evaluation
     jni_progress_ctx mt_progress = { env, callback };
