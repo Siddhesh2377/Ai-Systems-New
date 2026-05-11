@@ -605,7 +605,6 @@ All under `GGUFNativeLib` (internal to the AAR — go through `GGMLEngine`).
 nativeVlmLoadProjector(path, nThreads, imageMinTokens, imageMaxTokens) : Boolean
 nativeVlmLoadProjectorFromFd(fd, ...)                                  : Boolean
 nativeVlmRelease()
-nativeVlmIsLoaded()                                                    : Boolean
 nativeVlmGetInfo()                                                     : String?      // {supports_vision, supports_audio, default_marker}
 nativeVlmGetDefaultMarker()                                            : String
 

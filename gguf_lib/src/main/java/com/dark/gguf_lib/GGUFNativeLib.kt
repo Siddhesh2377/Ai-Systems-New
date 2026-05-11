@@ -196,7 +196,6 @@ internal object GGUFNativeLib {
     ): Boolean
 
     external fun nativeVlmRelease()
-    external fun nativeVlmIsLoaded(): Boolean
     external fun nativeVlmGetInfo(): String?
     external fun nativeVlmGetDefaultMarker(): String
 

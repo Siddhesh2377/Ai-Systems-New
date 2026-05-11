@@ -2965,11 +2965,6 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmRelease(JNIEnv *, jobject) {
     }
 }
 
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmIsLoaded(JNIEnv *, jobject) {
-    return g_vlm.ctx != nullptr ? JNI_TRUE : JNI_FALSE;
-}
-
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGetInfo(JNIEnv * env, jobject) {
     if (!g_vlm.ctx) return env->NewStringUTF("{}");
