@@ -133,6 +133,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
     error_tracker.cpp
     ${LLAMA_DIR}/engine/tn-log.cpp
     ${LLAMA_DIR}/engine/thread-engine.cpp
+    ${LLAMA_DIR}/engine/power-engine.cpp
     ${LLAMA_DIR}/engine/rag-engine.cpp
     ${LLAMA_DIR}/engine/vt_cache.cpp
     ${LLAMA_DIR}/engine/vlm_kv_cache.cpp
