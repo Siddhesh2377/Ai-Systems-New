@@ -71,17 +71,15 @@ OfflineTts.fromFile(cfg).use { tts ->
 
 ### Crash + error tracker
 
-```kotlin
-SherpaLib.nativeErrorInit() // installs SIGSEGV/SIGABRT/... handlers, idempotent
-SherpaLib.nativeErrorSetCrashLogPath(File(filesDir, "sherpa_crash.json").absolutePath)
+Diagnostics, error capture, and signal-handler crash files are owned by the
+`:tn_security` module. The host app installs handlers + the crash-file pattern
+once via `com.dark.tn_security.TnSecurity`; every log line and every error
+emitted by this SDK (and by the upstream sherpa-onnx library — its
+`SHERPA_ONNX_LOGE` macro is rerouted in the fork) is delivered to that same
+sink with the `TN_MODULE_AI_SHERPA` / `TN_MODULE_SHERPA_ONNX` tag set.
 
-// after a failure:
-val json = SherpaLib.nativeErrorGetLastJson() // "{}" if none
-SherpaLib.nativeErrorClear()
-```
-
-The crash handler writes a small JSON blob and re-raises with the default
-handler so Android's tombstone path still produces a `tombstone_NN` file.
+No per-SDK error API is exposed any more; consumers read errors out of the
+unified `TnSecurity` event stream.
 
 ## Threading and lifecycle
 
@@ -121,11 +119,9 @@ src/main/
 │   ├── jni_cache.{h,cpp}     JNI_OnLoad: cached jclass / jmethodID refs
 │   ├── jni_common.h          field-getter helpers, CHECK_PTR macro
 │   ├── offline_recognizer.cpp
-│   ├── offline_tts.cpp
-│   ├── error_tracker.{h,cpp} signal handlers + last-error JSON store
-│   └── error_jni.cpp         JNI bindings for the error tracker
+│   └── offline_tts.cpp
 └── java/com/dark/ai_sherpa/
-    ├── SherpaLib.kt              library loader + error API
+    ├── SherpaLib.kt              library loader
     ├── OfflineRecognizer.kt      recognizer + stream
     ├── OfflineRecognizerConfig.kt
     ├── OfflineTts.kt

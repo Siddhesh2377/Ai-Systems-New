@@ -1,7 +1,10 @@
 // Copyright (c) 2025 Dark Matter Labs
 #include <algorithm>
 
-#include "error_tracker.h"
+#define TN_MODULE TN_MODULE_AI_SHERPA
+#define TN_TAG    "ai_sherpa"
+#include <tn_security/tn_security_macros.h>
+
 #include "jni_cache.h"
 #include "jni_common.h"
 #include "sherpa-onnx/c-api/c-api.h"
@@ -175,19 +178,19 @@ Java_com_dark_ai_1sherpa_OfflineRecognizer_newFromFile(
     JNIEnv* env, jobject, jobject jconfig) {
   auto h = ReadOfflineConfig(env, jconfig);
 
-  char detail[640];
-  snprintf(detail, sizeof(detail),
-           "tokens=%s whisper_enc=%s whisper_dec=%s nemo=%s threads=%d",
-           h.tokens.c_str(),
-           h.whisper_enc.empty() ? "-" : h.whisper_enc.c_str(),
-           h.whisper_dec.empty() ? "-" : h.whisper_dec.c_str(),
-           h.nemo_ctc_model.empty() ? "-" : h.nemo_ctc_model.c_str(),
-           h.cfg.model_config.num_threads);
-  tn_error_set_op("OfflineRecognizer.newFromFile", detail);
+  tn_sec_set_op("OfflineRecognizer.newFromFile");
+  TN_D("op-detail: tokens=%s whisper_enc=%s whisper_dec=%s nemo=%s threads=%d",
+       h.tokens.c_str(),
+       h.whisper_enc.empty() ? "-" : h.whisper_enc.c_str(),
+       h.whisper_dec.empty() ? "-" : h.whisper_dec.c_str(),
+       h.nemo_ctc_model.empty() ? "-" : h.nemo_ctc_model.c_str(),
+       h.cfg.model_config.num_threads);
 
   const SherpaOnnxOfflineRecognizer* p = SherpaOnnxCreateOfflineRecognizer(&h.cfg);
   if (!p) {
-    tn_error_set_last(TN_ERR_MODEL_LOAD, "STTLoad",
+    TN_ERR_FIX(TN_CODE_MODEL_LOAD_FAIL, TN_STAGE_LOAD,
+        "Verify the model file, tokens, and free memory.",
+        "%s",
         "SherpaOnnxCreateOfflineRecognizer returned null. "
         "Likely missing/corrupt model file, mismatched tokens, or insufficient memory.");
     ThrowIllegalState(env, "Failed to create OfflineRecognizer");

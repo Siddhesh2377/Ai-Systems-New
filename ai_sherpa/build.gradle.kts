@@ -51,4 +51,12 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
+
+    buildFeatures {
+        prefab = true
+    }
+}
+
+dependencies {
+    api(project(":tn_security"))
 }

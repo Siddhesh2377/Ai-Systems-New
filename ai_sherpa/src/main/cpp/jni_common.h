@@ -1,15 +1,22 @@
 // Copyright (c) 2025 Dark Matter Labs
 #pragma once
 
-#include <android/log.h>
 #include <jni.h>
 
 #include <string>
 
-#define TAG "ai_sherpa"
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  TAG, __VA_ARGS__)
-#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
+#ifndef TN_MODULE
+#define TN_MODULE TN_MODULE_AI_SHERPA
+#endif
+#ifndef TN_TAG
+#define TN_TAG "ai_sherpa"
+#endif
+#include <tn_security/tn_security_macros.h>
+
+#define LOGE(...) TN_E(__VA_ARGS__)
+#define LOGW(...) TN_W(__VA_ARGS__)
+#define LOGD(...) TN_D(__VA_ARGS__)
+#define LOGI(...) TN_I(__VA_ARGS__)
 
 // Throws java.lang.NullPointerException and returns retval if ptr is 0.
 // Used to guard JNI entries that take Java-side handles (jlong) — a 0 value

@@ -73,7 +73,7 @@ class OfflineTts private constructor(@Volatile private var ptr: Long) : AutoClos
          * Loads a TTS engine from on-disk model files described by [config].
          * Blocks during ONNX session init (1–10s typical for VITS, 5–20s for
          * Kokoro). Throws `IllegalStateException` if the model fails to load —
-         * see [SherpaLib.nativeErrorGetLastJson] for the underlying reason.
+         * the structured reason is emitted to the `:tn_security` sink.
          */
         fun fromFile(config: OfflineTtsConfig): OfflineTts {
             val p = newFromFile(config)

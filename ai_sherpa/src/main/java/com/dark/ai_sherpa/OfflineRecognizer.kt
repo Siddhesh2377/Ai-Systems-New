@@ -70,7 +70,7 @@ class OfflineRecognizer private constructor(@Volatile private var ptr: Long) : A
          * Loads a recognizer from on-disk model files described by [config].
          * Blocks for the duration of the ONNX session init (1–10s typical).
          * Throws `IllegalStateException` if the underlying model fails to load —
-         * see [SherpaLib.nativeErrorGetLastJson] for details.
+         * the structured reason is emitted to the `:tn_security` sink.
          */
         fun fromFile(config: OfflineRecognizerConfig): OfflineRecognizer {
             val p = newFromFile(config)

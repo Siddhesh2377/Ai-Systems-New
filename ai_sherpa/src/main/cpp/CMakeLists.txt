@@ -36,14 +36,24 @@ set(SHERPA_ONNX_ENABLE_WEBSOCKET            OFF CACHE BOOL "" FORCE)
 set(SHERPA_ONNX_ENABLE_TESTS                OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS                       OFF CACHE BOOL "" FORCE)
 
+find_package(tn_security REQUIRED CONFIG)
+
+# Propagate tn_security headers into the sherpa-onnx subbuild — the upstream
+# fork's csrc/macros.h now includes <tn_security/tn_security.h> so its
+# SHERPA_ONNX_LOGE macro can route into the unified sink. Unresolved
+# tn_sec_log symbols in the static archive are satisfied when libai_sherpa.so
+# links against tn_security::tn_security below.
+get_target_property(_tn_sec_inc tn_security::tn_security INTERFACE_INCLUDE_DIRECTORIES)
+if(_tn_sec_inc)
+  include_directories(${_tn_sec_inc})
+endif()
+
 add_subdirectory(${SHERPA_ONNX_DIR} ${CMAKE_BINARY_DIR}/sherpa-onnx)
 
 add_library(ai_sherpa SHARED
   jni_cache.cpp
   offline_recognizer.cpp
   offline_tts.cpp
-  error_tracker.cpp
-  error_jni.cpp
 )
 
 target_include_directories(ai_sherpa PRIVATE
@@ -55,6 +65,7 @@ target_include_directories(ai_sherpa PRIVATE
 target_link_libraries(ai_sherpa PRIVATE
   sherpa-onnx-c-api
   sherpa-onnx-core
+  tn_security::tn_security
   android
   log
 )

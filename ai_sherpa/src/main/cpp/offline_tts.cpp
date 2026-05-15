@@ -2,7 +2,10 @@
 #include <algorithm>
 #include <cstring>
 
-#include "error_tracker.h"
+#define TN_MODULE TN_MODULE_AI_SHERPA
+#define TN_TAG    "ai_sherpa"
+#include <tn_security/tn_security_macros.h>
+
 #include "jni_cache.h"
 #include "jni_common.h"
 #include "sherpa-onnx/c-api/c-api.h"
@@ -97,18 +100,18 @@ Java_com_dark_ai_1sherpa_OfflineTts_newFromFile(
     JNIEnv* env, jobject, jobject jconfig) {
   auto h = ReadTtsConfig(env, jconfig);
 
-  char detail[640];
-  snprintf(detail, sizeof(detail),
-           "vits=%s kokoro=%s tokens=%s threads=%d",
-           h.vits_model.empty()   ? "-" : h.vits_model.c_str(),
-           h.kokoro_model.empty() ? "-" : h.kokoro_model.c_str(),
-           h.vits_tokens.empty()  ? h.kokoro_tokens.c_str() : h.vits_tokens.c_str(),
-           h.cfg.model.num_threads);
-  tn_error_set_op("OfflineTts.newFromFile", detail);
+  tn_sec_set_op("OfflineTts.newFromFile");
+  TN_D("op-detail: vits=%s kokoro=%s tokens=%s threads=%d",
+       h.vits_model.empty()   ? "-" : h.vits_model.c_str(),
+       h.kokoro_model.empty() ? "-" : h.kokoro_model.c_str(),
+       h.vits_tokens.empty()  ? h.kokoro_tokens.c_str() : h.vits_tokens.c_str(),
+       h.cfg.model.num_threads);
 
   const SherpaOnnxOfflineTts* p = SherpaOnnxCreateOfflineTts(&h.cfg);
   if (!p) {
-    tn_error_set_last(TN_ERR_MODEL_LOAD, "TTSLoad",
+    TN_ERR_FIX(TN_CODE_MODEL_LOAD_FAIL, TN_STAGE_LOAD,
+        "Verify the TTS model files, tokens, and free memory.",
+        "%s",
         "SherpaOnnxCreateOfflineTts returned null. "
         "Likely missing/incompatible model, tokens, or insufficient memory.");
     ThrowIllegalState(env, "Failed to create OfflineTts");
@@ -149,10 +152,9 @@ Java_com_dark_ai_1sherpa_OfflineTts_generate(
   const char* text = env->GetStringUTFChars(jtext, nullptr);
   const size_t text_len = text ? std::strlen(text) : 0;
 
-  char detail[256];
-  snprintf(detail, sizeof(detail), "sid=%d speed=%.2f text_len=%zu",
-           (int)sid, (float)speed, text_len);
-  tn_error_set_op("OfflineTts.generate", detail);
+  tn_sec_set_op("OfflineTts.generate");
+  TN_D("op-detail: sid=%d speed=%.2f text_len=%zu",
+       (int)sid, (float)speed, text_len);
 
   SherpaOnnxGenerationConfig gen_cfg{};
   gen_cfg.sid   = static_cast<int>(sid);
@@ -165,7 +167,9 @@ Java_com_dark_ai_1sherpa_OfflineTts_generate(
   if (text) env->ReleaseStringUTFChars(jtext, text);
 
   if (!audio) {
-    tn_error_set_last(TN_ERR_GENERATION, "TTSGenerate",
+    TN_ERR_FIX(TN_CODE_DECODE_FAIL, TN_STAGE_TTS_GENERATE,
+        "Check that sid is in [0, numSpeakers) and text is non-empty.",
+        "%s",
         "TTS generation returned null. "
         "Possibly invalid speaker id, empty text, or out of memory.");
     ThrowIllegalState(env, "TTS generation failed");
