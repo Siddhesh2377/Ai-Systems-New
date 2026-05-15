@@ -6,6 +6,10 @@
  * Output: 1x1xHxW depth map (inverse depth, higher = closer)
  */
 
+#define TN_MODULE TN_MODULE_AI_SD
+#define TN_TAG    "ai_sd"
+#include <tn_security/tn_security_macros.h>
+
 #include "depth_estimator.h"
 #include "../utils/sd_logger.h"
 
@@ -26,6 +30,8 @@ bool DepthEstimator::loadModel(const std::string& modelPath, bool useOpenCL) {
 
     interpreter_ = MNN::Interpreter::createFromFile(modelPath.c_str());
     if (!interpreter_) {
+        TN_ERR(TN_CODE_MNN_INIT_FAIL, TN_STAGE_SD_DEPTH,
+               "[DEPTH] Failed to load model: %s", modelPath.c_str());
         SD_LOG_ERROR("[DEPTH] Failed to load model: %s", modelPath.c_str());
         return false;
     }
@@ -48,6 +54,8 @@ bool DepthEstimator::loadModel(const std::string& modelPath, bool useOpenCL) {
 
     session_ = interpreter_->createSession(cfg);
     if (!session_) {
+        TN_ERR(TN_CODE_MNN_INIT_FAIL, TN_STAGE_SD_DEPTH,
+               "[DEPTH] Failed to create session");
         SD_LOG_ERROR("[DEPTH] Failed to create session");
         release();
         return false;

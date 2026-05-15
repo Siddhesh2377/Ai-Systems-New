@@ -50,6 +50,20 @@ endif()
 set(PLATFORM_LIBS log android dl m c GLESv2 EGL)
 
 # ============================================================================
+# tn_security — unified logging + error reporting (Prefab AAR)
+# ============================================================================
+# Resolved before MNN's add_subdirectory so the include path can be propagated
+# into MNN's compilation (MNNDefine.h routes its log macros through
+# tn_sec_log). The __has_include fallback in MNNDefine.h keeps the build
+# working if propagation fails.
+find_package(tn_security REQUIRED CONFIG)
+get_target_property(TN_SECURITY_INCLUDE_DIRS
+    tn_security::tn_security INTERFACE_INCLUDE_DIRECTORIES)
+if(TN_SECURITY_INCLUDE_DIRS)
+    include_directories(${TN_SECURITY_INCLUDE_DIRS})
+endif()
+
+# ============================================================================
 # Third-party: ZSTD
 # ============================================================================
 set(ZSTD_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/zstd)
@@ -70,7 +84,10 @@ set(MNN_LOW_MEMORY ON CACHE BOOL "" FORCE)
 set(MNN_CPU_WEIGHT_DEQUANT_GEMM ON CACHE BOOL "" FORCE)
 set(MNN_BUILD_FOR_ANDROID ON CACHE BOOL "" FORCE)
 set(MNN_BUILD_FOR_ANDROID_COMMAND ON CACHE BOOL "" FORCE)
-set(MNN_USE_LOGCAT OFF CACHE BOOL "" FORCE)
+# LOGCAT ON: activates MNN's #ifdef MNN_USE_LOGCAT branch in MNNDefine.h, which
+# we've patched to route MNN_ERROR/MNN_PRINT through tn_sec_log under module
+# TN_MODULE_MNN. Without this, MNN falls back to printf() — invisible on Android.
+set(MNN_USE_LOGCAT ON CACHE BOOL "" FORCE)
 set(MNN_OPENCL ON CACHE BOOL "" FORCE)
 set(MNN_SUPPORT_TRANSFORMER_FUSE ON CACHE BOOL "" FORCE)
 # BF16 ops — 7s Gen 3 has hw bf16, 5-30% speedup on capable cores
@@ -242,6 +259,7 @@ target_link_libraries(ai_sd PRIVATE
     MNN
     tokenizers_cpp
     libzstd
+    tn_security::tn_security
 )
 
 # 16KB page alignment

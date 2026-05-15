@@ -5,6 +5,10 @@
  * No global state dependencies — pure math on xtensor arrays.
  */
 
+#define TN_MODULE TN_MODULE_AI_SD
+#define TN_TAG    "ai_sd"
+#include <tn_security/tn_security_macros.h>
+
 #include "vae_codec.h"
 
 #include <stdexcept>
@@ -119,6 +123,8 @@ xt::xarray<float> blend_vae_encoder_tiles(
     int latent_h, int latent_w, int tile_size,
     int overlap_x, int overlap_y) {
     if (tiles_mean_std.empty()) {
+        TN_ERR(TN_CODE_INVALID_PARAM, TN_STAGE_SD_VAE,
+               "Tile list cannot be empty for VAE encoder blending");
         throw std::runtime_error(
             "Tile list cannot be empty for VAE encoder blending.");
     }
@@ -210,6 +216,8 @@ xt::xarray<float> blend_vae_output_tiles(
     int output_h, int output_w, int tile_size,
     int overlap_x, int overlap_y) {
     if (tiles.empty()) {
+        TN_ERR(TN_CODE_INVALID_PARAM, TN_STAGE_SD_VAE,
+               "Tile list cannot be empty for VAE output blending");
         throw std::runtime_error(
             "Tile list cannot be empty for VAE output blending.");
     }

@@ -8,6 +8,10 @@
  * invalidation are safe.
  */
 
+#define TN_MODULE TN_MODULE_AI_SD
+#define TN_TAG    "ai_sd"
+#include <tn_security/tn_security_macros.h>
+
 #include "jni_utils.h"
 #include "sd_logger.h"
 
@@ -102,9 +106,13 @@ void ensure_init_locked(JNIEnv* env, jobject callback) {
 
 // Any pending Java exception left after a CallVoidMethod will abort the
 // next JNI call with a hard process abort. Clear once per callback so the
-// next step survives even if user code threw.
+// next step survives even if user code threw. Emit a structured tn_security
+// error first so callers can surface "Kotlin callback X threw" instead of
+// swallowing it silently.
 void check_clear_exception(JNIEnv* env, const char* where) {
     if (env->ExceptionCheck()) {
+        TN_ERR(TN_CODE_PLUGIN_EXEC_FAIL, TN_STAGE_UNSPECIFIED,
+               "Kotlin callback threw in %s", where ? where : "<unknown>");
         SD_LOG_ERROR("sd_jni: pending Java exception after %s — clearing", where);
         env->ExceptionDescribe();
         env->ExceptionClear();

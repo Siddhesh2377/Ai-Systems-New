@@ -6,6 +6,10 @@
  * via pipeline_globals.h during migration.
  */
 
+#define TN_MODULE TN_MODULE_AI_SD
+#define TN_TAG    "ai_sd"
+#include <tn_security/tn_security_macros.h>
+
 #include "text_encoder.h"
 #include "../pipeline/pipeline_globals.h"
 #include "../pipeline/prompt_processor.h"

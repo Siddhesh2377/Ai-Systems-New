@@ -10,6 +10,10 @@
  * inference pipeline.
  */
 
+#define TN_MODULE TN_MODULE_AI_SD
+#define TN_TAG    "ai_sd"
+#include <tn_security/tn_security_macros.h>
+
 #include "diffusion_state.h"
 #include "../core/pipeline_context.h"
 #include "../utils/sd_logger.h"
@@ -52,6 +56,11 @@ bool DiffusionState::load_models(const SDModelConfig& config) {
     SD_LOG_INFO("Loading models from: %s", config.modelDir.c_str());
 
     if (!sd_pipeline::initialize_models(config)) {
+        // The structured error was already emitted by the loader at the
+        // specific failure site (tokenizer / MNN / QNN / patch); this is just
+        // the outer "rollup" so callers see a TN_STAGE_LOAD breadcrumb too.
+        TN_ERR(TN_CODE_MODEL_LOAD_FAIL, TN_STAGE_LOAD,
+               "Failed to initialize models from %s", config.modelDir.c_str());
         SD_LOG_ERROR("Failed to initialize models");
         m_impl.reset();
         return false;

@@ -5,12 +5,17 @@ plugins {
 android {
     namespace = "com.dark.ai_sd"
     compileSdk {
-        version = release(36)
+        // 36.1 required to match tn_security AAR (Prefab dependency).
+        version = release(36) {
+            minorApiLevel = 1
+        }
     }
     ndkVersion = "27.3.13750724"
 
     defaultConfig {
-        minSdk = 27
+        // Bumped 27 -> 29 to match tn_security's minSdk. The QNN backend
+        // realistically only ships on devices >= API 29 anyway.
+        minSdk = 29
         consumerProguardFiles("consumer-rules.pro")
 
         ndk {
@@ -22,6 +27,10 @@ android {
             cmake {
                 arguments += listOf(
                     "-DCMAKE_BUILD_TYPE=Release",
+                    // Shared STL required for Prefab consumers of tn_security
+                    // (which exports public C++ ABI). Static STL would silently
+                    // duplicate libc++ in each .so and break std::* type IDs.
+                    "-DANDROID_STL=c++_shared",
                     "-Wno-deprecated",
                     "-Wno-dev",
                 )
@@ -65,9 +74,13 @@ android {
             useLegacyPackaging = true
         }
     }
+    buildFeatures {
+        prefab = true
+    }
 }
 
 dependencies {
+    api(project(":tn_security"))
     // tar.xz extraction for QNN libs — api scope so consumers get these transitively
     api(libs.commons.compress)
     api(libs.xz)

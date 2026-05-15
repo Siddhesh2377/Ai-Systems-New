@@ -9,6 +9,10 @@
  * All weight math is delegated to the existing applyLoRA() in safetensor_to_mnn.h.
  */
 
+#define TN_MODULE TN_MODULE_AI_SD
+#define TN_TAG    "ai_sd"
+#include <tn_security/tn_security_macros.h>
+
 #include "lora_engine.h"
 #include "../utils/safetensor_to_mnn.h"
 #include "../utils/sd_logger.h"

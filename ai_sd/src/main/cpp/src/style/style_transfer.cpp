@@ -11,6 +11,10 @@
  * This implementation uses a single combined model (AdaIN-style) for simplicity.
  */
 
+#define TN_MODULE TN_MODULE_AI_SD
+#define TN_TAG    "ai_sd"
+#include <tn_security/tn_security_macros.h>
+
 #include "style_transfer.h"
 #include "../utils/sd_logger.h"
 
@@ -33,6 +37,8 @@ bool StyleTransfer::loadModel(const std::string& modelPath, bool useOpenCL) {
 
     interpreter_ = MNN::Interpreter::createFromFile(modelPath.c_str());
     if (!interpreter_) {
+        TN_ERR(TN_CODE_MNN_INIT_FAIL, TN_STAGE_SD_STYLE,
+               "[STYLE] Failed to load model: %s", modelPath.c_str());
         SD_LOG_ERROR("[STYLE] Failed to load model: %s", modelPath.c_str());
         return false;
     }
@@ -55,6 +61,8 @@ bool StyleTransfer::loadModel(const std::string& modelPath, bool useOpenCL) {
 
     session_ = interpreter_->createSession(cfg);
     if (!session_) {
+        TN_ERR(TN_CODE_MNN_INIT_FAIL, TN_STAGE_SD_STYLE,
+               "[STYLE] Failed to create session");
         SD_LOG_ERROR("[STYLE] Failed to create session");
         release();
         return false;

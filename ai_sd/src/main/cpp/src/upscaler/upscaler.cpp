@@ -5,6 +5,10 @@
  * Uses calculate_tile_positions() from vae_codec for tile layout.
  */
 
+#define TN_MODULE TN_MODULE_AI_SD
+#define TN_TAG    "ai_sd"
+#include <tn_security/tn_security_macros.h>
+
 #include "upscaler.h"
 #include "../vae/vae_codec.h"
 #include "../model/qnn_model.h"
@@ -28,6 +32,8 @@ xt::xarray<uint8_t> upscaleImageWithModel(
     const std::vector<uint8_t>& input_image, int width, int height,
     std::unique_ptr<QnnModel>& upscaler) {
   if (!upscaler) {
+    TN_ERR(TN_CODE_NOT_READY, TN_STAGE_SD_UPSCALE,
+           "Upscaler model not provided");
     throw std::runtime_error("Upscaler model not provided");
   }
 
@@ -94,6 +100,8 @@ xt::xarray<uint8_t> upscaleImageWithModel(
       if (StatusCode::SUCCESS !=
           upscaler->executeUpscalerGraphs(tile_input_vec.data(),
                                           tile_output_vec.data())) {
+        TN_ERR(TN_CODE_DECODE_FAIL, TN_STAGE_SD_UPSCALE,
+               "Upscaler execution failed for tile at (x=%d, y=%d)", x, y);
         throw std::runtime_error("Upscaler execution failed for tile");
       }
 

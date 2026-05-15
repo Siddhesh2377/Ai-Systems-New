@@ -8,6 +8,10 @@
  * then crop and preprocess. Eliminates stb JPEG codec overhead.
  */
 
+#define TN_MODULE TN_MODULE_AI_SD
+#define TN_TAG    "ai_sd"
+#include <tn_security/tn_security_macros.h>
+
 #include "safety_checker.h"
 #include "../utils/sd_logger.h"
 
@@ -56,6 +60,8 @@ bool safety_check(const std::vector<uint8_t>& image_data, int width, int height,
     SD_LOG_DEBUG("[SAFETY] NSFW Score: %.4f", nsfw_score);
     return true;
   } catch (const std::exception& e) {
+    TN_ERR(TN_CODE_DECODE_FAIL, TN_STAGE_DECODE,
+           "[SAFETY] Safety check error: %s", e.what());
     SD_LOG_ERROR("[SAFETY] Safety check error: %s", e.what());
     return false;
   }

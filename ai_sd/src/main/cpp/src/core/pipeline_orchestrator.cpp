@@ -8,6 +8,10 @@
  * Original port: xororz/local-dream
  */
 
+#define TN_MODULE TN_MODULE_AI_SD
+#define TN_TAG    "ai_sd"
+#include <tn_security/tn_security_macros.h>
+
 #include "../pipeline/diffusion_pipeline.h"
 #include "pipeline_context.h"
 #include "../utils/sd_logger.h"
@@ -421,14 +425,24 @@ GenerationResult generateImage(
       }
       clipCleanup();
     } else {
-      if (!clipApp) throw std::runtime_error("Global clipApp not initialized!");
+      if (!clipApp) {
+        TN_ERR(TN_CODE_NOT_READY, TN_STAGE_SD_CLIP,
+               "Global clipApp not initialized");
+        throw std::runtime_error("Global clipApp not initialized!");
+      }
       if (StatusCode::SUCCESS !=
-          clipApp->executeClipGraphs(input_ids_ptr, embed_ptr))
+          clipApp->executeClipGraphs(input_ids_ptr, embed_ptr)) {
+        TN_ERR(TN_CODE_DECODE_FAIL, TN_STAGE_SD_CLIP,
+               "QNN CLIP exec failed (neg)");
         throw std::runtime_error("QNN CLIP exec failed (neg)");
+      }
       if (StatusCode::SUCCESS !=
           clipApp->executeClipGraphs(input_ids_ptr + 77,
-                                     embed_ptr + 77 * text_embedding_size))
+                                     embed_ptr + 77 * text_embedding_size)) {
+        TN_ERR(TN_CODE_DECODE_FAIL, TN_STAGE_SD_CLIP,
+               "QNN CLIP exec failed (pos)");
         throw std::runtime_error("QNN CLIP exec failed (pos)");
+      }
     }
 
     auto clip_end = std::chrono::high_resolution_clock::now();
@@ -600,12 +614,18 @@ GenerationResult generateImage(
                  vae_enc_std.size() * sizeof(float));
           // Perf 7: session NOT released here — persists for next generation
         } else {
-          if (!vaeEncoderApp)
+          if (!vaeEncoderApp) {
+            TN_ERR(TN_CODE_NOT_READY, TN_STAGE_SD_VAE,
+                   "Global vaeEncoderApp not initialized");
             throw std::runtime_error("Global vaeEncoderApp not init!");
+          }
           if (StatusCode::SUCCESS !=
               vaeEncoderApp->executeVaeEncoderGraphs(
-                  img_data.data(), vae_enc_mean.data(), vae_enc_std.data()))
+                  img_data.data(), vae_enc_mean.data(), vae_enc_std.data())) {
+            TN_ERR(TN_CODE_DECODE_FAIL, TN_STAGE_SD_VAE,
+                   "QNN VAE encode exec failed (non-tiled)");
             throw std::runtime_error("QNN VAE enc exec failed");
+          }
         }
 
         auto mean = xt::adapt(vae_enc_mean, shape);
@@ -656,14 +676,20 @@ GenerationResult generateImage(
           std::vector<float> tile_std_vec(1 * 4 * vae_enc_latent_tile_size *
                                           vae_enc_latent_tile_size);
 
-          if (!vaeEncoderApp)
+          if (!vaeEncoderApp) {
+            TN_ERR(TN_CODE_NOT_READY, TN_STAGE_SD_VAE,
+                   "Global vaeEncoderApp not initialized (tile path)");
             throw std::runtime_error("Global vaeEncoderApp not init!");
+          }
 
           if (StatusCode::SUCCESS !=
               vaeEncoderApp->executeVaeEncoderGraphs(tile_img_vec.data(),
                                                      tile_mean_vec.data(),
-                                                     tile_std_vec.data()))
+                                                     tile_std_vec.data())) {
+            TN_ERR(TN_CODE_DECODE_FAIL, TN_STAGE_SD_VAE,
+                   "QNN VAE encode exec failed for tile %zu", i);
             throw std::runtime_error("QNN VAE enc exec failed for tile");
+          }
 
           std::vector<int> tile_shape = {1, 4, vae_enc_latent_tile_size,
                                          vae_enc_latent_tile_size};
@@ -1078,8 +1104,11 @@ GenerationResult generateImage(
 #endif
         // Perf 7: session NOT released here — persists for next generation
       } else {
-        if (!vaeDecoderApp)
+        if (!vaeDecoderApp) {
+          TN_ERR(TN_CODE_NOT_READY, TN_STAGE_SD_VAE,
+                 "Global vaeDecoderApp not initialized");
           throw std::runtime_error("Global vaeDecoderApp not init!");
+        }
 
 #ifdef SD_ENABLE_DIAGNOSTICS
         SD_LOG_INFO("[DIAG] Calling QNN VAE decoder: input=%d floats, output=%d floats",
@@ -1090,8 +1119,11 @@ GenerationResult generateImage(
 
         if (StatusCode::SUCCESS !=
             vaeDecoderApp->executeVaeDecoderGraphs(vae_dec_in_vec.data(),
-                                                   vae_dec_out_pixels.data()))
+                                                   vae_dec_out_pixels.data())) {
+          TN_ERR(TN_CODE_DECODE_FAIL, TN_STAGE_SD_VAE,
+                 "QNN VAE decode exec failed (non-tiled)");
           throw std::runtime_error("QNN VAE dec exec failed");
+        }
 
 #ifdef SD_ENABLE_DIAGNOSTICS
         SD_LOG_INFO("[DIAG] QNN VAE decoder completed successfully");
@@ -1147,13 +1179,19 @@ GenerationResult generateImage(
         xt::xarray<float> tile_output =
             xt::zeros<float>({1, 3, vae_tile_size, vae_tile_size});
 
-        if (!vaeDecoderApp)
+        if (!vaeDecoderApp) {
+          TN_ERR(TN_CODE_NOT_READY, TN_STAGE_SD_VAE,
+                 "Global vaeDecoderApp not initialized (tile path)");
           throw std::runtime_error("Global vaeDecoderApp not init!");
+        }
 
         if (StatusCode::SUCCESS !=
             vaeDecoderApp->executeVaeDecoderGraphs(tile_latent_vec.data(),
-                                                   tile_output.data()))
+                                                   tile_output.data())) {
+          TN_ERR(TN_CODE_DECODE_FAIL, TN_STAGE_SD_VAE,
+                 "QNN VAE decode exec failed for tile %zu", i);
           throw std::runtime_error("QNN VAE dec exec failed for tile");
+        }
 
         decoded_tiles.push_back(std::move(tile_output));
 
@@ -1256,6 +1294,11 @@ GenerationResult generateImage(
                             static_cast<int>(total_time),
                             first_step_time_ms};
   } catch (const std::exception &e) {
+    // Re-raise so the JNI layer maps to on_error / SDCallback.onError; the
+    // structured error was already emitted by whatever stage threw (CLIP /
+    // UNET / VAE / scheduler). This is just the per-generation rollup line.
+    TN_ERR(TN_CODE_DECODE_FAIL, TN_STAGE_UNSPECIFIED,
+           "Image generation error: %s", e.what());
     QNN_ERROR("Image generation error: %s", e.what());
     throw;
   }
@@ -1330,6 +1373,7 @@ SDGenerationResult run_generation(PipelineContext& ctx,
   auto progress_bridge = [&progressCb, &stopFlag](int step, int total_steps,
                                                     const std::vector<uint8_t>& image_data) {
     if (stopFlag.load()) {
+      TN_CANCEL("user requested stop during diffusion loop");
       throw std::runtime_error("Generation cancelled");
     }
     if (progressCb) {

@@ -11,6 +11,10 @@
  *            + mask_input(1x1x256x256) + has_mask_input(1)
  */
 
+#define TN_MODULE TN_MODULE_AI_SD
+#define TN_TAG    "ai_sd"
+#include <tn_security/tn_security_macros.h>
+
 #include "segmenter.h"
 #include "../utils/sd_logger.h"
 
@@ -37,6 +41,8 @@ bool Segmenter::loadModel(const std::string& encoderPath, const std::string& dec
     // --- Encoder ---
     encoder_ = MNN::Interpreter::createFromFile(encoderPath.c_str());
     if (!encoder_) {
+        TN_ERR(TN_CODE_MNN_INIT_FAIL, TN_STAGE_SD_SEGMENT,
+               "[SEG] Failed to load encoder: %s", encoderPath.c_str());
         SD_LOG_ERROR("[SEG] Failed to load encoder: %s", encoderPath.c_str());
         return false;
     }
@@ -70,6 +76,8 @@ bool Segmenter::loadModel(const std::string& encoderPath, const std::string& dec
     // --- Decoder ---
     decoder_ = MNN::Interpreter::createFromFile(decoderPath.c_str());
     if (!decoder_) {
+        TN_ERR(TN_CODE_MNN_INIT_FAIL, TN_STAGE_SD_SEGMENT,
+               "[SEG] Failed to load decoder: %s", decoderPath.c_str());
         SD_LOG_ERROR("[SEG] Failed to load decoder: %s", decoderPath.c_str());
         release();
         return false;

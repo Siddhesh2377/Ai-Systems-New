@@ -10,6 +10,10 @@
  * (the _1 encodes the underscore in "ai_sd")
  */
 
+#define TN_MODULE TN_MODULE_AI_SD
+#define TN_TAG    "ai_sd"
+#include <tn_security/tn_security_macros.h>
+
 #include "state/diffusion_state.h"
 #include "upscaler/upscaler.h"
 #include "segmentation/segmenter.h"
@@ -84,7 +88,8 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeInitRuntime(
 
     std::string libDir = jstring_to_string(env, qnnLibDir);
     if (libDir.empty()) {
-        SD_LOG_ERROR("nativeInitRuntime: qnnLibDir is empty");
+        TN_ERR(TN_CODE_INVALID_PARAM, TN_STAGE_INIT,
+               "nativeInitRuntime: qnnLibDir is empty");
         return JNI_FALSE;
     }
 
@@ -203,6 +208,8 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeGenerate(
     sd_cpu::pin_to_perf_cores();
 
     if (!g_sd_state.is_ready()) {
+        TN_ERR(TN_CODE_NOT_READY, TN_STAGE_INIT,
+               "nativeGenerate: model not loaded");
         sd_jni::on_error(env, callback, "Model not loaded");
         return JNI_FALSE;
     }
@@ -310,11 +317,14 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeGenerate(
         SDGenerationResult result = g_sd_state.generate(params, progressCb, g_sd_stop);
 
         if (g_sd_stop.load()) {
+            TN_CANCEL("user requested stop");
             sd_jni::on_error(env, callback, "Generation cancelled");
             return JNI_FALSE;
         }
 
         if (result.imageData.empty()) {
+            TN_ERR(TN_CODE_DECODE_FAIL, TN_STAGE_SD_VAE,
+                   "Generation produced no image data");
             sd_jni::on_error(env, callback, "Generation produced no image data");
             return JNI_FALSE;
         }
@@ -327,7 +337,11 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeGenerate(
         return JNI_TRUE;
 
     } catch (const std::exception& e) {
-        SD_LOG_ERROR("Generation failed: %s", e.what());
+        // Stage is intentionally generic at the JNI layer — the structured
+        // error from the failing stage (CLIP / UNET / VAE) was already emitted
+        // by the orchestrator / loader / runner that originated the throw.
+        TN_ERR(TN_CODE_DECODE_FAIL, TN_STAGE_UNSPECIFIED,
+               "Generation failed: %s", e.what());
         sd_jni::on_error(env, callback, e.what());
         return JNI_FALSE;
     }
@@ -422,7 +436,8 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeLoadUpscaler(
     g_upscaler_use_mnn = useMnn;
 
     if (g_upscaler_model_path.empty()) {
-        SD_LOG_ERROR("[UPSCALER] Model path is empty");
+        TN_ERR(TN_CODE_INVALID_PARAM, TN_STAGE_LOAD,
+               "[UPSCALER] Model path is empty");
         return JNI_FALSE;
     }
 
@@ -437,8 +452,11 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeLoadUpscaler(
             (void)sd_pipeline::ensureQnnSystemReady(sys, bk);
         }
         if (!sd_pipeline::loadStandaloneQnnUpscaler(g_upscaler_model_path)) {
-            SD_LOG_ERROR("[UPSCALER] Standalone QNN load failed for %s",
-                         g_upscaler_model_path.c_str());
+            TN_ERR_FIX(TN_CODE_MODEL_LOAD_FAIL, TN_STAGE_LOAD,
+                       "Check that the upscaler .bin matches this SoC's HTP version, "
+                       "or pass useMnn=true to use the CPU/GPU fallback.",
+                       "[UPSCALER] Standalone QNN load failed for %s",
+                       g_upscaler_model_path.c_str());
             g_upscaler_loaded = false;
             return JNI_FALSE;
         }
@@ -464,17 +482,23 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeUpscaleImage(
     std::lock_guard<std::mutex> lock(g_upscaler_mtx);
 
     if (!g_upscaler_loaded) {
+        TN_ERR(TN_CODE_NOT_READY, TN_STAGE_SD_UPSCALE, "Upscaler not loaded");
         sd_jni::on_error(env, callback, "Upscaler not loaded");
         return JNI_FALSE;
     }
 
     if (!inputRgb) {
+        TN_ERR(TN_CODE_INVALID_PARAM, TN_STAGE_SD_UPSCALE,
+               "Input image is null");
         sd_jni::on_error(env, callback, "Input image is null");
         return JNI_FALSE;
     }
 
     jsize inputLen = env->GetArrayLength(inputRgb);
     if (inputLen != width * height * 3) {
+        TN_ERR(TN_CODE_INVALID_PARAM, TN_STAGE_SD_UPSCALE,
+               "Input size mismatch: got %d bytes, expected %d (%dx%d*3)",
+               (int)inputLen, width * height * 3, width, height);
         sd_jni::on_error(env, callback, "Input size mismatch (expected width*height*3)");
         return JNI_FALSE;
     }
@@ -487,6 +511,9 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeUpscaleImage(
         snprintf(buf, sizeof(buf),
                  "Upscaler input too large (%dx%d). Max %d on each side; downscale first.",
                  width, height, UPSCALER_MAX_DIM);
+        TN_ERR_FIX(TN_CODE_RESOURCE_EXHAUSTED, TN_STAGE_SD_UPSCALE,
+                   "Downscale the image before requesting 4x upscale.",
+                   "%s", buf);
         sd_jni::on_error(env, callback, buf);
         return JNI_FALSE;
     }
@@ -524,7 +551,8 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeUpscaleImage(
         return JNI_TRUE;
 
     } catch (const std::exception& e) {
-        SD_LOG_ERROR("[UPSCALER] Upscale failed: %s", e.what());
+        TN_ERR(TN_CODE_DECODE_FAIL, TN_STAGE_SD_UPSCALE,
+               "[UPSCALER] Upscale failed: %s", e.what());
         sd_jni::on_error(env, callback, e.what());
         return JNI_FALSE;
     }
@@ -698,7 +726,8 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeLoadSegmenter(
     std::string decoder = jstring_to_string(env, decoderPath);
 
     if (encoder.empty() || decoder.empty()) {
-        SD_LOG_ERROR("[SEGMENTER] Encoder or decoder path is empty");
+        TN_ERR(TN_CODE_INVALID_PARAM, TN_STAGE_SD_SEGMENT,
+               "[SEGMENTER] Encoder or decoder path is empty");
         return JNI_FALSE;
     }
 
@@ -706,7 +735,9 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeLoadSegmenter(
     bool ok = g_segmenter->loadModel(encoder, decoder, useOpenCL);
     if (!ok) {
         g_segmenter.reset();
-        SD_LOG_ERROR("[SEGMENTER] Failed to load models");
+        TN_ERR(TN_CODE_MNN_INIT_FAIL, TN_STAGE_SD_SEGMENT,
+               "[SEGMENTER] Failed to load models (encoder=%s decoder=%s)",
+               encoder.c_str(), decoder.c_str());
     } else {
         SD_LOG_INFO("[SEGMENTER] Loaded encoder=%s decoder=%s", encoder.c_str(), decoder.c_str());
     }
@@ -720,7 +751,7 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeSegmenterEncodeImage(
     std::lock_guard<std::mutex> lock(g_segmenter_mtx);
 
     if (!g_segmenter || !g_segmenter->isLoaded()) {
-        SD_LOG_ERROR("[SEGMENTER] Not loaded");
+        TN_ERR(TN_CODE_NOT_READY, TN_STAGE_SD_SEGMENT, "[SEGMENTER] Not loaded");
         return JNI_FALSE;
     }
 
@@ -738,6 +769,8 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeSegmentAtPoint(
     std::lock_guard<std::mutex> lock(g_segmenter_mtx);
 
     if (!g_segmenter || !g_segmenter->isEncoded()) {
+        TN_ERR(TN_CODE_NOT_READY, TN_STAGE_SD_SEGMENT,
+               "Segmenter not ready (load model + encode image first)");
         sd_jni::on_error(env, callback, "Segmenter not ready (load model + encode image first)");
         return JNI_FALSE;
     }
@@ -758,7 +791,8 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeSegmentAtPoint(
                             maskW, maskH, scoreAsLong, timeMs);
         return JNI_TRUE;
     } catch (const std::exception& e) {
-        SD_LOG_ERROR("[SEGMENTER] segmentAtPoint failed: %s", e.what());
+        TN_ERR(TN_CODE_DECODE_FAIL, TN_STAGE_SD_SEGMENT,
+               "[SEGMENTER] segmentAtPoint failed: %s", e.what());
         sd_jni::on_error(env, callback, e.what());
         return JNI_FALSE;
     }
@@ -771,6 +805,8 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeSegmentWithBox(
     std::lock_guard<std::mutex> lock(g_segmenter_mtx);
 
     if (!g_segmenter || !g_segmenter->isEncoded()) {
+        TN_ERR(TN_CODE_NOT_READY, TN_STAGE_SD_SEGMENT,
+               "Segmenter not ready (load model + encode image first)");
         sd_jni::on_error(env, callback, "Segmenter not ready (load model + encode image first)");
         return JNI_FALSE;
     }
@@ -789,7 +825,8 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeSegmentWithBox(
                             maskW, maskH, scoreAsLong, timeMs);
         return JNI_TRUE;
     } catch (const std::exception& e) {
-        SD_LOG_ERROR("[SEGMENTER] segmentWithBox failed: %s", e.what());
+        TN_ERR(TN_CODE_DECODE_FAIL, TN_STAGE_SD_SEGMENT,
+               "[SEGMENTER] segmentWithBox failed: %s", e.what());
         sd_jni::on_error(env, callback, e.what());
         return JNI_FALSE;
     }
@@ -821,7 +858,8 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeLoadLamaInpainter(
 
     std::string path = jstring_to_string(env, modelPath);
     if (path.empty()) {
-        SD_LOG_ERROR("[LAMA] Model path is empty");
+        TN_ERR(TN_CODE_INVALID_PARAM, TN_STAGE_SD_INPAINT,
+               "[LAMA] Model path is empty");
         return JNI_FALSE;
     }
 
@@ -829,7 +867,8 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeLoadLamaInpainter(
     bool ok = g_lama->loadModel(path, useOpenCL);
     if (!ok) {
         g_lama.reset();
-        SD_LOG_ERROR("[LAMA] Failed to load model");
+        TN_ERR(TN_CODE_MNN_INIT_FAIL, TN_STAGE_SD_INPAINT,
+               "[LAMA] Failed to load model: %s", path.c_str());
     } else {
         SD_LOG_INFO("[LAMA] Loaded: %s", path.c_str());
     }
@@ -844,6 +883,8 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeLamaInpaint(
     std::lock_guard<std::mutex> lock(g_lama_mtx);
 
     if (!g_lama || !g_lama->isLoaded()) {
+        TN_ERR(TN_CODE_NOT_READY, TN_STAGE_SD_INPAINT,
+               "LaMa inpainter not loaded");
         sd_jni::on_error(env, callback, "LaMa inpainter not loaded");
         return JNI_FALSE;
     }
@@ -866,7 +907,8 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeLamaInpaint(
                             width, height, 0, timeMs);
         return JNI_TRUE;
     } catch (const std::exception& e) {
-        SD_LOG_ERROR("[LAMA] Inpaint failed: %s", e.what());
+        TN_ERR(TN_CODE_DECODE_FAIL, TN_STAGE_SD_INPAINT,
+               "[LAMA] Inpaint failed: %s", e.what());
         sd_jni::on_error(env, callback, e.what());
         return JNI_FALSE;
     }
@@ -898,7 +940,8 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeLoadDepthEstimator(
 
     std::string path = jstring_to_string(env, modelPath);
     if (path.empty()) {
-        SD_LOG_ERROR("[DEPTH] Model path is empty");
+        TN_ERR(TN_CODE_INVALID_PARAM, TN_STAGE_SD_DEPTH,
+               "[DEPTH] Model path is empty");
         return JNI_FALSE;
     }
 
@@ -906,7 +949,8 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeLoadDepthEstimator(
     bool ok = g_depth->loadModel(path, useOpenCL);
     if (!ok) {
         g_depth.reset();
-        SD_LOG_ERROR("[DEPTH] Failed to load model");
+        TN_ERR(TN_CODE_MNN_INIT_FAIL, TN_STAGE_SD_DEPTH,
+               "[DEPTH] Failed to load model: %s", path.c_str());
     } else {
         SD_LOG_INFO("[DEPTH] Loaded: %s", path.c_str());
     }
@@ -920,6 +964,8 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeEstimateDepthColorized(
     std::lock_guard<std::mutex> lock(g_depth_mtx);
 
     if (!g_depth || !g_depth->isLoaded()) {
+        TN_ERR(TN_CODE_NOT_READY, TN_STAGE_SD_DEPTH,
+               "Depth estimator not loaded");
         sd_jni::on_error(env, callback, "Depth estimator not loaded");
         return JNI_FALSE;
     }
@@ -938,7 +984,8 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeEstimateDepthColorized(
                             width, height, 0, timeMs);
         return JNI_TRUE;
     } catch (const std::exception& e) {
-        SD_LOG_ERROR("[DEPTH] Estimation failed: %s", e.what());
+        TN_ERR(TN_CODE_DECODE_FAIL, TN_STAGE_SD_DEPTH,
+               "[DEPTH] Estimation failed: %s", e.what());
         sd_jni::on_error(env, callback, e.what());
         return JNI_FALSE;
     }
@@ -970,7 +1017,8 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeLoadStyleTransfer(
 
     std::string path = jstring_to_string(env, modelPath);
     if (path.empty()) {
-        SD_LOG_ERROR("[STYLE] Model path is empty");
+        TN_ERR(TN_CODE_INVALID_PARAM, TN_STAGE_SD_STYLE,
+               "[STYLE] Model path is empty");
         return JNI_FALSE;
     }
 
@@ -978,7 +1026,8 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeLoadStyleTransfer(
     bool ok = g_style->loadModel(path, useOpenCL);
     if (!ok) {
         g_style.reset();
-        SD_LOG_ERROR("[STYLE] Failed to load model");
+        TN_ERR(TN_CODE_MNN_INIT_FAIL, TN_STAGE_SD_STYLE,
+               "[STYLE] Failed to load model: %s", path.c_str());
     } else {
         SD_LOG_INFO("[STYLE] Loaded: %s", path.c_str());
     }
@@ -994,6 +1043,8 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeStylize(
     std::lock_guard<std::mutex> lock(g_style_mtx);
 
     if (!g_style || !g_style->isLoaded()) {
+        TN_ERR(TN_CODE_NOT_READY, TN_STAGE_SD_STYLE,
+               "Style transfer not loaded");
         sd_jni::on_error(env, callback, "Style transfer not loaded");
         return JNI_FALSE;
     }
@@ -1016,7 +1067,8 @@ Java_com_dark_ai_1sd_SDNativeLib_nativeStylize(
                             contentW, contentH, 0, timeMs);
         return JNI_TRUE;
     } catch (const std::exception& e) {
-        SD_LOG_ERROR("[STYLE] Stylize failed: %s", e.what());
+        TN_ERR(TN_CODE_DECODE_FAIL, TN_STAGE_SD_STYLE,
+               "[STYLE] Stylize failed: %s", e.what());
         sd_jni::on_error(env, callback, e.what());
         return JNI_FALSE;
     }

@@ -5,6 +5,10 @@
  * Reads globals (unetApp) via pipeline_globals.h during migration.
  */
 
+#define TN_MODULE TN_MODULE_AI_SD
+#define TN_TAG    "ai_sd"
+#include <tn_security/tn_security_macros.h>
+
 #include "unet_runner.h"
 #include "../pipeline/pipeline_globals.h"
 #include "../model/qnn_model.h"
@@ -54,8 +58,11 @@ void UNetRunner::init(bool use_mnn, bool use_opencl,
 
     if (use_mnn_) {
         mnn_interpreter_ = MNN::Interpreter::createFromFile(unet_path.c_str());
-        if (!mnn_interpreter_)
+        if (!mnn_interpreter_) {
+            TN_ERR(TN_CODE_MNN_INIT_FAIL, TN_STAGE_LOAD,
+                   "Failed to create MNN UNET interpreter from: %s", unet_path.c_str());
             throw std::runtime_error("Failed to create MNN UNET interpreter from: " + unet_path);
+        }
 
         MNN::ScheduleConfig cfg_unet;
         MNN::BackendConfig bkCfg_unet;
@@ -75,8 +82,12 @@ void UNetRunner::init(bool use_mnn, bool use_opencl,
         cfg_unet.backendConfig = &bkCfg_unet;
 
         mnn_session_ = mnn_interpreter_->createSession(cfg_unet);
-        if (!mnn_session_)
+        if (!mnn_session_) {
+            TN_ERR(TN_CODE_MNN_INIT_FAIL, TN_STAGE_LOAD,
+                   "Failed to create MNN UNET session (use_opencl=%d)",
+                   (int)use_opencl);
             throw std::runtime_error("Failed to create MNN UNET session");
+        }
 
         auto samp = mnn_interpreter_->getSessionInput(mnn_session_, "sample");
         auto ts = mnn_interpreter_->getSessionInput(mnn_session_, "timestep");
@@ -92,8 +103,11 @@ void UNetRunner::init(bool use_mnn, bool use_opencl,
 
         mnn_interpreter_->releaseModel();
     } else {
-        if (!unetApp)
+        if (!unetApp) {
+            TN_ERR(TN_CODE_NOT_READY, TN_STAGE_INIT,
+                   "Global unetApp not initialized — QNN UNET load skipped or failed");
             throw std::runtime_error("Global unetApp not initialized");
+        }
     }
 
     initialized_ = true;
@@ -104,8 +118,11 @@ void UNetRunner::init(bool use_mnn, bool use_opencl,
 void UNetRunner::step(const float* latents_in, int timestep,
                       const float* text_embeddings, float* unet_out,
                       float cfg_scale) {
-    if (!initialized_)
+    if (!initialized_) {
+        TN_ERR(TN_CODE_NOT_READY, TN_STAGE_SD_UNET,
+               "UNetRunner::step() called before init");
         throw std::runtime_error("UNetRunner not initialized");
+    }
 
     int total_latent_size = batch_size_ * single_latent_size_;
     int total_embed_size = batch_size_ * 77 * text_emb_size_;
@@ -152,8 +169,11 @@ void UNetRunner::step(const float* latents_in, int timestep,
                 const_cast<float*>(latents_in) + single_latent_size_,
                 timestep,
                 const_cast<float*>(embed_ptr) + 77 * text_emb_size_,
-                latents_out_ptr + single_latent_size_))
+                latents_out_ptr + single_latent_size_)) {
+            TN_ERR(TN_CODE_DECODE_FAIL, TN_STAGE_SD_UNET,
+                   "QNN UNET exec failed (cond) at timestep=%d", timestep);
             throw std::runtime_error("QNN UNET exec failed (cond)");
+        }
 
         if (skip_uncond) {
             // Mirror cond into the uncond slot so the CPU-side CFG combiner
@@ -165,8 +185,11 @@ void UNetRunner::step(const float* latents_in, int timestep,
                 unetApp->executeUnetGraphs(
                     const_cast<float*>(latents_in),
                     timestep, const_cast<float*>(embed_ptr),
-                    latents_out_ptr))
+                    latents_out_ptr)) {
+                TN_ERR(TN_CODE_DECODE_FAIL, TN_STAGE_SD_UNET,
+                       "QNN UNET exec failed (uncond) at timestep=%d", timestep);
                 throw std::runtime_error("QNN UNET exec failed (uncond)");
+            }
         }
     }
 }

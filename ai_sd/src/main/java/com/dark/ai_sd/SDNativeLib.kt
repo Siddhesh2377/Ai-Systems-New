@@ -220,6 +220,12 @@ class SDNativeLib {
 
         init {
             isAvailable = try {
+                // tn_security must be resolvable when libai_sd.so links it. The
+                // dynamic linker normally handles transitive deps via DT_NEEDED,
+                // but loading it explicitly first guarantees its JNI_OnLoad +
+                // process-wide sink state are initialized before ai_sd issues
+                // its first tn_sec_log call.
+                runCatching { System.loadLibrary("tn_security") }
                 System.loadLibrary("ai_sd")
                 true
             } catch (_: UnsatisfiedLinkError) {

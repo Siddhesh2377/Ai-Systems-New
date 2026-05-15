@@ -8,6 +8,10 @@
  *   - ZSTD patch functions: applyZstdPatch, applyZstdPatchToBuffer
  */
 
+#define TN_MODULE TN_MODULE_AI_SD
+#define TN_TAG    "ai_sd"
+#include <tn_security/tn_security_macros.h>
+
 #include "model_loader.h"
 #include "../pipeline/pipeline_globals.h"
 #include "../state/diffusion_state.h"
@@ -21,8 +25,31 @@
 // QNN Headers
 #include "DynamicLoadUtil.hpp"
 #include "Logger.hpp"
+#include "QnnLog.h"
 #include "PAL/DynamicLoading.hpp"
 #include "QnnSampleAppUtils.hpp"
+
+// QNN logs flow through this callback into tn_security under TN_MODULE_QNN.
+// Installed via qnn::log::Logger::createLogger() instead of the default
+// stdout-printf path; ensures every QNN_INFO/QNN_ERROR (both from SampleApp
+// internals and from this file) lands in the unified sink pipeline.
+static void tn_sec_route_qnn_log(const char* fmt,
+                                 QnnLog_Level_t level,
+                                 uint64_t /*timestamp*/,
+                                 va_list argp) {
+    if (!fmt) return;
+    tn_level lvl;
+    switch (level) {
+        case QNN_LOG_LEVEL_ERROR:   lvl = TN_LEVEL_ERROR; break;
+        case QNN_LOG_LEVEL_WARN:    lvl = TN_LEVEL_WARN;  break;
+        case QNN_LOG_LEVEL_INFO:    lvl = TN_LEVEL_INFO;  break;
+        case QNN_LOG_LEVEL_DEBUG:   lvl = TN_LEVEL_DEBUG; break;
+        case QNN_LOG_LEVEL_VERBOSE: lvl = TN_LEVEL_TRACE; break;
+        default:                    lvl = TN_LEVEL_INFO;  break;
+    }
+    tn_sec_log_v(lvl, TN_MODULE_QNN, "QNN",
+                 tn_sec_current_op(), nullptr, 0, nullptr, fmt, argp);
+}
 
 // External Libraries
 #include "tokenizers_cpp.h"
@@ -247,9 +274,20 @@ bool initialize_models(const SDModelConfig& config) {
 
     using namespace qnn::tools;
 
-    if (!qnn::log::initializeLogging()) {
-        QNN_ERROR("Failed to initialize QNN logging");
-        return false;
+    // Install our tn_security-routing callback so QNN_* macros land in the
+    // unified sink under TN_MODULE_QNN instead of stdout. createLogger() is
+    // idempotent (it stores into s_logger once) — safe to call from each
+    // load.
+    {
+        QnnLog_Error_t status;
+        auto logger = qnn::log::Logger::createLogger(
+            tn_sec_route_qnn_log, QNN_LOG_LEVEL_INFO, &status);
+        if (!logger || status != QNN_LOG_NO_ERROR) {
+            TN_ERR(TN_CODE_BACKEND_INIT_FAIL, TN_STAGE_INIT,
+                   "Failed to install QNN log callback (status=%d)", (int)status);
+            QNN_ERROR("Failed to initialize QNN logging");
+            return false;
+        }
     }
 
     // Set globals from config (replacing CLI argument parsing)
@@ -284,10 +322,14 @@ bool initialize_models(const SDModelConfig& config) {
             std::filesystem::path tokenEmbPath = parentDir / "token_emb.bin";
 
             if (!std::filesystem::exists(posEmbPath)) {
+                TN_ERR(TN_CODE_FILE_NOT_FOUND, TN_STAGE_LOAD,
+                       "pos_emb.bin not found: %s", posEmbPath.string().c_str());
                 QNN_ERROR("pos_emb.bin not found: %s", posEmbPath.string().c_str());
                 return false;
             }
             if (!std::filesystem::exists(tokenEmbPath)) {
+                TN_ERR(TN_CODE_FILE_NOT_FOUND, TN_STAGE_LOAD,
+                       "token_emb.bin not found: %s", tokenEmbPath.string().c_str());
                 QNN_ERROR("token_emb.bin not found: %s", tokenEmbPath.string().c_str());
                 return false;
             }
@@ -329,6 +371,9 @@ bool initialize_models(const SDModelConfig& config) {
         tokenizer = tokenizers::Tokenizer::FromBlobJSON(blob);
         if (!tokenizer) throw std::runtime_error("Tokenizer creation failed.");
     } catch (const std::exception& e) {
+        TN_ERR(TN_CODE_MODEL_LOAD_FAIL, TN_STAGE_LOAD,
+               "Failed to load tokenizer (%s): %s",
+               tokenizerPath.c_str(), e.what());
         QNN_ERROR("Failed to load tokenizer: %s", e.what());
         return false;
     }
@@ -371,6 +416,8 @@ bool initialize_models(const SDModelConfig& config) {
         safetyCheckerInterpreter =
             MNN::Interpreter::createFromFile(safetyCheckerPath.c_str());
         if (!safetyCheckerInterpreter) {
+            TN_ERR(TN_CODE_MNN_INIT_FAIL, TN_STAGE_LOAD,
+                   "Failed to load safety checker: %s", safetyCheckerPath.c_str());
             QNN_ERROR("Failed to load safety checker: %s", safetyCheckerPath.c_str());
             return false;
         }
@@ -387,6 +434,8 @@ bool initialize_models(const SDModelConfig& config) {
     if (use_mnn_clip) {
         clipInterpreter = MNN::Interpreter::createFromFile(clipPath.c_str());
         if (!clipInterpreter) {
+            TN_ERR(TN_CODE_MNN_INIT_FAIL, TN_STAGE_LOAD,
+                   "Failed to load MNN CLIP: %s", clipPath.c_str());
             QNN_ERROR("Failed to load MNN CLIP: %s", clipPath.c_str());
             return false;
         }
@@ -410,6 +459,11 @@ bool initialize_models(const SDModelConfig& config) {
         // to fail fast with a clear message instead of crashing during generation
         std::ifstream unetTest(unetPath);
         if (!unetTest.good()) {
+            TN_ERR_FIX(TN_CODE_FILE_NOT_FOUND, TN_STAGE_LOAD,
+                       "Place unet.mnn next to the other model files, or pass a "
+                       "QNN backend path instead of runOnCpu=true.",
+                       "CPU mode requires unet.mnn but file not found: %s",
+                       unetPath.c_str());
             QNN_ERROR("CPU mode requires unet.mnn but file not found: %s", unetPath.c_str());
             return false;
         }
@@ -454,6 +508,8 @@ bool initialize_models(const SDModelConfig& config) {
         QNN_INFO("  HTP Ver : V%d", htpVer);
         QNN_INFO("=========================");
         if (config.qnnSystemLibPath.empty() || config.qnnBackendPath.empty()) {
+            TN_ERR(TN_CODE_INVALID_PARAM, TN_STAGE_INIT,
+                   "QNN system library and backend paths required for GPU mode");
             QNN_ERROR("QNN system library and backend paths required for GPU mode");
             return false;
         }
@@ -463,6 +519,13 @@ bool initialize_models(const SDModelConfig& config) {
             dynamicloadutil::getQnnSystemFunctionPointers(config.qnnSystemLibPath,
                                                           &g_qnnSystemFuncs);
         if (sysStatus != dynamicloadutil::StatusCode::SUCCESS) {
+            // Most common cause: HTP not available on this SoC, or wrong
+            // libQnnSystem.so/libQnnHtp.so flavor for the device.
+            TN_ERR_FIX(TN_CODE_QNN_HTP_UNAVAILABLE, TN_STAGE_INIT,
+                       "Check that libQnnSystem.so + libQnnHtpV<N>Stub.so for "
+                       "this device's HTP version were extracted to %s.",
+                       "Failed to get QNN system function pointers (lib=%s)",
+                       config.qnnSystemLibPath.c_str());
             QNN_ERROR("Failed to get QNN system function pointers");
             return false;
         }
@@ -473,22 +536,47 @@ bool initialize_models(const SDModelConfig& config) {
             g_unetPatchedBuffer = qnn::tools::sample_app::applyZstdPatchToBuffer(
                 unetPath, config.patchPath);
             if (!g_unetPatchedBuffer) {
+                TN_ERR(TN_CODE_ZSTD_PATCH_FAIL, TN_STAGE_ASSET_PATCH,
+                       "Failed to apply zstd patch to UNet (base=%s patch=%s)",
+                       unetPath.c_str(), config.patchPath.c_str());
                 QNN_ERROR("Failed to apply patch to unet model buffer");
                 return false;
             }
         }
 
-        // Create QNN models
+        // Create QNN models — failures here usually mean the .bin variant
+        // doesn't match the SoC (e.g. 8gen1 binary on 7s Gen 3 HTP V73).
         if (!use_mnn_clip) {
             clipApp = createQnnModel(clipPath, "clip");
-            if (!clipApp) { QNN_ERROR("Failed to create QNN CLIP model"); return false; }
+            if (!clipApp) {
+                TN_ERR_FIX(TN_CODE_SOC_INCOMPATIBLE, TN_STAGE_LOAD,
+                           "Download the model variant that matches this SoC "
+                           "(e.g. 'min' for Snapdragon 7s Gen 3 / HTP V73).",
+                           "Failed to create QNN CLIP model: %s", clipPath.c_str());
+                QNN_ERROR("Failed to create QNN CLIP model");
+                return false;
+            }
         }
 
         unetApp = createQnnModel(unetPath, "unet");
-        if (!unetApp) { QNN_ERROR("Failed to create QNN UNET model"); return false; }
+        if (!unetApp) {
+            TN_ERR_FIX(TN_CODE_SOC_INCOMPATIBLE, TN_STAGE_LOAD,
+                       "Download the model variant that matches this SoC "
+                       "(e.g. 'min' for Snapdragon 7s Gen 3 / HTP V73).",
+                       "Failed to create QNN UNET model: %s", unetPath.c_str());
+            QNN_ERROR("Failed to create QNN UNET model");
+            return false;
+        }
 
         vaeDecoderApp = createQnnModel(vaeDecoderPath, "vae_decoder");
-        if (!vaeDecoderApp) { QNN_ERROR("Failed to create QNN VAE Decoder"); return false; }
+        if (!vaeDecoderApp) {
+            TN_ERR_FIX(TN_CODE_SOC_INCOMPATIBLE, TN_STAGE_LOAD,
+                       "Download the model variant that matches this SoC.",
+                       "Failed to create QNN VAE Decoder: %s",
+                       vaeDecoderPath.c_str());
+            QNN_ERROR("Failed to create QNN VAE Decoder");
+            return false;
+        }
 
         if (!vaeEncoderPath.empty()) {
             vaeEncoderApp = createQnnModel(vaeEncoderPath, "vae_encoder");
@@ -668,6 +756,9 @@ bool ensureQnnSystemReady(const std::string& qnnSystemLibPath,
                            const std::string& qnnBackendPath) {
     using namespace qnn::tools;
     if (qnnSystemLibPath.empty() || qnnBackendPath.empty()) {
+        TN_ERR(TN_CODE_INVALID_PARAM, TN_STAGE_INIT,
+               "ensureQnnSystemReady: empty paths (system='%s' backend='%s')",
+               qnnSystemLibPath.c_str(), qnnBackendPath.c_str());
         QNN_ERROR("ensureQnnSystemReady: empty paths (system='%s' backend='%s')",
                   qnnSystemLibPath.c_str(), qnnBackendPath.c_str());
         return false;
@@ -681,6 +772,10 @@ bool ensureQnnSystemReady(const std::string& qnnSystemLibPath,
         dynamicloadutil::getQnnSystemFunctionPointers(qnnSystemLibPath,
                                                        &g_qnnSystemFuncs);
     if (sysStatus != dynamicloadutil::StatusCode::SUCCESS) {
+        TN_ERR_FIX(TN_CODE_QNN_HTP_UNAVAILABLE, TN_STAGE_INIT,
+                   "Check libQnnSystem.so + libQnnHtp.so are present in %s.",
+                   "ensureQnnSystemReady: getQnnSystemFunctionPointers failed (lib=%s)",
+                   qnnSystemLibPath.c_str());
         QNN_ERROR("ensureQnnSystemReady: getQnnSystemFunctionPointers failed");
         g_backendPathCmd.clear();
         return false;
@@ -692,17 +787,26 @@ bool ensureQnnSystemReady(const std::string& qnnSystemLibPath,
 
 bool loadStandaloneQnnUpscaler(const std::string& modelPath) {
     if (g_backendPathCmd.empty()) {
+        TN_ERR(TN_CODE_NOT_READY, TN_STAGE_INIT,
+               "loadStandaloneQnnUpscaler: QNN system not initialized; "
+               "call ensureQnnSystemReady() first");
         QNN_ERROR("loadStandaloneQnnUpscaler: QNN system not initialized; "
                   "call ensureQnnSystemReady() first");
         return false;
     }
     if (modelPath.empty()) {
+        TN_ERR(TN_CODE_INVALID_PARAM, TN_STAGE_SD_UPSCALE,
+               "loadStandaloneQnnUpscaler: empty modelPath");
         QNN_ERROR("loadStandaloneQnnUpscaler: empty modelPath");
         return false;
     }
 
     upscalerApp = createQnnModel(modelPath, "upscaler");
     if (!upscalerApp) {
+        TN_ERR_FIX(TN_CODE_SOC_INCOMPATIBLE, TN_STAGE_SD_UPSCALE,
+                   "Download an upscaler variant compatible with this SoC.",
+                   "loadStandaloneQnnUpscaler: createQnnModel failed for %s",
+                   modelPath.c_str());
         QNN_ERROR("loadStandaloneQnnUpscaler: createQnnModel failed for %s",
                   modelPath.c_str());
         return false;
@@ -711,6 +815,9 @@ bool loadStandaloneQnnUpscaler(const std::string& modelPath) {
     int status = initializeQnnApp("Upscaler", upscalerApp,
                                   /*buffer=*/nullptr, /*bufferSize=*/0);
     if (status != EXIT_SUCCESS) {
+        TN_ERR(TN_CODE_MODEL_LOAD_FAIL, TN_STAGE_SD_UPSCALE,
+               "loadStandaloneQnnUpscaler: initializeQnnApp failed (status=%d) for %s",
+               status, modelPath.c_str());
         QNN_ERROR("loadStandaloneQnnUpscaler: initializeQnnApp failed "
                   "(status=%d)", status);
         upscalerApp.reset();

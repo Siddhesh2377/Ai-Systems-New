@@ -3,24 +3,24 @@
 /**
  * Production logging for ai_sd.
  *
+ * Routes through tn_security under TN_MODULE_AI_SD so every log line lands
+ * in the unified sink pipeline (logcat + JSON crash file + Kotlin facade).
+ * The historical SD_LOG_* surface is preserved as a thin compatibility shim
+ * for the ~400 existing call sites; new code should prefer the TN_I/W/E/D
+ * macros from <tn_security/tn_security_macros.h>.
+ *
  * Level hierarchy: NONE < ERROR < WARN < INFO < DEBUG < TRACE
- * Compile-time gate: SD_LOG_LEVEL_MAX (default 3=INFO)
- * Runtime gate: sd_log_set_level()
- * Zero heap allocation: 512-char stack buffer
- * Structured tags: [CLIP] [UNET] [VAE] [SCHED] [TILE] [JNI] [SAFETY] [LOAD] [GEN] [UPSCL]
- * Timing macros: SD_TIMER_START(name) / SD_TIMER_END(name, tag)
+ * Compile-time gate: SD_LOG_LEVEL_MAX (default 3=INFO) — kept for source
+ * compatibility; the actual level filter lives in tn_security.
  */
 
 #include <cstdio>
-#include <cstdarg>
-#include <atomic>
 #include <chrono>
 
-#if defined(__ANDROID__)
-#include <android/log.h>
-#endif
+#include <tn_security/tn_security.h>
 
-// Compile-time maximum log level (strips dead code in release)
+// Compile-time maximum log level — historical knob, retained so call-site
+// gates still work. The real filtering happens in tn_sec_log.
 // 0=NONE, 1=ERROR, 2=WARN, 3=INFO, 4=DEBUG, 5=TRACE
 #ifndef SD_LOG_LEVEL_MAX
 #define SD_LOG_LEVEL_MAX 3
@@ -28,84 +28,46 @@
 
 #define SD_LOG_TAG "ai_sd"
 
-namespace sd_log {
-
-enum Level : int {
-    NONE  = 0,
-    ERROR = 1,
-    WARN  = 2,
-    INFO  = 3,
-    DEBUG = 4,
-    TRACE = 5
-};
-
-inline std::atomic<int>& runtime_level() {
-    static std::atomic<int> lvl{INFO};
-    return lvl;
-}
-
-inline void set_level(int l) { runtime_level().store(l, std::memory_order_relaxed); }
-inline int  get_level()      { return runtime_level().load(std::memory_order_relaxed); }
-
-inline void log_msg(int level, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
-inline void log_msg(int level, const char* fmt, ...) {
-    if (level > get_level()) return;
-
-    va_list ap;
-    va_start(ap, fmt);
-
-#if defined(__ANDROID__)
-    int prio;
-    switch (level) {
-        case ERROR: prio = ANDROID_LOG_ERROR; break;
-        case WARN:  prio = ANDROID_LOG_WARN;  break;
-        case INFO:  prio = ANDROID_LOG_INFO;  break;
-        case DEBUG: prio = ANDROID_LOG_DEBUG; break;
-        default:    prio = ANDROID_LOG_VERBOSE; break;
-    }
-    __android_log_vprint(prio, SD_LOG_TAG, fmt, ap);
-#else
-    char buf[512];
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    if (level <= WARN)
-        fprintf(stderr, "%s\n", buf);
-    else
-        fprintf(stdout, "%s\n", buf);
-#endif
-
-    va_end(ap);
-}
-
-} // namespace sd_log
-
 // --- Level macros with compile-time gate ---
+//
+// Each macro hard-codes TN_MODULE_AI_SD as the source module. .cpp files that
+// also want to emit structured errors via TN_ERR should additionally:
+//
+//     #define TN_MODULE TN_MODULE_AI_SD
+//     #define TN_TAG    "ai_sd"
+//     #include <tn_security/tn_security_macros.h>
 
 #if SD_LOG_LEVEL_MAX >= 1
-#define SD_LOG_ERROR(...) ::sd_log::log_msg(::sd_log::ERROR, __VA_ARGS__)
+#define SD_LOG_ERROR(...) tn_sec_log(TN_LEVEL_ERROR, TN_MODULE_AI_SD, SD_LOG_TAG, \
+    tn_sec_current_op(), __FILE__, __LINE__, __func__, __VA_ARGS__)
 #else
 #define SD_LOG_ERROR(...) ((void)0)
 #endif
 
 #if SD_LOG_LEVEL_MAX >= 2
-#define SD_LOG_WARN(...) ::sd_log::log_msg(::sd_log::WARN, __VA_ARGS__)
+#define SD_LOG_WARN(...) tn_sec_log(TN_LEVEL_WARN, TN_MODULE_AI_SD, SD_LOG_TAG, \
+    tn_sec_current_op(), __FILE__, __LINE__, __func__, __VA_ARGS__)
 #else
 #define SD_LOG_WARN(...) ((void)0)
 #endif
 
 #if SD_LOG_LEVEL_MAX >= 3
-#define SD_LOG_INFO(...) ::sd_log::log_msg(::sd_log::INFO, __VA_ARGS__)
+#define SD_LOG_INFO(...) tn_sec_log(TN_LEVEL_INFO, TN_MODULE_AI_SD, SD_LOG_TAG, \
+    tn_sec_current_op(), __FILE__, __LINE__, __func__, __VA_ARGS__)
 #else
 #define SD_LOG_INFO(...) ((void)0)
 #endif
 
 #if SD_LOG_LEVEL_MAX >= 4
-#define SD_LOG_DEBUG(...) ::sd_log::log_msg(::sd_log::DEBUG, __VA_ARGS__)
+#define SD_LOG_DEBUG(...) tn_sec_log(TN_LEVEL_DEBUG, TN_MODULE_AI_SD, SD_LOG_TAG, \
+    tn_sec_current_op(), __FILE__, __LINE__, __func__, __VA_ARGS__)
 #else
 #define SD_LOG_DEBUG(...) ((void)0)
 #endif
 
 #if SD_LOG_LEVEL_MAX >= 5
-#define SD_LOG_TRACE(...) ::sd_log::log_msg(::sd_log::TRACE, __VA_ARGS__)
+#define SD_LOG_TRACE(...) tn_sec_log(TN_LEVEL_TRACE, TN_MODULE_AI_SD, SD_LOG_TAG, \
+    tn_sec_current_op(), __FILE__, __LINE__, __func__, __VA_ARGS__)
 #else
 #define SD_LOG_TRACE(...) ((void)0)
 #endif
@@ -141,5 +103,6 @@ inline void log_msg(int level, const char* fmt, ...) {
 #define SD_TIMER_END_INFO(name, tag, fmt, ...) ((void)0)
 #endif
 
-// --- Convenience: set runtime level from JNI ---
-inline void sd_log_set_level(int level) { sd_log::set_level(level); }
+// --- Convenience: runtime level shim ---
+// Retained for source compatibility; tn_security has its own runtime gate.
+inline void sd_log_set_level(int /*level*/) {}

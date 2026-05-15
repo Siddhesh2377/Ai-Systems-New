@@ -25,9 +25,21 @@
 #define MNN_ERROR(format, ...) {char logtmp[4096]; snprintf(logtmp, 4096, format, ##__VA_ARGS__); OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, "MNNJNI", (const char*)logtmp);}
 #define MNN_PRINT(format, ...) {char logtmp[4096]; snprintf(logtmp, 4096, format, ##__VA_ARGS__); OH_LOG_Print(LOG_APP, LOG_DEBUG, LOG_DOMAIN, "MNNJNI", (const char*)logtmp);}
 #else
+// Route MNN's internal log macros through tn_security so they get attributed
+// to TN_MODULE_MNN (30) instead of disappearing into logcat unstructured. The
+// __has_include guard preserves the original android_log_print path if the
+// header isn't visible (e.g. MNN built standalone, outside ai_sd's CMake).
+#if __has_include(<tn_security/tn_security.h>)
+#include <tn_security/tn_security.h>
+#define MNN_ERROR(format, ...) tn_sec_log(TN_LEVEL_ERROR, TN_MODULE_MNN, "MNNJNI", \
+    tn_sec_current_op(), __FILE__, __LINE__, __func__, format, ##__VA_ARGS__)
+#define MNN_PRINT(format, ...) tn_sec_log(TN_LEVEL_INFO,  TN_MODULE_MNN, "MNNJNI", \
+    tn_sec_current_op(), __FILE__, __LINE__, __func__, format, ##__VA_ARGS__)
+#else
 #include <android/log.h>
 #define MNN_ERROR(format, ...) __android_log_print(ANDROID_LOG_ERROR, "MNNJNI", format, ##__VA_ARGS__)
 #define MNN_PRINT(format, ...) __android_log_print(ANDROID_LOG_INFO, "MNNJNI", format, ##__VA_ARGS__)
+#endif
 #endif
 #elif defined MNN_BUILD_FOR_IOS
 // on iOS, stderr prints to XCode debug area and syslog prints Console. You need both.
