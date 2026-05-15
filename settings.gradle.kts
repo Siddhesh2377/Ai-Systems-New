@@ -20,6 +20,7 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "Ai-Systems"
+include(":tn_security")
 include(":ai_sd")
 include(":gguf_lib")
 include(":ai_sherpa")
