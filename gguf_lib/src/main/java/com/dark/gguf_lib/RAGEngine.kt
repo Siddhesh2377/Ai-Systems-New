@@ -129,6 +129,19 @@ class RAGEngine : AutoCloseable {
     }
 
     /**
+     * Embed [text] using the same model the index was built with. Returns a
+     * mean-pooled raw embedding at the model's native n_embd (no Matryoshka
+     * truncation). Lets consumers share one loaded model for both retrieval
+     * and standalone embedding instead of also bringing up an
+     * [EmbeddingEngine] over the same weights.
+     */
+    suspend fun encode(text: String, normalize: Boolean = true): FloatArray? =
+        withContext(Dispatchers.IO) {
+            if (!isModelLoaded) return@withContext null
+            GGUFNativeLib.nativeRagEncode(text, normalize)
+        }
+
+    /**
      * Query restricted to chunks whose docId starts with [docIdPrefix]. An
      * empty prefix is equivalent to [query].
      */
