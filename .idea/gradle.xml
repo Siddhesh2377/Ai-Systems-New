@@ -14,6 +14,7 @@
             <option value="$PROJECT_DIR$/ai_sherpa" />
             <option value="$PROJECT_DIR$/app" />
             <option value="$PROJECT_DIR$/gguf_lib" />
+            <option value="$PROJECT_DIR$/tn_security" />
           </set>
         </option>
       </GradleProjectSettings>
