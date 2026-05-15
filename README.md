@@ -1,10 +1,10 @@
 # Ai-Systems
 
-On-device AI SDK for Android — LLM inference, image generation, image processing, and text-to-speech. No cloud, no internet, runs entirely on-device.
+On-device AI SDK monorepo for Android — LLM/VLM inference, image generation, speech (ASR/TTS), and a shared diagnostic/crash layer. No cloud, no internet, runs entirely on-device.
 
-Built for **Android** (ARMv8/ARMv9 via NDK) with JNI + native C++ backends.
+Built for **Android** (ARMv8 via NDK) with JNI + native C++ backends.
 
-> **Note:** This repo is developed strictly for **[ToolNeuron](https://github.com/Siddhesh2377/ToolNeuron)**. If you want to use these SDKs in your own app, fork or clone this repo and integrate the modules you need.
+> This repo is developed strictly for **[ToolNeuron](https://github.com/Siddhesh2377/ToolNeuron)**. If you want to use these SDKs in your own app, fork or clone and integrate the modules you need.
 
 ---
 
@@ -12,149 +12,165 @@ Built for **Android** (ARMv8/ARMv9 via NDK) with JNI + native C++ backends.
 
 | Module | What it does | Backend | Package |
 |--------|-------------|---------|---------|
-| **[gguf_lib](gguf_lib/)** | LLM inference (chat, embeddings, tool calling) | llama.cpp (custom fork) | `com.dark.gguf_lib` |
-| **[ai_sd](ai_sd/)** | Image generation (txt2img, img2img, inpaint) | QNN (Hexagon DSP) + MNN | `com.dark.ai_sd` |
-| **[ai_supertonic_tts](ai_supertonic_tts/)** | Text-to-speech (5 languages, 10 voices) | ONNX Runtime | `com.mp.ai_supertonic_tts` |
-| **[ai_chatterbox](ai_chatterbox/)** | Emotional TTS (voice cloning, expressive speech) | ONNX Runtime | `com.dark.ai_chatterbox` |
+| **[gguf_lib](gguf_lib/)** | LLM / VLM inference, RAG, embeddings, extractive summarization | llama.cpp custom fork + mtmd | `com.dark.gguf_lib` |
+| **[ai_sd](ai_sd/)** | Image generation (txt2img, img2img) + 5 image-processing modules (upscale, segment, inpaint, depth, style) | QNN (Hexagon DSP) + MNN | `com.dark.ai_sd` |
+| **[ai_sherpa](ai_sherpa/)** | Offline speech-to-text and text-to-speech | sherpa-onnx + ONNX Runtime | `com.dark.ai_sherpa` |
+| **[tn_security](tn_security/)** | Unified error / crash / log capture used by every other SDK | C JNI + Kotlin SharedFlow | `com.dark.tn_security` |
+| **app** | In-repo test app: SD + VLM demos | — | `com.dark.demon_system` |
+
+**Module list lives in [`settings.gradle.kts`](settings.gradle.kts).** All other docs derive from it.
 
 ---
 
-## Quick Setup
-
-### Gradle
+## Quick setup
 
 ```kotlin
 // settings.gradle.kts
+include(":tn_security")
 include(":gguf_lib")
 include(":ai_sd")
-include(":ai_supertonic_tts")
-include(":ai_chatterbox")
+include(":ai_sherpa")
 
 // app/build.gradle.kts
 dependencies {
-    implementation(project(":gguf_lib"))         // LLM
-    implementation(project(":ai_sd"))           // Image Gen
-    implementation(project(":ai_supertonic_tts")) // TTS
-    implementation(project(":ai_chatterbox"))    // Emotional TTS
+    implementation(project(":gguf_lib"))    // LLM / VLM / RAG
+    implementation(project(":ai_sd"))       // Image gen + processing
+    implementation(project(":ai_sherpa"))   // ASR + TTS
+    // :tn_security is pulled in transitively (api scope) by the SDKs above
 }
 ```
 
 ### Requirements
-
-- **Min SDK**: 27 (Android 8.1)
-- **Target SDK**: 36
-- **ABI**: `arm64-v8a` (all modules)
-- **CMake**: 3.31.4
-- **JDK**: 17
-- **Gradle**: 9.3.1
-- **AGP**: 9.0.1
+- Min SDK: 29 (Android 10)
+- Target SDK: 36
+- ABI: `arm64-v8a` (all modules). `ai_sherpa` also ships `armeabi-v7a`.
+- NDK: 27.3.13750724 (pinned — default selection often picks the wrong one)
+- CMake: 3.31.4 for `gguf_lib` / `ai_sd` / `tn_security`; 3.22.1 OK for `ai_sherpa`
+- JDK 17, Gradle 9.3.1, AGP 9.0.1
 
 ---
 
-## Module Details
+## Module details
 
-### gguf_lib — LLM Inference
+### gguf_lib — LLM / VLM / RAG
 
-On-device LLM inference powered by a [custom llama.cpp fork](https://github.com/Siddhesh2377/llama.cpp-custom) optimized for ARM CPU with KleidiAI micro-kernels.
+On-device LLM and VLM inference via a [custom llama.cpp fork](https://github.com/Siddhesh2377/llama.cpp-custom) optimized for ARM CPU with KleidiAI micro-kernels.
 
-**Key features**:
-- Multi-turn chat with Flow-based streaming tokens
-- Model-agnostic tool calling with GBNF grammar constraints (STRICT/LAZY modes)
-- Text embeddings for semantic search
-- Character personality engine: mood, emotion, uncensored mode via logit/sampling control
-- KV cache prefix reuse, context shifting, disk-backed prompt cache
-- Speculative decoding (ngram self-speculative)
-- CPU affinity pinning, zero-copy token delivery, JNI method ID caching
+Features:
+- Multi-turn chat with `Flow`-based streaming tokens; thinking-mode passthrough for reasoning models
+- Vision-language models (Qwen-VL, LFM2-VL, MiniCPM, InternVL) via mtmd projector
+- **Two disk-backed caches** that compose to drop VLM TTFT from ~18.7 s to hundreds of ms:
+  - **VT cache** — vision-token embeddings (skips ViT pass)
+  - **VLM-KV cache** — LLM state at post-image boundary (skips ViT AND image-prefill)
+- Standalone embedding engine + RAG engine with late chunking + binary quantization index
+- Extractive summarization (no model required) via `TextDigest`
+- KV cache prefix reuse, StreamingLLM eviction, disk-backed system-prompt cache
+- Thermal-adaptive thread scheduling, CPU affinity to P-cores, zero-copy token delivery
+- Multi-variant ARM CPU backends (armv8.0 → armv9.2+SME, runtime-selected via `getauxval`)
 
-See [gguf_lib/CLAUDE.md](gguf_lib/CLAUDE.md) for full API reference.
+> **Removed in May 2026:** tool calling, control vectors, personality / mood / uncensored mode. These symbols no longer exist; host code referencing them must be deleted before upgrading the AAR.
 
-### ai_sd — Image Generation
+See [`gguf_lib/CLAUDE.md`](gguf_lib/CLAUDE.md), [`gguf_lib/README.md`](gguf_lib/README.md), [`gguf_lib/VLM.md`](gguf_lib/VLM.md), [`gguf_lib/DEVICE.md`](gguf_lib/DEVICE.md).
 
-On-device Stable Diffusion via Qualcomm QNN (Hexagon DSP) or MNN (CPU fallback).
+### ai_sd — Image generation + processing
 
-**Key features**:
-- txt2img, img2img, inpainting
-- QNN acceleration on Snapdragon SoCs (8 Gen 1+)
-- LoRA support
+On-device Stable Diffusion via Qualcomm QNN (Hexagon HTP, W8A16) or MNN (CPU/GPU fallback).
+
+Features:
+- txt2img, img2img
+- LoRA (CPU/MNN path only)
 - DPM-Solver++ and Euler Ancestral schedulers
-- Tiled VAE for high-resolution generation
-- Safety checker (optional)
+- SoC detection (`/sys/devices/soc0/` + HTP version probe) → variant selection (`8gen1` / `8gen2` / `8gen3` / `min`)
+- Persistent UNet + VAE decoder sessions across generations
+- 13 performance optimizations (CPU affinity, zero-copy MNN tensors, CLIP embedding cache, etc.)
+- Tiled VAE for high-res, safety checker (optional)
+- 5 image-processing modules (all JNI-wired):
+  - **Upscaler** — Real-ESRGAN x4plus
+  - **Segmenter** — MobileSAM tap-to-segment
+  - **Inpainter** — LaMa fast object removal
+  - **Depth** — MiDaS / DepthAnything monocular depth
+  - **Style** — AdaIN arbitrary style transfer
 
-See [ai_sd/README.md](ai_sd/README.md) for full API reference.
+See [`ai_sd/CLAUDE.md`](ai_sd/CLAUDE.md).
 
-### ai_supertonic_tts — Text-to-Speech
+### ai_sherpa — Offline ASR + TTS
 
-On-device TTS using Supertonic v2 (66M params, ONNX Runtime). Produces 44.1 kHz mono audio at up to 167x faster than real-time.
+Wraps [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) via ONNX Runtime Android.
 
-**Key features**:
-- 5 languages: English, Korean, Spanish, Portuguese, French
-- 10 voice presets (5 female, 5 male)
-- Streaming playback via AudioTrack
-- Save to WAV/PCM files
-- Auto-chunking for long text
-- Optional NNAPI GPU/NPU acceleration
+Features:
+- Offline ASR: Whisper, Paraformer, Transducer, NeMo CTC, TDNN, NeMo Transducer
+- Offline TTS: VITS, Kokoro
+- 16 kHz / 80-bin Mel feature extraction (configurable)
+- `AutoCloseable` handles (forgetting `close()` leaks 50–500 MB)
+- Errors emit through the unified `tn_security` event stream
 
-See [ai_supertonic_tts/TTS_SDK_DOCS.md](ai_supertonic_tts/TTS_SDK_DOCS.md) for full API reference.
+Streaming ASR and VAD were removed in the Apr 2026 cleanup (no consumer used them).
 
-### ai_chatterbox — Emotional Text-to-Speech
+See [`ai_sherpa/README.md`](ai_sherpa/README.md).
 
-On-device emotional TTS via Chatterbox (MIT, [ResembleAI](https://github.com/resemble-ai/chatterbox)). Supports voice cloning from reference audio and emotion control.
+### tn_security — Unified diagnostic / crash layer
 
-**Key features**:
-- Two model variants: Turbo (350M, fast) and Original (500M, emotional)
-- Voice cloning from 10s reference audio
-- Emotion exaggeration control (Original variant)
-- 24kHz mono PCM output
-- Greedy autoregressive generation with KV cache
-- Cancellation support via atomic stop flag
+Every SDK in this repo routes native logs and structured errors through `tn_security`. Provides:
+- Signal handlers (SIGSEGV/ABRT/BUS/ILL/FPE) that write JSON crash files using only async-signal-safe syscalls
+- 256-entry ring buffer captured into the crash file at signal time
+- Structured errors tagged by module / op-id / stage / code, with user-actionable suggestions
+- Single Kotlin `SharedFlow<TnEvent>` for all logs / errors / cancellations / crashes
+- Lenient UTF-8 JNI decoding (replaces invalid bytes with U+FFFD; required because upstream tokenizer logs aren't strict UTF-8)
 
-See [ai_chatterbox/README.md](ai_chatterbox/README.md) for full API reference.
+See [`tn_security/README.md`](tn_security/README.md).
 
 ---
 
 ## Build
 
 ```bash
-# Full build (all modules)
+# All modules
 ./gradlew assembleRelease
 
 # Single module
 ./gradlew :gguf_lib:assembleRelease
 ./gradlew :ai_sd:assembleRelease
-./gradlew :ai_supertonic_tts:assembleRelease
-./gradlew :ai_chatterbox:assembleRelease
+./gradlew :ai_sherpa:assembleRelease
+./gradlew :tn_security:assembleRelease
+
+# In-repo test app
+./gradlew :app:assembleDebug
 ```
 
-Native C++ is built automatically via CMake during Gradle build. First build takes longer due to llama.cpp compilation.
+Native C++ builds automatically via CMake. First build is slow (llama.cpp + MNN + sherpa-onnx all compile from source).
+
+External source checkouts referenced by CMake (adjust per environment):
+
+| Used by | Path |
+|---|---|
+| `gguf_lib` | `/home/home/dev/include/llama.cpp` |
+| `ai_sherpa` | `/home/home/dev/include/sherpa-onnx` |
+| `ai_sherpa` | `/home/home/dev/include/ort-android-1.24.3/` (prebuilt) |
 
 ---
 
-## Architecture
+## Layout
 
 ```
 Ai-Systems/
-├── gguf_lib/          # LLM SDK
-│   ├── src/main/cpp/  #   C++ (JNI → llama.cpp)
-│   └── src/main/java/ #   Kotlin API
-├── ai_sd/             # Image Gen SDK
-│   ├── src/main/cpp/  #   C++ (JNI → QNN/MNN)
-│   └── src/main/java/ #   Kotlin API
-├── ai_supertonic_tts/ # TTS SDK
-│   ├── src/main/cpp/  #   C++ (JNI → ONNX Runtime)
-│   └── src/main/java/ #   Kotlin API
-├── ai_chatterbox/     # Emotional TTS SDK
-│   ├── src/main/cpp/  #   C++ (JNI → ONNX Runtime)
-│   └── src/main/java/ #   Kotlin API
-└── build.gradle.kts   # Root config
+├── tn_security/    # Unified diagnostic / crash SDK (foundation)
+├── gguf_lib/       # LLM / VLM / RAG / Embedding / TextDigest
+├── ai_sd/          # Stable Diffusion + image processing
+├── ai_sherpa/      # ASR + TTS
+├── app/            # In-repo test app (SD + VLM demos)
+├── settings.gradle.kts
+├── MODELS.md       # Recommended models per workload
+├── SECURITY.md     # Security audit + posture
+└── CONTRIBUTING.md
 ```
 
-Each SDK is an independent Android library module with its own JNI layer. They share no native dependencies and can be included individually.
+Each SDK is an independent Android library module. `:tn_security` is a foundation module pulled in via `api(project(":tn_security"))` from the others; the host app doesn't need to declare it manually.
 
 ---
 
-## Used By
+## Used by
 
-- **[ToolNeuron](https://github.com/Siddhesh2377/ToolNeuron)** — Android AI assistant with character intelligence, tool calling, image generation, and TTS
+- **[ToolNeuron](https://github.com/Siddhesh2377/ToolNeuron)** — Android AI assistant: consumes `:gguf_lib`, `:ai_sd`, `:ai_sherpa`, `:tn_security`
 
 ---
 
