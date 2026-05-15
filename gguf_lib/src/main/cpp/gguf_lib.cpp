@@ -4,6 +4,7 @@
 
 #include <jni.h>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <algorithm>
 #include <atomic>
@@ -35,20 +36,25 @@
 #include "vlm_kv_cache.h"
 #include "rag_ingest/rag_ingest.h"
 #include "text_digest/text_digest.h"
-#include "error_tracker.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
 #include <nlohmann/json.hpp>
 
-#define TAG "gguf_lib"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#define TN_MODULE TN_MODULE_GGUF_LIB
+#define TN_TAG    "gguf_lib"
+#include <tn_security/tn_security_macros.h>
+
+#define LOGI(...) TN_I(__VA_ARGS__)
+#define LOGW(...) TN_W(__VA_ARGS__)
+#define LOGE(...) TN_E(__VA_ARGS__)
 
 using json = nlohmann::ordered_json;
 
-static void llama_android_log_callback(enum ggml_log_level level, const char * text, void * /*user_data*/) {
+// Routes llama.cpp + ggml log lines into tn_security. user_data carries the
+// originating module (LLAMA_CPP or GGML) so attribution stays accurate even
+// though both libs share the ggml_log_callback signature.
+static void tn_sec_route_ggml_log(enum ggml_log_level level, const char * text, void * user_data) {
     if (text == nullptr || text[0] == '\0') return;
     size_t len = strlen(text);
     char buf[2048];
@@ -58,20 +64,27 @@ static void llama_android_log_callback(enum ggml_log_level level, const char * t
     buf[len] = '\0';
     if (len == 0) return;
 
+    tn_module src = (tn_module)(intptr_t)user_data;
+    if (src != TN_MODULE_LLAMA_CPP && src != TN_MODULE_GGML) src = TN_MODULE_LLAMA_CPP;
+
+    tn_level lvl;
     switch (level) {
-        case GGML_LOG_LEVEL_ERROR: LOGE("%s", buf); break;
-        case GGML_LOG_LEVEL_WARN:  LOGW("%s", buf); break;
-        case GGML_LOG_LEVEL_DEBUG:
-        case GGML_LOG_LEVEL_CONT:  break;
-        default:                   LOGI("%s", buf); break;
+        case GGML_LOG_LEVEL_ERROR: lvl = TN_LEVEL_ERROR; break;
+        case GGML_LOG_LEVEL_WARN:  lvl = TN_LEVEL_WARN;  break;
+        case GGML_LOG_LEVEL_DEBUG: lvl = TN_LEVEL_DEBUG; break;
+        case GGML_LOG_LEVEL_CONT:  return;
+        default:                   lvl = TN_LEVEL_INFO;  break;
     }
+    tn_sec_log(lvl, src, tn_sec_module_slug(src), tn_sec_current_op(),
+               nullptr, 0, nullptr, "%s", buf);
 }
 
 static std::once_flag g_backend_init_flag;
 
 static void ensure_backend_init() {
     std::call_once(g_backend_init_flag, [] {
-        llama_log_set(llama_android_log_callback, nullptr);
+        llama_log_set(tn_sec_route_ggml_log, (void*)(intptr_t)TN_MODULE_LLAMA_CPP);
+        ggml_log_set (tn_sec_route_ggml_log, (void*)(intptr_t)TN_MODULE_GGML);
         llama_backend_init();
 
         // ggml's static-link build only auto-registers CPU. With GGML_BACKEND_DL=OFF
@@ -318,8 +331,13 @@ static struct {
 
     std::vector<llama_token> session_tokens;
     int                      n_past = 0;
+    // Lock-free mirror of n_past for cross-thread readers (e.g. UI gauge via
+    // nativeGetContextUsage). Writers update both under gen_mutex; readers
+    // see a relaxed atomic load — value is approximate during prompt eval.
+    std::atomic<int>         n_past_shadow{0};
     std::vector<llama_token> prev_prompt_tokens;
     int                      n_system_tokens = 0;
+    int                      n_ctx_cached    = 0;
 
     std::string prompt_cache_dir;
     bool        thinking_enabled = true;
@@ -359,6 +377,33 @@ static struct {
     int  requested_mode = 1; // mirror of thread_mode prior to auto-derate
 } g_state;
 
+static inline void set_n_past(int v) {
+    g_state.n_past = v;
+    g_state.n_past_shadow.store(v, std::memory_order_relaxed);
+}
+static inline void inc_n_past() {
+    g_state.n_past_shadow.store(++g_state.n_past, std::memory_order_relaxed);
+}
+
+// Gates the per-token clock_gettime cascade in the decode loops. Default off so
+// release builds skip ~5 vDSO syscalls/token; setting true populates the
+// per-stage breakdown surfaced via nativeGetLastDecodeBreakdown().
+static std::atomic<bool> g_profile_decode{false};
+
+struct stage_timer {
+    bool enabled;
+    std::chrono::high_resolution_clock::time_point last;
+    explicit stage_timer(bool e) : enabled(e) {
+        if (enabled) last = std::chrono::high_resolution_clock::now();
+    }
+    void tick(uint64_t & accum) {
+        if (!enabled) return;
+        auto now = std::chrono::high_resolution_clock::now();
+        accum += std::chrono::duration_cast<std::chrono::microseconds>(now - last).count();
+        last = now;
+    }
+};
+
 static void kv_evict_streaming();
 
 static float read_proc_status_mb(const char * key) {
@@ -379,6 +424,10 @@ static float read_proc_status_mb(const char * key) {
 }
 
 static float read_mem_total_mb() {
+    // MemTotal is fixed for the device's lifetime, so the /proc read only
+    // runs the first time — every subsequent call hits the local cache.
+    static float cached_mb = 0.f;
+    if (cached_mb > 0.f) return cached_mb;
     FILE * f = fopen("/proc/meminfo", "r");
     if (!f) return 0.f;
     char line[256];
@@ -391,7 +440,8 @@ static float read_mem_total_mb() {
         }
     }
     fclose(f);
-    return kb / 1024.f;
+    cached_mb = kb / 1024.f;
+    return cached_mb;
 }
 
 // Reports RESIDENT memory (VmRSS / VmHWM), not virtual size. mmap'd model
@@ -401,7 +451,16 @@ static float read_mem_total_mb() {
 // peak_mb now = VmHWM (peak resident pages); mem_pct compares against
 // MemTotal so the percentage reflects what fraction of physical RAM the
 // process has actually pulled in.
+// Default on so onMetrics callbacks keep working. Disable via
+// nativeSetMetricsEnabled(false) to skip the per-generate /proc reads when the
+// consumer doesn't render the memory gauge.
+static std::atomic<bool> g_metrics_enabled{true};
+
 static void compute_memory_metrics(float & model_mb, float & ctx_mb, float & peak_mb, float & mem_pct) {
+    if (!g_metrics_enabled.load(std::memory_order_relaxed)) {
+        model_mb = ctx_mb = peak_mb = mem_pct = 0.f;
+        return;
+    }
     model_mb = g_state.model ? (float)llama_model_size(g_state.model) / (1024.f * 1024.f) : 0.f;
     ctx_mb   = g_state.ctx   ? (float)llama_state_get_size(g_state.ctx) / (1024.f * 1024.f) : 0.f;
     peak_mb  = read_proc_status_mb("VmHWM");
@@ -664,21 +723,30 @@ struct antiprompt_state {
     std::vector<std::string> stops;
     std::string              stopping_word;
     bool                     stopped = false;
+    // Longest stop word in bytes. Cached at set_stops so find_stop can bound
+    // its scan to the trailing (max_stop_len + last_token_size) bytes without
+    // re-measuring on every token.
+    size_t                   max_stop_len = 0;
 
     void set_stops(const std::vector<std::string> & s) {
         stops = s;
         stopping_word.clear();
         stopped = false;
+        max_stop_len = 0;
+        for (auto & w : stops) {
+            if (w.size() > max_stop_len) max_stop_len = w.size();
+        }
     }
 
-    size_t find_stop(const std::string & text, size_t last_token_size, stop_type type) {
+    size_t find_stop(std::string_view text, size_t last_token_size, stop_type type) {
+        if (max_stop_len == 0) return std::string::npos;
         size_t stop_pos = std::string::npos;
+        size_t window   = max_stop_len + last_token_size;
+        size_t from     = text.size() > window ? text.size() - window : 0;
         for (auto & word : stops) {
             if (word.empty()) continue;
             size_t pos;
             if (type == STOP_FULL) {
-                size_t window = word.size() + last_token_size;
-                size_t from   = text.size() > window ? text.size() - window : 0;
                 pos = text.find(word, from);
             } else {
                 pos = find_partial(word, text);
@@ -695,11 +763,11 @@ struct antiprompt_state {
     }
 
 private:
-    static size_t find_partial(const std::string & word, const std::string & text) {
+    static size_t find_partial(const std::string & word, std::string_view text) {
         if (text.empty() || word.empty()) return std::string::npos;
         size_t max_check = std::min(word.size() - 1, text.size());
         for (size_t len = max_check; len >= 1; len--) {
-            if (text.compare(text.size() - len, len, word, 0, len) == 0) {
+            if (memcmp(text.data() + text.size() - len, word.data(), len) == 0) {
                 return text.size() - len;
             }
         }
@@ -875,8 +943,9 @@ struct token_batcher {
 static std::vector<llama_token> tokenize_string(const std::string & text, bool add_special = true) {
     if (!g_state.model) return {};
     const llama_vocab * vocab = llama_model_get_vocab(g_state.model);
-    int n_tokens = text.size() + 256;
-    std::vector<llama_token> tokens(n_tokens);
+    // BPE averages ~3 bytes/token on English; on undersize, the n<0 branch
+    // resizes exactly and re-tokenizes — so an undershoot just costs one retry.
+    std::vector<llama_token> tokens((size_t)(text.size() / 3) + 8);
     int n = llama_tokenize(vocab, text.c_str(), text.size(),
                            tokens.data(), tokens.size(), add_special, true);
     if (n < 0) {
@@ -933,6 +1002,9 @@ static bool eval_tokens(const std::vector<llama_token> & tokens, int & n_past,
         }
 
         n_past += n_eval;
+        // Callers pass &g_state.n_past — keep the lock-free shadow live so
+        // the UI gauge updates batch-by-batch during long prompt eval.
+        g_state.n_past_shadow.store(n_past, std::memory_order_relaxed);
 
         if (progress) progress((float)(i + n_eval) / (float)total, progress_data);
 
@@ -965,7 +1037,7 @@ static int find_common_prefix(const std::vector<llama_token> & a, const std::vec
 // 0 = fits, -1 = prompt alone overflows the context window (fatal).
 static int check_prompt_fits(int n_prompt_tokens, int max_gen_tokens) {
     if (!g_state.ctx) return -1;
-    int n_ctx = (int)llama_n_ctx(g_state.ctx);
+    int n_ctx = g_state.n_ctx_cached;
     if (n_prompt_tokens >= n_ctx) {
         LOGE("Prompt (%d tokens) exceeds context window (%d)", n_prompt_tokens, n_ctx);
         return -1;
@@ -984,7 +1056,7 @@ static bool try_context_shift() {
 
     if (g_state.kv_n_window > 0) {
         kv_evict_streaming();
-        return g_state.n_past < (int)llama_n_ctx(g_state.ctx) - 1;
+        return g_state.n_past < g_state.n_ctx_cached - 1;
     }
 
     llama_memory_t mem = llama_get_memory(g_state.ctx);
@@ -1000,7 +1072,7 @@ static bool try_context_shift() {
     llama_memory_seq_rm(mem, 0, n_keep, n_keep + n_discard);
     llama_memory_seq_add(mem, 0, n_keep + n_discard, g_state.n_past, -n_discard);
 
-    g_state.n_past -= n_discard;
+    set_n_past(g_state.n_past - n_discard);
     g_state.prev_prompt_tokens.clear();
     LOGI("Context shift: n_past -> %d (kept %d sys, dropped %d)",
          g_state.n_past, n_keep, n_discard);
@@ -1021,7 +1093,7 @@ static void kv_evict_streaming() {
     int evict_end = n_past - n_window;
     llama_memory_seq_rm(mem, 0, n_sink, evict_end);
     llama_memory_seq_add(mem, 0, evict_end, n_past, -(evict_end - n_sink));
-    g_state.n_past = n_sink + n_window;
+    set_n_past(n_sink + n_window);
     g_state.prev_prompt_tokens.clear();
     LOGI("KV evict: n_past %d -> %d (sink=%d window=%d)",
          n_past, g_state.n_past, n_sink, n_window);
@@ -1029,9 +1101,12 @@ static void kv_evict_streaming() {
 
 static float get_context_usage() {
     if (!g_state.ctx) return 0.0f;
-    int n_ctx = (int)llama_n_ctx(g_state.ctx);
+    int n_ctx = g_state.n_ctx_cached;
     if (n_ctx <= 0) return 0.0f;
-    return (float)g_state.n_past / (float)n_ctx;
+    // Lock-free reader path — must use the atomic shadow, not the
+    // mutex-guarded g_state.n_past, to avoid a data race with the
+    // generate threads.
+    return (float)g_state.n_past_shadow.load(std::memory_order_relaxed) / (float)n_ctx;
 }
 
 // FNV-1a 64-bit — used purely as a stable filename for the disk-backed prompt
@@ -1057,11 +1132,11 @@ static bool try_restore_prompt_cache(const std::string & system_prompt,
     fclose(f);
 
     size_t n_token_count = 0;
-    std::vector<llama_token> cache_tokens(llama_n_ctx(g_state.ctx));
+    std::vector<llama_token> cache_tokens((size_t)g_state.n_ctx_cached);
     bool ok = llama_state_load_file(g_state.ctx, cache_path.c_str(),
                                      cache_tokens.data(), cache_tokens.size(), &n_token_count);
     if (ok && (int)n_token_count > 0) {
-        g_state.n_past = (int)n_token_count;
+        set_n_past((int)n_token_count);
         g_state.prev_prompt_tokens.assign(cache_tokens.begin(), cache_tokens.begin() + n_token_count);
         LOGI("Prompt cache restored: %zu tokens", n_token_count);
         return true;
@@ -1096,7 +1171,8 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModel(
             "path=%s ctx=%d threads=%d batch=%d flash=%d mmap=%d mlock=%d",
             peek ? peek : "<null>", (int)nCtx, (int)nThreads, (int)nBatch,
             (int)flashAttn, (int)useMmap, (int)useMlock);
-        tn_error_set_op("loadModel", detail);
+        tn_sec_set_op("loadModel");
+        TN_D("loadModel: %s", detail);
         if (peek) env->ReleaseStringUTFChars(jpath, peek);
     }
 
@@ -1104,12 +1180,13 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModel(
 
     if (g_state.sampler) { common_sampler_free(g_state.sampler); g_state.sampler = nullptr; }
     if (g_state.ctx)     { llama_detach_threadpool(g_state.ctx); llama_free(g_state.ctx); g_state.ctx = nullptr; }
+    g_state.n_ctx_cached = 0;
     if (g_state.threadpool)       { ggml_threadpool_free(g_state.threadpool);       g_state.threadpool = nullptr; }
     if (g_state.threadpool_batch) { ggml_threadpool_free(g_state.threadpool_batch); g_state.threadpool_batch = nullptr; }
     if (g_state.model)   { llama_model_free(g_state.model); g_state.model = nullptr; }
     g_state.chat_templates.reset();
     g_chat_templates_tried = false;
-    g_state.n_past = 0;
+    set_n_past(0);
     g_state.session_tokens.clear();
     g_state.prev_prompt_tokens.clear();
     g_state.n_system_tokens = 0;
@@ -1147,8 +1224,9 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModel(
 
     g_state.model = llama_model_load_from_file(path_s.c_str(), mparams);
     if (!g_state.model) {
-        tn_error_set_last(TN_ERR_MODEL_LOAD, "ModelLoad",
-            "llama_model_load_from_file returned null. Likely causes: corrupt or non-GGUF file, unsupported architecture, or out of memory.");
+        TN_ERR_FIX(TN_CODE_MODEL_LOAD_FAIL, TN_STAGE_LOAD,
+            "Check that the file is a valid GGUF, the architecture is supported, and there's enough free RAM.",
+            "llama_model_load_from_file returned null for %s", path_s.c_str());
         return JNI_FALSE;
     }
 
@@ -1210,11 +1288,15 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModel(
             (int)cparams.n_ctx,
             cacheK_s.empty() ? "?" : cacheK_s.c_str(),
             cacheV_s.empty() ? "?" : cacheV_s.c_str());
-        tn_error_set_last(TN_ERR_OOM, "ContextAlloc", msg);
+        TN_ERR_FIX(TN_CODE_OOM, TN_STAGE_INIT,
+            "Reduce Context Size or use a lighter KV cache type (q8_0 → q4_1).",
+            "%s", msg);
         llama_model_free(g_state.model);
         g_state.model = nullptr;
         return JNI_FALSE;
     }
+
+    g_state.n_ctx_cached = (int)llama_n_ctx(g_state.ctx);
 
     // Each of these can throw — and uncaught C++ exceptions in this .so
     // unwind through libpdfium's static libunwind (mismatched ABI), which is
@@ -1280,7 +1362,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadModel(
     }
 
     LOGI("Model loaded (ctx=%d threads_gen=%d threads_batch=%d batch=%d mode=%d)",
-         (int)llama_n_ctx(g_state.ctx), cparams.n_threads, cparams.n_threads_batch,
+         g_state.n_ctx_cached, cparams.n_threads, cparams.n_threads_batch,
          cparams.n_batch, g_state.thread_mode);
     return JNI_TRUE;
 }
@@ -1369,19 +1451,17 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetChatTemplate(
     g_state.chat_template_override = tmpl;
     env->ReleaseStringUTFChars(jtemplate, tmpl);
 
-    {
-        char detail[256];
-        snprintf(detail, sizeof(detail), "len=%zu", g_state.chat_template_override.size());
-        tn_error_set_op("setChatTemplate", detail);
-    }
+    tn_sec_set_op("setChatTemplate");
+    TN_D("setChatTemplate: len=%zu", g_state.chat_template_override.size());
 
     if (g_state.model) {
         try {
             g_state.chat_templates = common_chat_templates_init(
                 g_state.model, g_state.chat_template_override);
         } catch (const std::exception & e) {
-            tn_error_set_last(TN_ERR_TEMPLATE, "ChatTemplate",
-                std::string("Invalid chat template: ").append(e.what()).c_str());
+            TN_ERR_FIX(TN_CODE_MODEL_TEMPLATE_INVALID, TN_STAGE_INIT,
+                "Clear the chat template override and reload the model.",
+                "Invalid chat template: %s", e.what());
             g_state.chat_template_override.clear();
             g_state.chat_templates = common_chat_templates_init(g_state.model, "");
         }
@@ -1472,11 +1552,11 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStream(
             llama_memory_clear(mem, true);
             n_common = 0;
         }
-        g_state.n_past = n_common;
+        set_n_past(n_common);
         LOGI("Single-turn prefix reuse: %d/%d tokens cached", n_common, (int)tokens.size());
     } else {
         llama_memory_clear(mem, true);
-        g_state.n_past = 0;
+        set_n_past(0);
         n_common = 0;
     }
 
@@ -1522,14 +1602,15 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStream(
 
     token_batcher batcher(env, callback, g_onToken);
 
+    const bool prof = g_profile_decode.load(std::memory_order_relaxed);
+
     while (n_generated < maxTokens && !g_state.cancel_flag.load()) {
         if (!g_state.sampler) break;
 
-        auto ts0 = std::chrono::high_resolution_clock::now();
+        stage_timer timer(prof);
         llama_token id = common_sampler_sample(g_state.sampler, g_state.ctx, -1);
         common_sampler_accept(g_state.sampler, id, true);
-        auto ts1 = std::chrono::high_resolution_clock::now();
-        g_state.last_sample_us += std::chrono::duration_cast<std::chrono::microseconds>(ts1 - ts0).count();
+        timer.tick(g_state.last_sample_us);
 
         if (llama_vocab_is_eog(vocab, id)) {
             break;
@@ -1538,20 +1619,14 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStream(
         // Detokenize
         char buf[256];
         int n = llama_token_to_piece(vocab, id, buf, sizeof(buf) - 1, 0, true);
-        auto ts2 = std::chrono::high_resolution_clock::now();
-        g_state.last_detok_us += std::chrono::duration_cast<std::chrono::microseconds>(ts2 - ts1).count();
+        timer.tick(g_state.last_detok_us);
         if (n > 0) {
             buf[n] = '\0';
             generated_text.append(buf, n);
 
-            // Two-phase antiprompt detection — use indices, not substr copies
-            // Phase 1: Check for FULL stop string match in unsent region
             size_t unsent_start = std::min(sent_count, generated_text.size());
             size_t unsent_len = generated_text.size() - unsent_start;
-
-            // Build a string_view-like reference (C++17 std::string_view not available in all NDKs)
-            // We pass the unsent portion directly to find_stop
-            std::string unsent(generated_text.data() + unsent_start, unsent_len);
+            std::string_view unsent(generated_text.data() + unsent_start, unsent_len);
 
             size_t stop_pos = antiprompt.find_stop(unsent, (size_t)n, STOP_FULL);
             if (stop_pos != std::string::npos) {
@@ -1581,11 +1656,10 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStream(
                 break;
             }
         }
-        auto ts3 = std::chrono::high_resolution_clock::now();
-        g_state.last_stop_us += std::chrono::duration_cast<std::chrono::microseconds>(ts3 - ts2).count();
+        timer.tick(g_state.last_stop_us);
 
         // shift context if we're about to overflow
-        if (g_state.n_past >= (int)llama_n_ctx(g_state.ctx) - 1) {
+        if (g_state.n_past >= g_state.n_ctx_cached - 1) {
             if (!try_context_shift()) {
                 LOGW("Context full, stopping generation");
                 break;
@@ -1597,10 +1671,9 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStream(
         common_batch_clear(sb);
         common_batch_add(sb, id, g_state.n_past, {0}, true);
         if (llama_decode(g_state.ctx, sb) != 0) break;
-        g_state.n_past++;
+        inc_n_past();
         n_generated++;
-        auto ts4 = std::chrono::high_resolution_clock::now();
-        g_state.last_decode_us += std::chrono::duration_cast<std::chrono::microseconds>(ts4 - ts3).count();
+        timer.tick(g_state.last_decode_us);
     }
     g_state.last_decode_tokens = (uint64_t)n_generated;
 
@@ -1732,13 +1805,13 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStreamMultiTurn(
             llama_memory_clear(mem, true);
             n_common = 0;
         }
-        g_state.n_past = n_common;
+        set_n_past(n_common);
         LOGI("Context reuse: %d/%d tokens cached, %d new tokens to eval",
              n_common, (int)tokens.size(), (int)tokens.size() - n_common);
     } else {
         // no usable prefix — try disk-backed prompt cache before full re-eval
         llama_memory_clear(mem, true);
-        g_state.n_past = 0;
+        set_n_past(0);
         n_common = 0;
 
         if (!g_state.system_prompt.empty()) {
@@ -1747,11 +1820,11 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStreamMultiTurn(
                 n_common = find_common_prefix(g_state.prev_prompt_tokens, tokens);
                 if (n_common > 0 && n_common <= g_state.n_past) {
                     llama_memory_seq_rm(mem, 0, n_common, -1);
-                    g_state.n_past = n_common;
+                    set_n_past(n_common);
                     LOGI("Disk cache hit: reusing %d/%d tokens", n_common, (int)tokens.size());
                 } else {
                     llama_memory_clear(mem, true);
-                    g_state.n_past = 0;
+                    set_n_past(0);
                     n_common = 0;
                 }
             }
@@ -1828,31 +1901,28 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStreamMultiTurn(
 
     token_batcher batcher(env, callback, g_onToken);
 
+    const bool prof = g_profile_decode.load(std::memory_order_relaxed);
+
     while (n_generated < maxTokens && !g_state.cancel_flag.load()) {
         if (!g_state.sampler) break;
 
-        auto ts0 = std::chrono::high_resolution_clock::now();
+        stage_timer timer(prof);
         llama_token id = common_sampler_sample(g_state.sampler, g_state.ctx, -1);
         common_sampler_accept(g_state.sampler, id, true);
-        auto ts1 = std::chrono::high_resolution_clock::now();
-        g_state.last_sample_us += std::chrono::duration_cast<std::chrono::microseconds>(ts1 - ts0).count();
+        timer.tick(g_state.last_sample_us);
 
         if (llama_vocab_is_eog(vocab, id)) break;
 
         char buf[256];
         int n = llama_token_to_piece(vocab, id, buf, sizeof(buf) - 1, 0, true);
-        auto ts2 = std::chrono::high_resolution_clock::now();
-        g_state.last_detok_us += std::chrono::duration_cast<std::chrono::microseconds>(ts2 - ts1).count();
+        timer.tick(g_state.last_detok_us);
         if (n > 0) {
             buf[n] = '\0';
             generated_text.append(buf, n);
 
             size_t unsent_start = std::min(sent_count, generated_text.size());
             size_t unsent_len   = generated_text.size() - unsent_start;
-            // Hot path: this runs on every token. The std::string ctor copies
-            // unsent_len bytes; antiprompt.find_stop only reads within that
-            // window. Per-token cost is negligible (typically <128 bytes).
-            std::string unsent(generated_text.data() + unsent_start, unsent_len);
+            std::string_view unsent(generated_text.data() + unsent_start, unsent_len);
 
             size_t stop_pos = antiprompt.find_stop(unsent, (size_t)n, STOP_FULL);
             if (stop_pos != std::string::npos) {
@@ -1874,10 +1944,9 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStreamMultiTurn(
 
             if (env->ExceptionCheck()) { env->ExceptionClear(); break; }
         }
-        auto ts3 = std::chrono::high_resolution_clock::now();
-        g_state.last_stop_us += std::chrono::duration_cast<std::chrono::microseconds>(ts3 - ts2).count();
+        timer.tick(g_state.last_stop_us);
 
-        if (g_state.n_past >= (int)llama_n_ctx(g_state.ctx) - 1) {
+        if (g_state.n_past >= g_state.n_ctx_cached - 1) {
             if (!try_context_shift()) break;
         }
 
@@ -1885,10 +1954,9 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStreamMultiTurn(
         common_batch_clear(sb);
         common_batch_add(sb, id, g_state.n_past, {0}, true);
         if (llama_decode(g_state.ctx, sb) != 0) break;
-        g_state.n_past++;
+        inc_n_past();
         n_generated++;
-        auto ts4 = std::chrono::high_resolution_clock::now();
-        g_state.last_decode_us += std::chrono::duration_cast<std::chrono::microseconds>(ts4 - ts3).count();
+        timer.tick(g_state.last_decode_us);
     }
     g_state.last_decode_tokens = (uint64_t)n_generated;
 
@@ -1935,8 +2003,23 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGenerateStreamMultiTurn(
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeStopGeneration(JNIEnv *, jobject) {
-    g_state.cancel_flag = true;
-    LOGI("Generation stop requested");
+    // Only LOG on the false→true transition so coalesced UI/coordinator
+    // stops don't trigger a stream of identical entries.
+    if (!g_state.cancel_flag.exchange(true)) {
+        LOGI("Generation stop requested");
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeResetKvCache(JNIEnv *, jobject) {
+    std::lock_guard<std::mutex> lock(g_state.gen_mutex);
+    if (!g_state.ctx) return;
+    llama_memory_clear(llama_get_memory(g_state.ctx), true);
+    set_n_past(0);
+    g_state.session_tokens.clear();
+    g_state.prev_prompt_tokens.clear();
+    g_state.n_system_tokens = 0;
+    LOGI("KV cache cleared");
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -1954,6 +2037,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRelease(JNIEnv *, jobject) {
         llama_detach_threadpool(g_state.ctx);
         llama_free(g_state.ctx);
         g_state.ctx = nullptr;
+        g_state.n_ctx_cached = 0;
     }
     if (g_state.threadpool) {
         ggml_threadpool_free(g_state.threadpool);
@@ -1969,7 +2053,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRelease(JNIEnv *, jobject) {
     }
     g_state.chat_templates.reset();
     g_chat_templates_tried = false;
-    g_state.n_past = 0;
+    set_n_past(0);
     g_state.session_tokens.clear();
     g_state.prev_prompt_tokens.clear();
     g_state.n_system_tokens = 0;
@@ -2003,7 +2087,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGetModelInfo(JNIEnv * env, jobject) 
 
         // Context size
         if (g_state.ctx) {
-            info["n_ctx"] = (int)llama_n_ctx(g_state.ctx);
+            info["n_ctx"] = g_state.n_ctx_cached;
         }
 
         // Model size
@@ -2044,11 +2128,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeUpdateSamplerParams(
     std::string json_str(json_cstr);
     env->ReleaseStringUTFChars(jparamsJson, json_cstr);
 
-    {
-        char detail[512];
-        snprintf(detail, sizeof(detail), "json=%.480s", json_str.c_str());
-        tn_error_set_op("updateSamplerParams", detail);
-    }
+    tn_sec_set_op("updateSamplerParams");
 
     try {
         auto j = json::parse(json_str);
@@ -2094,8 +2174,8 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeUpdateSamplerParams(
         return JNI_TRUE;
 
     } catch (const std::exception & e) {
-        LOGE("Failed to parse sampler params JSON: %s", e.what());
-        tn_error_set_last(TN_ERR_INVALID_PARAM, "InvalidParam", e.what());
+        TN_ERR(TN_CODE_INVALID_PARAM, TN_STAGE_UNSPECIFIED,
+               "Sampler params JSON parse failed: %s", e.what());
         return JNI_FALSE;
     }
 }
@@ -2193,7 +2273,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeStateLoadFromFile(
     const char * path = env->GetStringUTFChars(jpath, nullptr);
 
     size_t n_token_count = 0;
-    g_state.session_tokens.resize(llama_n_ctx(g_state.ctx));
+    g_state.session_tokens.resize((size_t)g_state.n_ctx_cached);
 
     bool ok = llama_state_load_file(g_state.ctx, path,
                                      g_state.session_tokens.data(),
@@ -2202,7 +2282,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeStateLoadFromFile(
 
     if (ok) {
         g_state.session_tokens.resize(n_token_count);
-        g_state.n_past = n_token_count;
+        set_n_past(n_token_count);
         LOGI("State loaded from %s: %zu tokens", path, n_token_count);
     } else {
         g_state.session_tokens.clear();
@@ -2219,6 +2299,8 @@ static struct {
     llama_model   * model = nullptr;
     llama_context * ctx   = nullptr;
     std::mutex      mutex;
+    llama_batch     batch     = {};
+    int             batch_cap = 0;
 } g_embed;
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -2228,6 +2310,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadEmbeddingModel(
 
     std::lock_guard<std::mutex> lock(g_embed.mutex);
 
+    if (g_embed.batch_cap > 0) { llama_batch_free(g_embed.batch); g_embed.batch = {}; g_embed.batch_cap = 0; }
     if (g_embed.ctx) { llama_free(g_embed.ctx); g_embed.ctx = nullptr; }
     if (g_embed.model) { llama_model_free(g_embed.model); g_embed.model = nullptr; }
 
@@ -2284,8 +2367,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeEncodeText(
     env->ReleaseStringUTFChars(jtext, text_cstr);
 
     const llama_vocab * vocab = llama_model_get_vocab(g_embed.model);
-    int n_tokens_max = text.size() + 256;
-    std::vector<llama_token> tokens(n_tokens_max);
+    std::vector<llama_token> tokens((size_t)(text.size() / 3) + 8);
     int n = llama_tokenize(vocab, text.c_str(), text.size(),
                            tokens.data(), tokens.size(), true, true);
     if (n < 0) {
@@ -2304,20 +2386,22 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeEncodeText(
 
     llama_memory_clear(llama_get_memory(g_embed.ctx), true);
 
-    llama_batch batch = llama_batch_init(tokens.size(), 0, 1);
+    if ((int)tokens.size() > g_embed.batch_cap) {
+        if (g_embed.batch_cap > 0) llama_batch_free(g_embed.batch);
+        g_embed.batch     = llama_batch_init((int)tokens.size(), 0, 1);
+        g_embed.batch_cap = (int)tokens.size();
+    }
+    common_batch_clear(g_embed.batch);
     for (size_t i = 0; i < tokens.size(); i++) {
-        common_batch_add(batch, tokens[i], i, {0}, i == tokens.size() - 1);
+        common_batch_add(g_embed.batch, tokens[i], i, {0}, i == tokens.size() - 1);
     }
 
-    if (llama_decode(g_embed.ctx, batch) != 0) {
-        llama_batch_free(batch);
+    if (llama_decode(g_embed.ctx, g_embed.batch) != 0) {
         jstring jerr = env->NewStringUTF("Failed to decode for embeddings");
         env->CallVoidMethod(callback, g_embed_onError, jerr);
         env->DeleteLocalRef(jerr);
         return JNI_FALSE;
     }
-
-    llama_batch_free(batch);
 
     int n_embd = llama_model_n_embd(g_embed.model);
     const float * embd = llama_get_embeddings_seq(g_embed.ctx, 0);
@@ -2345,9 +2429,9 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeEncodeText(
     jclass resultClass = env->FindClass("com/dark/gguf_lib/models/EmbeddingResult");
     if (!resultClass) {
         if (env->ExceptionCheck()) env->ExceptionClear();
-        LOGE("EmbeddingResult class not found — likely R8 stripped or wrong classloader");
-        tn_error_set_last(TN_ERR_UNKNOWN, "EncodeText",
-            "EmbeddingResult class not found at runtime");
+        TN_ERR_FIX(TN_CODE_PLUGIN_CLASS_NOT_FOUND, TN_STAGE_UNSPECIFIED,
+            "Ensure consumer-rules.pro keeps com.dark.gguf_lib.models.* classes.",
+            "EmbeddingResult class not found — R8 stripped or wrong classloader");
         return JNI_FALSE;
     }
     jmethodID resultCtor = env->GetMethodID(resultClass, "<init>", "([F)V");
@@ -2374,6 +2458,7 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeReleaseEmbeddingModel(JNIEnv *, jobject) {
     std::lock_guard<std::mutex> lock(g_embed.mutex);
 
+    if (g_embed.batch_cap > 0) { llama_batch_free(g_embed.batch); g_embed.batch = {}; g_embed.batch_cap = 0; }
     if (g_embed.ctx) { llama_free(g_embed.ctx); g_embed.ctx = nullptr; }
     if (g_embed.model) { llama_model_free(g_embed.model); g_embed.model = nullptr; }
 
@@ -2391,6 +2476,16 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetThinkingEnabled(JNIEnv *, jobject, jboolean enabled) {
     g_state.thinking_enabled = (enabled == JNI_TRUE);
     LOGI("Thinking %s", g_state.thinking_enabled ? "enabled" : "disabled");
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetProfileDecode(JNIEnv *, jobject, jboolean enabled) {
+    g_profile_decode.store(enabled == JNI_TRUE, std::memory_order_relaxed);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeSetMetricsEnabled(JNIEnv *, jobject, jboolean enabled) {
+    g_metrics_enabled.store(enabled == JNI_TRUE, std::memory_order_relaxed);
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -2529,7 +2624,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeWarmUp(JNIEnv *, jobject) {
     common_batch_add(sb, bos, 0, {0}, true);
     int rc = llama_decode(g_state.ctx, sb);
     llama_memory_clear(llama_get_memory(g_state.ctx), true);
-    g_state.n_past = 0;
+    set_n_past(0);
     g_state.prev_prompt_tokens.clear();
     LOGI("Manual warm-up pass complete (rc=%d)", rc);
     return rc == 0 ? JNI_TRUE : JNI_FALSE;
@@ -2623,6 +2718,23 @@ extern "C" JNIEXPORT jboolean JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRagIsLoaded(JNIEnv *, jobject) {
     std::lock_guard<std::mutex> lock(g_rag.mutex);
     return (g_rag.engine && rag_engine_is_loaded(g_rag.engine)) ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jfloatArray JNICALL
+Java_com_dark_gguf_1lib_GGUFNativeLib_nativeRagEncode(
+        JNIEnv * env, jobject, jstring jtext, jboolean normalize) {
+    std::lock_guard<std::mutex> lock(g_rag.mutex);
+    if (!g_rag.engine || !rag_engine_is_loaded(g_rag.engine)) return nullptr;
+    const char * text = env->GetStringUTFChars(jtext, nullptr);
+    int32_t n_embd = 0;
+    float * buf = rag_engine_encode(g_rag.engine, text,
+                                     normalize == JNI_TRUE, &n_embd);
+    env->ReleaseStringUTFChars(jtext, text);
+    if (!buf || n_embd <= 0) return nullptr;
+    jfloatArray arr = env->NewFloatArray(n_embd);
+    if (arr) env->SetFloatArrayRegion(arr, 0, n_embd, buf);
+    rag_engine_free_floats(buf);
+    return arr;
 }
 
 extern "C" JNIEXPORT jint JNICALL
@@ -3360,10 +3472,11 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeGetMemoryStatsJson(JNIEnv * env, job
     info["mem_available_mb"] = (double)read_mem_available_mb();
 
     if (g_state.ctx) {
-        const int n_ctx_total = (int)llama_n_ctx(g_state.ctx);
+        const int n_ctx_total = g_state.n_ctx_cached;
+        const int n_used      = g_state.n_past_shadow.load(std::memory_order_relaxed);
         info["n_ctx"]   = n_ctx_total;
-        info["n_used"]  = g_state.n_past;
-        info["context_usage_pct"] = n_ctx_total > 0 ? 100.0 * (double)g_state.n_past / (double)n_ctx_total : 0.0;
+        info["n_used"]  = n_used;
+        info["context_usage_pct"] = n_ctx_total > 0 ? 100.0 * (double)n_used / (double)n_ctx_total : 0.0;
     } else {
         info["n_ctx"]  = 0;
         info["n_used"] = 0;
@@ -3643,7 +3756,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmPrecomputeKvState(
     // Reset KV cache before pre-warm so the captured state is clean.
     llama_memory_t mem = llama_get_memory(g_state.ctx);
     if (mem) llama_memory_clear(mem, true);
-    g_state.n_past = 0;
+    set_n_past(0);
     g_state.prev_prompt_tokens.clear();
 
     const int32_t vlm_n_batch  = 512;
@@ -3875,7 +3988,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGenerateStream(
     // Clear KV cache — VLM always starts fresh
     llama_memory_t mem = llama_get_memory(g_state.ctx);
     if (mem) llama_memory_clear(mem, true);
-    g_state.n_past = 0;
+    set_n_past(0);
     g_state.prev_prompt_tokens.clear();
 
     rebuild_sampler();
@@ -4108,7 +4221,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGenerateStream(
         return JNI_FALSE;
     }
 
-    g_state.n_past = new_n_past;
+    set_n_past(new_n_past);
     int prompt_tokens = g_state.n_past;
 
     const float vlm_encode_ms = t_encode_us / 1000.0f;
@@ -4157,10 +4270,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGenerateStream(
 
             size_t unsent_start = std::min(sent_count, generated_text.size());
             size_t unsent_len   = generated_text.size() - unsent_start;
-            // Hot path: this runs on every token. The std::string ctor copies
-            // unsent_len bytes; antiprompt.find_stop only reads within that
-            // window. Per-token cost is negligible (typically <128 bytes).
-            std::string unsent(generated_text.data() + unsent_start, unsent_len);
+            std::string_view unsent(generated_text.data() + unsent_start, unsent_len);
 
             size_t stop_pos = antiprompt.find_stop(unsent, (size_t)n, STOP_FULL);
             if (stop_pos != std::string::npos) {
@@ -4183,7 +4293,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGenerateStream(
             if (env->ExceptionCheck()) { env->ExceptionClear(); break; }
         }
 
-        if (g_state.n_past >= (int)llama_n_ctx(g_state.ctx) - 1) {
+        if (g_state.n_past >= g_state.n_ctx_cached - 1) {
             if (!try_context_shift()) break;
         }
 
@@ -4191,7 +4301,7 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeVlmGenerateStream(
         common_batch_clear(sb);
         common_batch_add(sb, id, g_state.n_past, {0}, true);
         if (llama_decode(g_state.ctx, sb) != 0) break;
-        g_state.n_past++;
+        inc_n_past();
         n_generated++;
     }
 
@@ -4246,33 +4356,9 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeEvictToBudget(JNIEnv *, jobject) {
     kv_evict_streaming();
 }
 
-// Error Tracker JNI
-
-extern "C" JNIEXPORT void JNICALL
-Java_com_dark_gguf_1lib_GGUFNativeLib_nativeErrorInit(JNIEnv *, jobject) {
-    tn_error_init();
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_com_dark_gguf_1lib_GGUFNativeLib_nativeErrorSetCrashLogPath(
-        JNIEnv * env, jobject, jstring jpath) {
-    if (!jpath) return;
-    const char * p = env->GetStringUTFChars(jpath, nullptr);
-    tn_error_set_crash_log_path(p);
-    env->ReleaseStringUTFChars(jpath, p);
-}
-
-extern "C" JNIEXPORT jstring JNICALL
-Java_com_dark_gguf_1lib_GGUFNativeLib_nativeErrorGetLastJson(JNIEnv * env, jobject) {
-    const char * j = tn_error_get_last_json();
-    return env->NewStringUTF(j ? j : "{}");
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_com_dark_gguf_1lib_GGUFNativeLib_nativeErrorClear(JNIEnv *, jobject) {
-    tn_error_clear_last();
-    tn_error_clear_op();
-}
+// Error handling lives in :tn_security now. The host (TnSecurity.init) wires
+// crash-file pattern + signal handlers + sink fan-out. The four
+// nativeError* JNI methods that used to live here have been deleted.
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeTextDigest(
