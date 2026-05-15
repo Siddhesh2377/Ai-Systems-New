@@ -68,6 +68,10 @@ internal object GGUFNativeLib {
     ): Boolean
 
     external fun nativeStopGeneration()
+    // Wipe the in-context KV state + session bookkeeping but keep the model
+    // loaded. Used by [GGMLEngine.compact] to drop a summarized conversation
+    // so the next generate prefills from a clean prefix.
+    external fun nativeResetKvCache()
 
     external fun nativeGetStateSize(): Long
     external fun nativeGetContextUsage(): Float
@@ -85,6 +89,13 @@ internal object GGUFNativeLib {
     external fun nativeSetThinkingEnabled(enabled: Boolean)
 
     external fun nativeSetThreadMode(mode: Int)
+
+    // Diagnostics toggles. Default state: profile_decode OFF (per-stage
+    // breakdown reports zeros until enabled), metrics ON (onMetrics callback
+    // fires with /proc-derived numbers). Flip via GGMLEngine.setProfileDecode
+    // / setMetricsEnabled to skip overhead when the consumer doesn't render it.
+    external fun nativeSetProfileDecode(enabled: Boolean)
+    external fun nativeSetMetricsEnabled(enabled: Boolean)
 
     // ── Power engine / decode diagnostics ──────────────────────────────────
     //
@@ -159,6 +170,7 @@ internal object GGUFNativeLib {
     external fun nativeLoadRagModel(path: String): Boolean
     external fun nativeLoadRagModelFromFd(fd: Int): Boolean
     external fun nativeRagIsLoaded(): Boolean
+    external fun nativeRagEncode(text: String, normalize: Boolean): FloatArray?
 
     external fun nativeRagAddDocument(text: String, docId: String): Int
     external fun nativeRagRemoveDocument(docId: String): Int
@@ -174,10 +186,7 @@ internal object GGUFNativeLib {
         bytes: ByteArray?, mimeHint: String?, nameHint: String?,
     ): Int
 
-    external fun nativeErrorInit()
-    external fun nativeErrorSetCrashLogPath(path: String)
-    external fun nativeErrorGetLastJson(): String
-    external fun nativeErrorClear()
+    // Error capture lives in :tn_security now — see TnSecurity in that module.
 
     external fun nativeTextDigest(
         text: String,
