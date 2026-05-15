@@ -78,7 +78,7 @@ class GGMLEngine {
      *                    "Per-op routing" for the full trade-off.
      *
      * @return true on success. On failure, see [com.dark.gguf_lib.error] via
-     *         `GGUFNativeLib.nativeErrorGetLastJson()` (used internally).
+     *         the `TnSecurity` event stream from `:tn_security` for details.
      */
     suspend fun load(
         path: String,
@@ -165,6 +165,20 @@ class GGMLEngine {
      * [loadVlmProjector] to re-bind.
      */
     fun setThreadMode(mode: Int) = GGUFNativeLib.nativeSetThreadMode(mode)
+
+    /**
+     * Toggle the per-stage decode timing cascade. Default OFF — the per-token
+     * loop skips ~5 clock_gettime calls per token and [getLastDecodeBreakdown]
+     * reports zeros. Flip on for diagnostics.
+     */
+    fun setProfileDecode(enabled: Boolean) = GGUFNativeLib.nativeSetProfileDecode(enabled)
+
+    /**
+     * Toggle the per-generate memory metrics computation. Default ON — leaves
+     * onMetrics callbacks populated with /proc-derived RSS / model / ctx
+     * numbers. Disable when the consumer doesn't render a memory gauge.
+     */
+    fun setMetricsEnabled(enabled: Boolean) = GGUFNativeLib.nativeSetMetricsEnabled(enabled)
 
     // ── Power engine + decode diagnostics ──────────────────────────────────
 
@@ -441,6 +455,93 @@ class GGMLEngine {
 
     /** Request the current generation to stop. Idempotent; cheap. */
     fun stopGeneration() = GGUFNativeLib.nativeStopGeneration()
+
+    /**
+     * Drop the in-context KV cache and session state. Keeps the model
+     * loaded. Use after [compact] returns, or any time you want the next
+     * generate to prefill from a blank prefix.
+     */
+    fun resetKvCache() {
+        if (loaded) GGUFNativeLib.nativeResetKvCache()
+    }
+
+    /**
+     * Result of a [compact] call.
+     *
+     * @property summary       Model-generated summary text (may be blank on
+     *                         empty input or sampler failure).
+     * @property success       Whether the underlying generate completed
+     *                         without error.
+     * @property tokensIn      Approximate input tokens fed to the summarize
+     *                         turn (prompt + summary instruction).
+     * @property tokensOut     Tokens emitted by the model.
+     */
+    data class CompactResult(
+        val summary: String,
+        val success: Boolean,
+        val tokensIn: Int,
+        val tokensOut: Int,
+    )
+
+    /**
+     * Claude-style chat compaction. Takes the current conversation
+     * ([messagesJson] — same shape as [generateMultiTurnFlow]), appends a
+     * `user` turn asking the model to summarize, generates the summary, and
+     * then clears the KV cache + session state so the next generate starts
+     * from scratch.
+     *
+     * The caller is expected to replace its in-memory chat history with a
+     * fresh thread that embeds the returned summary — typically `[system,
+     * assistant: summary]` followed by the next user turn. Without that
+     * step the model has no recollection of the summary on its next call.
+     *
+     * Stream the summary tokens to UI via [onToken] if you want a "compacting…"
+     * progress display. Otherwise pass null.
+     *
+     * @param messagesJson      The conversation to summarize.
+     * @param maxSummaryTokens  Cap on generated summary length.
+     * @param summarizePrompt   Instruction appended as the final user turn.
+     *                          Override for a different summary shape.
+     * @param onToken           Optional streaming progress callback.
+     */
+    suspend fun compact(
+        messagesJson: String,
+        maxSummaryTokens: Int = 512,
+        summarizePrompt: String = DEFAULT_SUMMARIZE_PROMPT,
+        onToken: ((String) -> Unit)? = null,
+    ): CompactResult = withContext(Dispatchers.IO) {
+        if (!loaded) return@withContext CompactResult("", false, 0, 0)
+        val arr = runCatching { org.json.JSONArray(messagesJson) }.getOrNull()
+            ?: return@withContext CompactResult("", false, 0, 0)
+        arr.put(org.json.JSONObject().apply {
+            put("role", "user")
+            put("content", summarizePrompt)
+        })
+        val augmented = arr.toString()
+
+        val text = StringBuilder()
+        var tokensOut = 0
+        var tokensIn = 0
+        var success = false
+
+        generateMultiTurnFlow(augmented, maxSummaryTokens).collect { ev ->
+            when (ev) {
+                is GenerationEvent.Token -> {
+                    text.append(ev.text)
+                    onToken?.invoke(ev.text)
+                }
+                is GenerationEvent.Metrics -> {
+                    tokensIn  = ev.metrics.tokensEvaluated
+                    tokensOut = ev.metrics.tokensPredicted
+                }
+                is GenerationEvent.Done   -> { success = true }
+                else -> Unit
+            }
+        }
+
+        GGUFNativeLib.nativeResetKvCache()
+        CompactResult(text.toString(), success, tokensIn, tokensOut)
+    }
 
     /** Bytes needed to serialize the current KV cache state. */
     fun getStateSize(): Long = if (loaded) GGUFNativeLib.nativeGetStateSize() else 0
@@ -799,6 +900,15 @@ class GGMLEngine {
     }
 
     companion object {
+        /** Default instruction used by [compact] when no override is given. */
+        const val DEFAULT_SUMMARIZE_PROMPT: String = (
+            "Summarize our conversation so far into a single self-contained note " +
+            "that captures: the user's primary goal, key facts and decisions, " +
+            "files or code referenced, errors encountered and how they were " +
+            "resolved, and any unresolved tasks. Return only the summary, " +
+            "no preamble or framing."
+        )
+
         /** Categorize the host device by total RAM. */
         fun detectDeviceTier(context: Context): DeviceTier {
             val am = context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
