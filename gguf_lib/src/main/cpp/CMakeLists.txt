@@ -82,6 +82,8 @@ set(CMAKE_SHARED_LINKER_FLAGS
 
 add_subdirectory(${LLAMA_DIR} ${CMAKE_CURRENT_BINARY_DIR}/llama)
 
+find_package(tn_security REQUIRED CONFIG)
+
 set(RAG_INGEST_DIR ${CMAKE_CURRENT_SOURCE_DIR}/rag_ingest)
 set(PDFIUM_DIR     ${RAG_INGEST_DIR}/third_party/pdfium)
 
@@ -130,7 +132,6 @@ set(VLM_SOURCES
 
 add_library(${CMAKE_PROJECT_NAME} SHARED
     gguf_lib.cpp
-    error_tracker.cpp
     ${LLAMA_DIR}/engine/tn-log.cpp
     ${LLAMA_DIR}/engine/thread-engine.cpp
     ${LLAMA_DIR}/engine/power-engine.cpp
@@ -160,5 +161,6 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
     llama
     common
     pdfium
+    tn_security::tn_security
     android
     log)

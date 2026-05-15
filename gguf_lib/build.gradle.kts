@@ -63,10 +63,12 @@ android {
 
     buildFeatures {
         buildConfig = false
+        prefab = true
     }
 }
 
 dependencies {
+    api(project(":tn_security"))
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.androidx.core.ktx)
 }

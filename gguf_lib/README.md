@@ -4,6 +4,13 @@ Android AAR module providing a Kotlin SDK + JNI bridge for on-device LLM/VLM
 inference. Built on llama.cpp + the tool-neuron engine helpers (CPU-only,
 ARM-optimized).
 
+**Companion docs**
+- [`CLAUDE.md`](CLAUDE.md) — native code map, invariants, what's intentionally removed
+- [`VLM.md`](VLM.md) — vision-language integration guide (VT cache + VLM-KV cache + opOffload)
+- [`DEVICE.md`](DEVICE.md) — Snapdragon 7s Gen 3 benchmark data; the basis for every perf claim below
+
+> **Removed in May 2026:** tool calling, control vectors, personality / mood / uncensored mode. AAR will not link if host code references these symbols. See [`CLAUDE.md`](CLAUDE.md) for the full list.
+
 ## Architecture
 
 ```
@@ -68,6 +75,27 @@ engine.setThreadMode(2)  // performance
 
 Note: the VLM projector binds `n_threads` at init. After `setThreadMode()` you
 must `releaseVlmProjector()` then `loadVlmProjector()` to re-bind.
+
+### Thermal-adaptive auto mode
+
+```kotlin
+engine.setAutoMode(true)
+engine.setThermalThresholds(warmMilliC = 65_000, hotMilliC = 75_000, critMilliC = 85_000)
+// Call periodically (e.g. once per second) from a background coroutine:
+engine.autoModeTick()
+val thermalJson = engine.getThermalState()  // {"zone_max_milli_c": ..., "mode": ...}
+```
+
+Reads `/sys/class/thermal/thermal_zoneN` and de-rates the thread mode when the SoC
+gets hot. Useful for sustained generation on power-limited devices.
+
+### Thinking mode (Qwen3 etc.)
+
+```kotlin
+if (engine.supportsThinking()) {
+    engine.setThinkingEnabled(true)   // reasoning blocks emitted as part of token stream
+}
+```
 
 ## Generation
 
@@ -152,6 +180,21 @@ grid is a compile-time constant in `clip.cpp` and is unaffected by this knob.
 `GenerationEvent.VlmStageMetrics` reports `vlmEncodeMs` (ViT forward), `vlmDecodeMs`
 (LLM running prompt-eval on image embeddings) and `imageTokens` once per call.
 
+### Disk-backed caches (the TTFT win)
+
+Two persistent caches compose. **VT cache** stores ViT output embeddings; **VLM-KV
+cache** stores the LLM context state at the post-image boundary. On a VLM-KV hit,
+both the ~10 s ViT pass and the ~9 s image-prefill are skipped — TTFT drops from
+~18.7 s to hundreds of ms.
+
+See [`VLM.md`](VLM.md) for the full integration pattern, key derivation, budget
+sizing, opOffload tradeoffs, and pre-warming via `precomputeVisionEmbeddings`.
+
+```kotlin
+engine.vtCacheInit(dir, budgetBytes = 200L * 1024 * 1024)
+engine.vlmKvCacheInit(dir, budgetBytes = 300L * 1024 * 1024)
+```
+
 ## RAG
 
 ```kotlin
@@ -180,6 +223,27 @@ EmbeddingEngine().use { embedder ->
 ```
 
 Independent of `GGMLEngine` — both can run concurrently.
+
+## Extractive summarization (no model required)
+
+`TextDigest` is a CPU-only TextRank + MMR + lead-bias summarizer. No GGUF model
+needed; uses sentence-level features to rank.
+
+```kotlin
+val digest = TextDigest.compress(
+    text         = longText,
+    query        = "what we shipped this week",
+    targetTokens = 256,
+)
+```
+
+## Hardware introspection
+
+```kotlin
+val gpus = HardwareEngine.probe()        // List<GpuProfile>
+val firstGpu = HardwareEngine.firstGpu()
+val backendsJson = engine.listBackendsJson()  // diagnostic only
+```
 
 ## AIDL service tuning
 
@@ -212,9 +276,20 @@ engine.load(path, params.contextSize, cacheTypeK = params.cacheTypeK, cacheTypeV
 
 ## Build integration
 
-1. Add this module as a Gradle subproject or copy the `gguf_lib` directory.
+1. Add this module as a Gradle subproject (also include `:tn_security` — it's the
+   transitive log/error sink).
 2. Update `LLAMA_DIR` in `src/main/cpp/CMakeLists.txt` to point at your
    llama.cpp checkout.
 3. The native library loads via `System.loadLibrary("gguf_lib")` automatically
    on first access to `GGUFNativeLib` (called from `GGMLEngine`).
-4. All public APIs live in `com.dark.gguf_lib.*`.
+4. All public APIs live in `com.dark.gguf_lib.*`. `GGUFNativeLib` is `internal`
+   — go through `GGMLEngine`, `EmbeddingEngine`, `RAGEngine`, `TextDigest`,
+   `VlmEncoder`, or `HardwareEngine`.
+
+## Error reporting
+
+Every native log line and every structured error emitted by `gguf_lib` (and the
+underlying llama.cpp / ggml libraries) is delivered through the unified
+`:tn_security` event stream, tagged `TN_MODULE_GGUF_LIB` / `TN_MODULE_LLAMA_CPP`
+/ `TN_MODULE_GGML`. Host apps read errors off `TnSecurity` rather than catching
+them per-call. See [`../tn_security/README.md`](../tn_security/README.md).
