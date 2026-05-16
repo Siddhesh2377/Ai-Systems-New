@@ -169,22 +169,69 @@ object TnSecurity {
     //
     // After a service-process death, the signal handler has written a crash
     // file to the configured directory. On next service rebind the app reads
-    // and deletes them, replaying each as a [TnEvent.Crash] through the
-    // normal sink pipeline.
+    // and replays each as a [TnEvent.Crash] through the normal sink pipeline.
+    //
+    // To make crash JSON available for post-mortem (e.g. `adb pull`) without
+    // re-spamming the log on every process start, each replayed file is
+    // RENAMED from `crash_*.json` to `crash_*.json.seen`. Subsequent drains
+    // only pick up the bare `.json` files (i.e. brand-new crashes), so the
+    // same crash is broadcast exactly once across all processes that start.
+    // FIFO eviction (cap [MAX_RETAINED_CRASH_FILES]) considers BOTH
+    // extensions so the on-disk retention is bounded regardless of whether
+    // a file has been replayed yet.
+
+    private const val MAX_RETAINED_CRASH_FILES = 5
 
     fun drainCrashFiles(crashDir: File): List<TnEvent.Crash> {
         if (!crashDir.isDirectory) return emptyList()
+        // Strict: only new (unread) crash files. Already-replayed files have
+        // a `.seen` suffix and are skipped here on purpose.
+        val freshFiles = crashDir.listFiles { f ->
+            f.name.startsWith("crash_") && f.name.endsWith(".json")
+        } ?: emptyArray()
+
         val out = mutableListOf<TnEvent.Crash>()
-        crashDir.listFiles { f -> f.name.startsWith("crash_") && f.name.endsWith(".json") }
-            ?.forEach { f ->
-                val crash = runCatching { parseCrashFile(f) }.getOrNull()
-                if (crash != null) {
-                    out += crash
-                    dispatch(crash)
-                }
-                f.delete()
-            }
+        for (f in freshFiles) {
+            val crash = runCatching { parseCrashFile(f) }.getOrNull() ?: continue
+            out += crash
+            dispatch(crash)
+            // Mark replayed so future drainCrashFiles calls (from sibling
+            // processes or app relaunches) don't re-broadcast.
+            runCatching { f.renameTo(File(f.parentFile, f.name + ".seen")) }
+        }
+        evictOldCrashFiles(listAllCrashFiles(crashDir))
         return out
+    }
+
+    private fun listAllCrashFiles(crashDir: File): List<File> {
+        // Pick up both fresh and already-replayed crash files for the FIFO
+        // retention pass — we want a hard upper bound on disk usage no
+        // matter how many crashes have been seen.
+        return crashDir.listFiles { f ->
+            f.name.startsWith("crash_") &&
+                (f.name.endsWith(".json") || f.name.endsWith(".json.seen"))
+        }?.toList().orEmpty()
+    }
+
+    private fun crashFileSortKey(f: File): Long {
+        // Pattern: crash_<module>_<pid>_<epochMs>.json[.seen] — last
+        // underscore-separated chunk before ".json[.seen]" is the
+        // timestamp. Falls back to file mtime if the trailing component
+        // isn't numeric.
+        val stem = f.name
+            .removePrefix("crash_")
+            .removeSuffix(".seen")
+            .removeSuffix(".json")
+        val tail = stem.substringAfterLast('_', missingDelimiterValue = "")
+        return tail.toLongOrNull() ?: f.lastModified()
+    }
+
+    private fun evictOldCrashFiles(files: List<File>) {
+        if (files.size <= MAX_RETAINED_CRASH_FILES) return
+        val toDelete = files
+            .sortedByDescending { crashFileSortKey(it) }
+            .drop(MAX_RETAINED_CRASH_FILES)
+        for (f in toDelete) runCatching { f.delete() }
     }
 
     private fun parseCrashFile(file: File): TnEvent.Crash {
