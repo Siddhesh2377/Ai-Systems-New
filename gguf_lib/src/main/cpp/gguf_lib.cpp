@@ -54,8 +54,62 @@ using json = nlohmann::ordered_json;
 // Routes llama.cpp + ggml log lines into tn_security. user_data carries the
 // originating module (LLAMA_CPP or GGML) so attribution stays accurate even
 // though both libs share the ggml_log_callback signature.
+//
+// Drops two huge categories of upstream chatter that otherwise dominate load
+// time on Android: every forwarded line takes ~7 ms to push through the
+// tn_security ring buffer + JNI hop + AIDL fan-out to the app process, so
+// suppressing the 700+ noisy lines per load reclaims ~5 s of wall time:
+//
+//   1. All GGML_LOG_LEVEL_DEBUG (the 509 "control token N is not marked as
+//      EOG" lines, the 148 per-tensor "create_tensor: loading tensor" lines,
+//      per-layer KV-cache / memory_recurrent assignments, sched_reserve
+//      internals, set_abort_callback, detach/attach_threadpool, set_n_threads).
+//   2. Known-spammy INFO-level prefixes: the 37 metadata KV-pair dump from
+//      llama_model_loader and the 46-line print_info weight-config dump.
+//      Both are static model metadata that the user can read from the GGUF
+//      file directly — they add nothing at load time.
+static bool tn_sec_is_noisy_llama_info(const char * s, size_t n) {
+    // Prefix match against a static table. Keep this list tight — every
+    // suppressed line is one we accept never seeing again.
+    static constexpr const char * const k_drop_prefixes[] = {
+        "llama_model_loader: - kv ",
+        "llama_model_loader: - type ",
+        "llama_model_loader: Dumping metadata",
+        "print_info:",
+        "init_tokenizer:",
+        "load: 0 unused",
+        "load: token to piece",
+        "load: special tokens cache",
+        "load: printing all EOG",
+        "load:   - ",
+        "llama_context: constructing",
+        "llama_context: n_",
+        "llama_context: causal",
+        "llama_context: flash",
+        "llama_context: kv_unified",
+        "llama_context: freq",
+        "llama_context: enumerating",
+        "llama_context: backend_ptrs",
+        "llama_context:        CPU",
+        "sched_reserve: reserving",
+        "sched_reserve: max_nodes",
+        "sched_reserve: worst-case",
+        "sched_reserve: graph ",
+    };
+    for (const char * p : k_drop_prefixes) {
+        size_t plen = strlen(p);
+        if (n >= plen && memcmp(s, p, plen) == 0) return true;
+    }
+    return false;
+}
+
 static void tn_sec_route_ggml_log(enum ggml_log_level level, const char * text, void * user_data) {
     if (text == nullptr || text[0] == '\0') return;
+    // Cheapest possible early-out for the load-time hot path. Must come before
+    // strlen + memcpy so a 30 KB upstream KV dump line doesn't even get
+    // copied into our buffer when we're going to drop it anyway.
+    if (level == GGML_LOG_LEVEL_DEBUG || level == GGML_LOG_LEVEL_CONT) return;
+
     size_t len = strlen(text);
     char buf[2048];
     if (len >= sizeof(buf)) len = sizeof(buf) - 1;
@@ -64,6 +118,8 @@ static void tn_sec_route_ggml_log(enum ggml_log_level level, const char * text, 
     buf[len] = '\0';
     if (len == 0) return;
 
+    if (level == GGML_LOG_LEVEL_INFO && tn_sec_is_noisy_llama_info(buf, len)) return;
+
     tn_module src = (tn_module)(intptr_t)user_data;
     if (src != TN_MODULE_LLAMA_CPP && src != TN_MODULE_GGML) src = TN_MODULE_LLAMA_CPP;
 
@@ -71,8 +127,6 @@ static void tn_sec_route_ggml_log(enum ggml_log_level level, const char * text, 
     switch (level) {
         case GGML_LOG_LEVEL_ERROR: lvl = TN_LEVEL_ERROR; break;
         case GGML_LOG_LEVEL_WARN:  lvl = TN_LEVEL_WARN;  break;
-        case GGML_LOG_LEVEL_DEBUG: lvl = TN_LEVEL_DEBUG; break;
-        case GGML_LOG_LEVEL_CONT:  return;
         default:                   lvl = TN_LEVEL_INFO;  break;
     }
     tn_sec_log(lvl, src, tn_sec_module_slug(src), tn_sec_current_op(),
@@ -557,12 +611,20 @@ static ggml_threadpool_t build_threadpool(int n_threads,
 // masks. Called both at load time (via load_model) and live from JNI on user
 // pref changes.
 static void apply_thread_mode(int mode) {
-    tn_thread_config cfg = tn_thread_config_for_mode((tn_thread_mode)mode);
     g_state.thread_mode = mode;
+
+    // Without a ctx there's nothing to attach a threadpool to. Build at the
+    // ctx-construction site instead (load_model calls apply_thread_mode again
+    // after llama_init_from_model). This lets the caller (InferenceService)
+    // pre-set the thread mode before load without paying for a pool build +
+    // free that would otherwise be wasted when load immediately rebuilds.
+    if (!g_state.ctx) return;
+
+    tn_thread_config cfg = tn_thread_config_for_mode((tn_thread_mode)mode);
 
     // Detach + free old pools first. detach must precede free or llama_context
     // ends up with dangling pool pointers.
-    if (g_state.ctx) llama_detach_threadpool(g_state.ctx);
+    llama_detach_threadpool(g_state.ctx);
     if (g_state.threadpool)       { ggml_threadpool_free(g_state.threadpool);       g_state.threadpool = nullptr; }
     if (g_state.threadpool_batch) { ggml_threadpool_free(g_state.threadpool_batch); g_state.threadpool_batch = nullptr; }
 
@@ -575,17 +637,15 @@ static void apply_thread_mode(int mode) {
         cfg.n_threads_batch, cfg.cpumask_batch,
         cfg.priority, cfg.poll, strict);
 
-    if (g_state.ctx) {
-        llama_set_n_threads(g_state.ctx,
-            cfg.n_threads_generation,
-            cfg.n_threads_batch);
-        llama_attach_threadpool(g_state.ctx,
-            g_state.threadpool ? g_state.threadpool : g_state.threadpool_batch,
-            g_state.threadpool_batch ? g_state.threadpool_batch : g_state.threadpool);
-        LOGI("Threadpools attached: gen=%d batch=%d (gen_pool=%p batch_pool=%p)",
-             cfg.n_threads_generation, cfg.n_threads_batch,
-             (void *)g_state.threadpool, (void *)g_state.threadpool_batch);
-    }
+    llama_set_n_threads(g_state.ctx,
+        cfg.n_threads_generation,
+        cfg.n_threads_batch);
+    llama_attach_threadpool(g_state.ctx,
+        g_state.threadpool ? g_state.threadpool : g_state.threadpool_batch,
+        g_state.threadpool_batch ? g_state.threadpool_batch : g_state.threadpool);
+    LOGI("Threadpools attached: gen=%d batch=%d (gen_pool=%p batch_pool=%p)",
+         cfg.n_threads_generation, cfg.n_threads_batch,
+         (void *)g_state.threadpool, (void *)g_state.threadpool_batch);
 }
 
 // rebuild_sampler(force=false) skips the rebuild if only simple knobs (temp,
@@ -2642,6 +2702,16 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeCreateRagEngine(
         jint nThreads, jint chunkSize, jint chunkOverlap,
         jint nDims, jint topK, jint topN, jboolean lateChunking) {
 
+    // Must run before any rag_engine_* call — registers ggml backends AND
+    // installs the llama/ggml log callbacks. Without it, llama_model_load_
+    // from_file inside rag_engine_load_model dispatches to an unregistered
+    // backend, triggers GGML_ABORT, and the :inference process dies via
+    // SIGABRT (si_code=-1) with no log breadcrumb because the log callback
+    // was never wired up. This was the actual cause of the "load PDF
+    // without ever loading an LLM" crash — the main LLM load path was
+    // accidentally the only thing initializing backends.
+    ensure_backend_init();
+
     std::lock_guard<std::mutex> lock(g_rag.mutex);
 
     if (g_rag.engine) {
@@ -2669,28 +2739,55 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeCreateRagEngine(
     return JNI_TRUE;
 }
 
+// Wraps rag_engine_load_model + rag_engine_load_model_from_fd with breadcrumb
+// logs and full exception coverage. Without this, a std::bad_alloc /
+// std::runtime_error from llama_model_load_from_file (mmap failure, header
+// parse error, ggml buffer alloc failure) propagates across the JNI boundary,
+// std::terminate is invoked, and the :inference process dies with SIGABRT
+// si_code=-1 and no diagnostic in the ring buffer. Catch here and turn it
+// into a false-return + a logged TnError with the exception message.
+template <typename F>
+static jboolean rag_load_dispatch(const char * label, F && doit) {
+    if (!g_rag.engine) {
+        LOGE("%s: RAG engine not created", label);
+        return JNI_FALSE;
+    }
+    LOGI("%s: entering rag_engine_load_model (memAvailMb=%.1f)",
+         label, read_mem_available_mb());
+    int32_t rc;
+    try {
+        rc = doit();
+    } catch (const std::bad_alloc &) {
+        LOGE("%s: bad_alloc — out of memory during model load", label);
+        return JNI_FALSE;
+    } catch (const std::exception & e) {
+        LOGE("%s: exception during model load: %s", label, e.what());
+        return JNI_FALSE;
+    } catch (...) {
+        LOGE("%s: unknown C++ exception during model load", label);
+        return JNI_FALSE;
+    }
+    if (rc != 0) {
+        LOGE("%s: rag_engine_load_model returned rc=%d", label, rc);
+        return JNI_FALSE;
+    }
+    LOGI("%s: RAG embedding model loaded (memAvailMb=%.1f)",
+         label, read_mem_available_mb());
+    return JNI_TRUE;
+}
+
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadRagModel(
         JNIEnv * env, jobject, jstring jpath) {
 
     std::lock_guard<std::mutex> lock(g_rag.mutex);
-
-    if (!g_rag.engine) {
-        LOGE("RAG engine not created");
-        return JNI_FALSE;
-    }
-
     const char * path = env->GetStringUTFChars(jpath, nullptr);
-    int32_t rc = rag_engine_load_model(g_rag.engine, path);
+    LOGI("nativeLoadRagModel: path=%s", path ? path : "(null)");
+    jboolean result = rag_load_dispatch(
+        "nativeLoadRagModel",
+        [&]() { return rag_engine_load_model(g_rag.engine, path); });
     env->ReleaseStringUTFChars(jpath, path);
-
-    if (rc != 0) {
-        LOGE("Failed to load RAG embedding model (rc=%d)", rc);
-        return JNI_FALSE;
-    }
-
-    LOGI("RAG embedding model loaded");
-    return JNI_TRUE;
+    return result;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -2698,20 +2795,10 @@ Java_com_dark_gguf_1lib_GGUFNativeLib_nativeLoadRagModelFromFd(
         JNIEnv *, jobject, jint fd) {
 
     std::lock_guard<std::mutex> lock(g_rag.mutex);
-
-    if (!g_rag.engine) {
-        LOGE("RAG engine not created");
-        return JNI_FALSE;
-    }
-
-    int32_t rc = rag_engine_load_model_from_fd(g_rag.engine, fd);
-    if (rc != 0) {
-        LOGE("Failed to load RAG model from fd=%d (rc=%d)", fd, rc);
-        return JNI_FALSE;
-    }
-
-    LOGI("RAG embedding model loaded from fd=%d", fd);
-    return JNI_TRUE;
+    LOGI("nativeLoadRagModelFromFd: fd=%d", (int)fd);
+    return rag_load_dispatch(
+        "nativeLoadRagModelFromFd",
+        [&]() { return rag_engine_load_model_from_fd(g_rag.engine, fd); });
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
